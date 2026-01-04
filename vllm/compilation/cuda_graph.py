@@ -119,7 +119,10 @@ class CUDAGraphLogging:
 @dataclasses.dataclass
 class CUDAGraphEntry:
     batch_descriptor: BatchDescriptor
-    cudagraph: torch.cuda.CUDAGraph | None = None
+    #cudagraph: torch.cuda.CUDAGraph | None = None
+    from typing import Any, Optional
+    cudagraph: Optional[Any] = None
+    
     output: Any | None = None
 
     # for cudagraph debugging, track the input addresses
