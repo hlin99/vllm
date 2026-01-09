@@ -283,6 +283,7 @@ def set_forward_context(
         forward_start_time = time.perf_counter()
 
     dp_metadata: DPMetadata | None = None
+    '''
     if vllm_config.parallel_config.data_parallel_size > 1 and (
         attn_metadata is not None or num_tokens is not None
     ):
@@ -302,7 +303,7 @@ def set_forward_context(
         dp_metadata = DPMetadata.make(
             vllm_config.parallel_config, num_tokens or 0, num_tokens_across_dp
         )
-
+    '''
     # Convenience: if cudagraph is used and num_tokens is given, we can just
     # create a batch descriptor here if not given (there's no harm since if it
     # doesn't match in the wrapper it'll fall through).
