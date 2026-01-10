@@ -88,6 +88,8 @@ try:
     from nixl._bindings import nixlXferTelemetry
 
     logger.info("NIXL is available")
+    import traceback
+    traceback.print_stack()
 except ImportError:
     logger.warning("NIXL is not available")
     NixlWrapper = None
@@ -1102,6 +1104,7 @@ class NixlConnectorWorker:
         Initialize transfer buffer in CPU mem for accelerators
         NOT directly supported by NIXL (e.g., tpu)
         """
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  initialize_host_xfer_buffer  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         xfer_buffers: dict[str, torch.Tensor] = {}
         inv_order = [0, 1, 3, 2, 4]
         try:
