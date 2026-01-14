@@ -88,8 +88,6 @@ try:
     from nixl._bindings import nixlXferTelemetry
 
     logger.info("NIXL is available")
-    import traceback
-    traceback.print_stack()
 except ImportError:
     logger.warning("NIXL is not available")
     NixlWrapper = None
@@ -869,6 +867,7 @@ class NixlConnectorWorker:
             self.use_host_buffer = False
         else:
             self.use_host_buffer = self.kv_buffer_device == "cpu"
+        logger.error("self.use_host_buffer = %s", self.use_host_buffer)
 
         # support for oot platform which can't register nixl memory
         # type based on kv_buffer_device
@@ -884,6 +883,7 @@ class NixlConnectorWorker:
                 "is not supported."
             )
         self.nixl_memory_type = nixl_memory_type
+        logger.error("self.nixl_memory_type = %s", self.nixl_memory_type)
 
         # Note: host xfer buffer ops when use_host_buffer is True
         self.copy_blocks: CopyBlocksOp | None = None
