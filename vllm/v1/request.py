@@ -27,6 +27,9 @@ if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 @dataclass
 class StreamingUpdate:
@@ -204,6 +207,9 @@ class Request:
         self,
         token_ids: int | list[int],
     ) -> None:
+        logger.error("append_output_token_ids:%s", token_ids)
+        import traceback
+        traceback.print_stack()
         if isinstance(token_ids, int):
             self._output_token_ids.append(token_ids)
             self._all_token_ids.append(token_ids)

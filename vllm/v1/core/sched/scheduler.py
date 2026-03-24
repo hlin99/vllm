@@ -904,12 +904,13 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
-
+        logger.error("I'm SchedulerOutput")
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
         if self.connector is not None:
+            logger.error("self.connector is not None")
             meta: KVConnectorMetadata = self.connector.build_connector_meta(
                 scheduler_output
             )
@@ -961,7 +962,10 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            logger.error("before update: req_id=%s, request.num_computed_tokens=%s", req_id, request.num_computed_tokens)
             request.num_computed_tokens += num_scheduled_token
+            logger.error("after update: req_id=%s, request.num_computed_tokens=%s", req_id, request.num_computed_tokens)
+            logger.error("request.all_token_ids=%s", request.all_token_ids)
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )

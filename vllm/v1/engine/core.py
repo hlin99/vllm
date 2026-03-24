@@ -448,13 +448,18 @@ class EngineCore:
                     scheduler_output, non_block=True
                 )
             if self.is_ec_consumer:
+                logger.error("self.is_ec_consumer")
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
+            logger.error("model_executed=%s",model_executed)
             if self.is_pooling_model or not model_executed:
+                logger.error("path 1")
                 # No sampling required (no requests scheduled).
                 future = cast(Future[ModelRunnerOutput], exec_future)
             else:
                 if not scheduler_output.pending_structured_output_tokens:
+                    logger.error("path 2")
+
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
                     grammar_output = self.scheduler.get_grammar_bitmask(
@@ -464,6 +469,8 @@ class EngineCore:
                         grammar_output, non_block=True
                     )
                 else:
+                    logger.error("path 3")
+
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
@@ -478,12 +485,15 @@ class EngineCore:
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
+                    logger.error("return 0")
                     return None, True
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
             # only be called when the scheduler contains requests or the queue
             # is non-empty.
+            logger.error("return 1")
+
             return None, False
 
         # Block until the next result is available.
@@ -502,6 +512,7 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        logger.error("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
