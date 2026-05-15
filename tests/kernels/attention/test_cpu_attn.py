@@ -9,7 +9,7 @@ import torch
 
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.torch_utils import set_random_seed
-from vllm.v1.attention.backends.cpu_attn import _get_attn_isa
+from vllm.v1.attention.backends.cpu_attn import CPUAttentionBackend, _get_attn_isa
 
 if not current_platform.is_cpu():
     pytest.skip("skipping CPU-only tests", allow_module_level=True)
@@ -57,6 +57,10 @@ def get_attn_isa(
         dtype if dtype is not None else torch.bfloat16,
         block_size if block_size else 32,
     )
+
+
+def test_cpu_backend_requires_hnd_kv_cache_layout():
+    assert CPUAttentionBackend.get_required_kv_cache_layout() == "HND"
 
 
 # rand number generation takes too much time, cache rand tensors
