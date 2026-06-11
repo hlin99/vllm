@@ -29,11 +29,12 @@ export NIXL_PLUGIN_DIR=/opt/venv/lib/python3.12/site-packages/.nixl.mesonpy.libs
 
 BLOCK_SIZE=64
 VLLM_NIXL_DEVICE_TO_DEVICE=true
-NIXL_BUFFER_DEVICE=cpu
+NIXL_BUFFER_DEVICE=xpu
 VLLM_NIXL_BACKEND=UCX
 export UCX_MEMTYPE_CACHE=0
 export UCX_NET_DEVICES=mlx5_0:1
 export UCX_TLS=rc,sm,self
+export UCX_TLS=ib,rc,sm,self,ze_copy
 
 export VLLM_NIXL_SIDE_CHANNEL_HOST=192.168.1.22
 
