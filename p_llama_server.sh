@@ -25,7 +25,7 @@ unset GLOO_SOCKET_IFNAME
 
 BLOCK_SIZE=64
 VLLM_NIXL_DEVICE_TO_DEVICE=true
-NIXL_BUFFER_DEVICE=xpu
+NIXL_BUFFER_DEVICE=cpu
 VLLM_NIXL_BACKEND=UCX
 export UCX_MEMTYPE_CACHE=0
 export UCX_NET_DEVICES=mlx5_0:1
@@ -33,7 +33,7 @@ export UCX_TLS=ib,rc,sm,self,ze_copy
 
 export VLLM_NIXL_SIDE_CHANNEL_HOST=192.168.1.20
 
-ZE_AFFINITY_MASK=3 vllm serve "$MODEL_PATH" \
+vllm serve "$MODEL_PATH" \
     --tensor-parallel-size "$TP_SIZE" \
     --port 8866 \
     --max_model_len 16384 \
