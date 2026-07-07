@@ -153,7 +153,7 @@ is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
 try:
     is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
-except Exception:
+except (RuntimeError, AttributeError):
     is_intel_alchemist = False
 is_nvidia_hopper = is_nvidia and (
     "NVIDIA H" in torch.cuda.get_device_name(0)
