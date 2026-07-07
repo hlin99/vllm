@@ -799,6 +799,14 @@ class FlashAttentionImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
+        # On XPU, the flash-attention kernel only writes output[:num_actual_tokens].
+        # Padding slots may contain stale NaN values from a previous step (e.g.
+        # slots freed by finished requests), which can propagate through subsequent
+        # ops such as RMSNorm.  Zero-initialise the padding region here to prevent
+        # that.
+        if current_platform.is_xpu() and num_actual_tokens < output.shape[0]:
+            output[num_actual_tokens:].zero_()
+
         # Handle encoder attention differently - no KV cache needed
         if attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,

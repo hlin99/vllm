@@ -119,6 +119,10 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
 
 @functools.cache
 def get_available_device() -> str:
+    # Short-circuit for XPU: querying the Triton driver on XPU can abort
+    # the driver process, so return the backend string directly.
+    if current_platform.is_xpu():
+        return "xpu"
     try:
         return triton.runtime.driver.active.get_current_target().backend
     except (RuntimeError, AttributeError):
@@ -147,7 +151,10 @@ device_platform = _check_platform()
 is_amd = device_platform == "amd"
 is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
-is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
+try:
+    is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
+except Exception:
+    is_intel_alchemist = False
 is_nvidia_hopper = is_nvidia and (
     "NVIDIA H" in torch.cuda.get_device_name(0)
     or torch.cuda.get_device_capability()[0] >= 9

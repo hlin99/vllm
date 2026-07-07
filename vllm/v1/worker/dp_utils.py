@@ -149,7 +149,13 @@ def _synchronize_dp_ranks(
     # sizes across DP ranks currently).
     # Use the synced runtime cudagraph mode rather than the compilation config
     # so we can avoid padding when cudagraph is not enabled for this step.
-    should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
+    # Expert parallelism also requires all DP ranks to process the same number
+    # of tokens so that expert dispatch/combine are balanced.
+    should_dp_pad = (
+        synced_cudagraph_mode != 0
+        or should_ubatch
+        or parallel_config.enable_expert_parallel
+    )
 
     # Pad all DP ranks up to the maximum token count across ranks if
     # should_dp_pad is True

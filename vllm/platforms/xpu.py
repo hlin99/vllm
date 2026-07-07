@@ -94,6 +94,12 @@ def get_mem_info_wrapper(
     # Call the underlying C++ implementation
     free, total = torch.ops._C_cache_ops.getMemoryInfo(device)
 
+    # Report the PyTorch-reserved memory pool as the free figure so that vLLM
+    # sees memory already held in the allocator cache as available for its KV
+    # cache, matching the semantics of torch.cuda.mem_get_info on CUDA.
+    reserved = torch.xpu.memory_reserved(device)
+    free = max(free, reserved)
+
     return free, total
 
 

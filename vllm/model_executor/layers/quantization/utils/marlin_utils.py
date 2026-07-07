@@ -362,7 +362,7 @@ def check_moe_marlin_supports_layer(
     straddling the padded boundary stays unsupported. hidden_size is the MoE
     I/O extent and is never padded. Act-order keeps the strict shape.
     """
-    if current_platform.is_rocm():
+    if current_platform.is_rocm() or not current_platform.is_cuda():
         return False
     hidden_size = layer.hidden_size
     # The layer has not rounded intermediate_size yet; use the stable unpadded
