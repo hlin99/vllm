@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 import torch
 import torch.nn as nn
 
+import vllm.ir
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -87,6 +88,13 @@ class WorkerBase:
         self.device: torch.device | None = None
         self.model_runner: nn.Module | None = None
 
+        # IR op priority and torch-wrap state are constant for the worker's
+        # lifetime.
+        vllm_config.kernel_config.ir_op_priority.set_default()
+        vllm.ir.set_default_torch_wrap(
+            vllm_config.compilation_config.ir_enable_torch_wrap
+        )
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
         raise NotImplementedError
@@ -116,6 +124,10 @@ class WorkerBase:
 
     def get_model(self) -> nn.Module:
         raise NotImplementedError
+
+    def supports_draft_weight_updates(self) -> bool:
+        """Whether this worker can update its configured speculative model."""
+        return False
 
     def apply_model(self, fn: Callable[[nn.Module], _R]) -> _R:
         """Apply a function on the model inside this worker."""
@@ -277,6 +289,12 @@ class WorkerWrapperBase:
                     worker_class,
                     extended_calls,
                 )
+
+        assigned_physical_gpu_ids = kwargs.pop("assigned_physical_gpu_ids", None)
+        if assigned_physical_gpu_ids is not None:
+            vllm_config.parallel_config.assigned_physical_gpu_ids = (
+                assigned_physical_gpu_ids
+            )
 
         shared_worker_lock = kwargs.pop("shared_worker_lock", None)
         if shared_worker_lock is None:
