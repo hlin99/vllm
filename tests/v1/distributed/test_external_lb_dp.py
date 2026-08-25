@@ -20,6 +20,13 @@ MODEL_NAME = os.getenv("MODEL_NAME", "ibm-research/PowerMoE-3b")
 DP_SIZE = int(os.getenv("DP_SIZE", "2"))
 # Default tensor parallel size to use
 TP_SIZE = int(os.getenv("TP_SIZE", "1"))
+_full_device_visibility = os.getenv("FULL_DEVICE_VISIBILITY", "False").lower()
+if _full_device_visibility not in {"true", "false"}:
+    raise ValueError("FULL_DEVICE_VISIBILITY must be 'True' or 'False'")
+FULL_DEVICE_VISIBILITY = _full_device_visibility == "true"
+GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", "0.92"))
+if not 0 < GPU_MEMORY_UTILIZATION <= 1:
+    raise ValueError("GPU_MEMORY_UTILIZATION must be greater than 0 and at most 1")
 
 
 class ExternalLBServerManager:
@@ -69,18 +76,20 @@ class ExternalLBServerManager:
             # Use a thread to start each server to allow parallel initialization
             def start_server(r: int, sargs: list[str]):
                 try:
+                    env_dict = {"VLLM_SERVER_DEV_MODE": "1"}
+                    enable_ep = "--enable-expert-parallel" in sargs
+                    if not enable_ep or not FULL_DEVICE_VISIBILITY:
+                        env_dict[current_platform.device_control_env_var] = ",".join(
+                            str(current_platform.device_id_to_physical_device_id(i))
+                            for i in range(r * TP_SIZE, (r + 1) * TP_SIZE)
+                        )
+
                     # Start the server
                     server = RemoteOpenAIServer(
                         self.model_name,
                         sargs,
                         auto_port=False,
-                        env_dict={
-                            "VLLM_SERVER_DEV_MODE": "1",
-                            current_platform.device_control_env_var: ",".join(
-                                str(current_platform.device_id_to_physical_device_id(i))
-                                for i in range(r * TP_SIZE, (r + 1) * TP_SIZE)
-                            ),
-                        },
+                        env_dict=env_dict,
                     )
                     server.__enter__()
                     print(
@@ -129,6 +138,8 @@ def default_server_args(request):
         "2048",
         "--max-num-seqs",
         "128",
+        "--gpu-memory-utilization",
+        str(GPU_MEMORY_UTILIZATION),
         "--enforce-eager",
     ]
     if request.param:
