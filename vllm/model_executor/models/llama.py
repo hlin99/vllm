@@ -26,12 +26,14 @@
 
 from collections.abc import Iterable
 from itertools import islice
+from sys import _getframe
 from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -79,6 +81,26 @@ from .utils import (
 )
 
 
+def _tensor_description(tensor: torch.Tensor | None) -> str:
+    if tensor is None:
+        return "None"
+    return f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}"
+
+
+def _trace(stage: str, **tensors: torch.Tensor | None) -> None:
+    if envs.VLLM_LLM_TRACE:
+        caller = _getframe(1)
+        tensor_details = ", ".join(
+            f"{name}({_tensor_description(tensor)})" for name, tensor in tensors.items()
+        )
+        suffix = f": {tensor_details}" if tensor_details else ""
+        print(
+            f"[LLaMA trace] [{caller.f_code.co_filename}:{caller.f_lineno}] "
+            f"{stage}{suffix}",
+            flush=True,
+        )
+
+
 class LlamaMLP(nn.Module):
     def __init__(
         self,
@@ -114,11 +136,16 @@ class LlamaMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        _trace("MLP initialized")
 
     def forward(self, x):
+        _trace("MLP input", hidden_states=x)
         x, _ = self.gate_up_proj(x)
+        _trace("MLP gate/up projection", gate_up=x)
         x = maybe_fused_act_quant(self.act_fn, x, self.down_proj)
+        _trace("MLP SiLU gate and multiply", activated=x)
         x, _ = self.down_proj(x)
+        _trace("MLP down projection", output=x)
         return x
 
 
@@ -139,6 +166,7 @@ class LlamaAttention(nn.Module):
     ) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -220,17 +248,31 @@ class LlamaAttention(nn.Module):
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
         )
+        _trace(
+            f"layer {self.layer_idx} attention initialized "
+            f"(heads={self.num_heads}, kv_heads={self.num_kv_heads}, "
+            f"head_dim={self.head_dim}, type={attn_type})"
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        _trace(
+            f"layer {self.layer_idx} attention input",
+            positions=positions,
+            hidden_states=hidden_states,
+        )
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        _trace(f"layer {self.layer_idx} QKV projection", q=q, k=k, v=v)
         q, k = self.rotary_emb(positions, q, k)
+        _trace(f"layer {self.layer_idx} RoPE", q=q, k=k)
         attn_output = self.attn(q, k, v)
+        _trace(f"layer {self.layer_idx} attention with KV cache", output=attn_output)
         output, _ = self.o_proj(attn_output)
+        _trace(f"layer {self.layer_idx} attention output projection", output=output)
         return output
 
     def _init_rotary_emb(
@@ -246,6 +288,10 @@ class LlamaAttention(nn.Module):
             rope_parameters=getattr(config, "rope_parameters", None),
             is_neox_style=is_neox_style,
         )
+        _trace(
+            f"layer {self.layer_idx} RoPE initialized "
+            f"(max_position={self.max_position_embeddings})"
+        )
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -259,6 +305,7 @@ class LlamaDecoderLayer(nn.Module):
         super().__init__()
 
         config = config or vllm_config.model_config.hf_config
+        self.layer_idx = extract_layer_index(prefix)
         cache_config = vllm_config.cache_config
         quant_config = self.get_quant_config(vllm_config)
 
@@ -309,6 +356,7 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        _trace(f"decoder layer {self.layer_idx} initialized")
 
     def forward(
         self,
@@ -316,22 +364,48 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        _trace(
+            f"layer {self.layer_idx} input",
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=residual,
+        )
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        _trace(
+            f"layer {self.layer_idx} input RMSNorm",
+            hidden_states=hidden_states,
+            residual=residual,
+        )
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        _trace(
+            f"layer {self.layer_idx} post-attention RMSNorm",
+            hidden_states=hidden_states,
+            residual=residual,
+        )
         hidden_states = self.mlp(hidden_states)
+        _trace(
+            f"layer {self.layer_idx} output",
+            hidden_states=hidden_states,
+            residual=residual,
+        )
         return hidden_states, residual
 
     def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
         """Get quantization config for this layer. Override in subclasses."""
-        return vllm_config.quant_config
+        quant_config = vllm_config.quant_config
+        _trace(
+            f"decoder layer {self.layer_idx} quantization "
+            f"({'enabled' if quant_config else 'disabled'})"
+        )
+        return quant_config
 
 
 @support_torch_compile(
@@ -343,6 +417,7 @@ class LlamaDecoderLayer(nn.Module):
         "intermediate_tensors": {0: "b"},
         "inputs_embeds": {0: "b"},
     },
+    enable_if=lambda _: not envs.VLLM_LLM_TRACE,
 )
 class LlamaModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = WeightsMapper(
@@ -399,9 +474,16 @@ class LlamaModel(nn.Module, EagleModelMixin):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+        _trace(
+            f"model initialized (layers={config.num_hidden_layers}, "
+            f"hidden_size={config.hidden_size}, vocab_size={self.vocab_size})"
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        _trace("token embedding input", input_ids=input_ids)
+        embeddings = self.embed_tokens(input_ids)
+        _trace("token embedding output", embeddings=embeddings)
+        return embeddings
 
     def forward(
         self,
@@ -411,6 +493,13 @@ class LlamaModel(nn.Module, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
         **extra_layer_kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        _trace(
+            f"model forward input (pipeline layers {self.start_layer} "
+            f"through {self.end_layer - 1})",
+            input_ids=input_ids,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+        )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -421,6 +510,11 @@ class LlamaModel(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+        _trace(
+            "model hidden-state source",
+            hidden_states=hidden_states,
+            residual=residual,
+        )
 
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
 
@@ -441,6 +535,11 @@ class LlamaModel(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
+            _trace(
+                "pipeline stage output",
+                hidden_states=hidden_states,
+                residual=residual,
+            )
             return IntermediateTensors(
                 {
                     "hidden_states": hidden_states,
@@ -450,15 +549,24 @@ class LlamaModel(nn.Module, EagleModelMixin):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        _trace("final RMSNorm", hidden_states=hidden_states)
 
         aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:
+            _trace(
+                "model forward output with auxiliary states",
+                hidden_states=hidden_states,
+            )
             return hidden_states, aux_hidden_states
+        _trace("model forward output", hidden_states=hidden_states)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        _trace("model weight loading started")
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        _trace(f"model weight loading finished ({len(loaded_weights)} weights)")
+        return loaded_weights
 
 
 class LlamaForCausalLM(
@@ -519,6 +627,10 @@ class LlamaForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        _trace(
+            f"causal LM initialized (vocab_size={config.vocab_size}, "
+            f"tie_embeddings={config.tie_word_embeddings})"
+        )
 
     def _init_model(
         self,
@@ -526,10 +638,14 @@ class LlamaForCausalLM(
         prefix: str = "",
         layer_type: type[nn.Module] = LlamaDecoderLayer,
     ):
+        _trace("causal LM creating transformer model")
         return LlamaModel(vllm_config=vllm_config, prefix=prefix, layer_type=layer_type)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
+        _trace("causal LM embedding request", input_ids=input_ids)
+        embeddings = self.model.embed_input_ids(input_ids)
+        _trace("causal LM embedding result", embeddings=embeddings)
+        return embeddings
 
     def forward(
         self,
@@ -538,27 +654,45 @@ class LlamaForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        _trace(
+            "causal LM forward input",
+            input_ids=input_ids,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+        )
         model_output = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
+        if isinstance(model_output, torch.Tensor):
+            _trace("causal LM forward output", hidden_states=model_output)
+        else:
+            _trace("causal LM forward output (pipeline intermediate)")
         return model_output
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        _trace("logits computation input", hidden_states=hidden_states)
         logits = self.logits_processor(self.lm_head, hidden_states)
+        _trace("logits computation output", logits=logits)
         return logits
 
     def compute_logits_local(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+        _trace("local logits computation input", hidden_states=hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+        _trace("local logits computation output", logits=logits)
+        return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        _trace("causal LM weight loading started")
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded_weights = loader.load_weights(weights)
+        _trace(f"causal LM weight loading finished ({len(loaded_weights)} weights)")
+        return loaded_weights
 
 
 if TYPE_CHECKING:

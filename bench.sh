@@ -1,0 +1,12 @@
+vllm bench serve \
+  --backend vllm \
+  --base-url http://127.0.0.1:8000 \
+  --model /workspace/Llama-3.1-8B-Instruct/ \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 512 \
+  --num-prompts 200 \
+  --max-concurrency 32 \
+  --ignore-eos \
+  --seed 42 \
+  --random-range-ratio 0
