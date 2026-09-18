@@ -12,6 +12,7 @@ from openai.types.chat import ChatCompletionMessageParam
 from prometheus_client.parser import text_string_to_metric_families
 
 from tests.utils import RemoteOpenAIServer
+from vllm.platforms import current_platform
 
 MODEL = "Qwen/Qwen3.5-0.8B"
 NUM_CONVERSATIONS = 8
@@ -19,6 +20,12 @@ MAX_TOKENS = 32
 # Long first turns leave room for hybrid cache alignment and MTP recomputation.
 MIN_PROMPT_TOKENS = 2048
 METRICS_TIMEOUT = 30
+
+# XPU Flash Attention uses 64-token blocks, producing 576-token hybrid cache
+# pages for this model instead of the 544-token pages used on CUDA. These
+# floors still reject one additional missed page for the test workload.
+BASE_MIN_HIT_RATE = 0.85 if current_platform.is_xpu() else 0.90
+MTP_MIN_HIT_RATE = 0.68 if current_platform.is_xpu() else 0.75
 
 
 def _user_turns(conversation: int) -> list[str]:
@@ -85,7 +92,10 @@ def server(request):
 @pytest.mark.parametrize(
     "server, min_hit_rate",
     # MTP re-prefills an extra block; both floors reject one more missed block.
-    [pytest.param(False, 0.90, id="base"), pytest.param(True, 0.75, id="mtp")],
+    [
+        pytest.param(False, BASE_MIN_HIT_RATE, id="base"),
+        pytest.param(True, MTP_MIN_HIT_RATE, id="mtp"),
+    ],
     indirect=["server"],
 )
 async def test_prefix_cache_hit_rate(
