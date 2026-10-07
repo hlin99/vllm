@@ -31,6 +31,15 @@ def main() -> None:
             "independent",
         }
         assert all(chunk % 64 == 0 for _, chunk, _ in profile.candidates)
+        assert len({chunk for _, chunk, _ in profile.finalists}) == 2
+        assert {mode for mode, _, _ in profile.finalists} == {
+            "p2p",
+            "ordered",
+            "independent",
+        }
+        assert (profile.all_gather_mode, profile.microchunk_tokens) == min(
+            profile.finalists, key=lambda item: item[2]
+        )[:2]
         upper = next(m for m in profile.measurements if m.tokens == 65536)
         if rank == 0:
             best = min(profile.candidates, key=lambda item: item[2])

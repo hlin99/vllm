@@ -69,23 +69,13 @@ def test_cpu_scan_precedes_memory_measurement():
     assert calls == [("scan", 32), ("memory", None)]
 
 
-def test_chunk_search_starts_at_half_shard_and_refines_on_64_rows():
+def test_chunk_search_scans_from_64_through_32_non_improvements():
     pytest.importorskip("deep_symm")
     from vllm.v1.worker.tpsp_profile import _search_chunks
 
-    visited = []
-
-    def score(chunk: int) -> float:
-        visited.append(chunk)
-        return abs(chunk - 2048)
-
-    chunks = _search_chunks(16384, score)
-    assert chunks is not None
-    assert visited[0] == 8192
+    chunks = _search_chunks(16384, lambda chunk: abs(chunk - 2048))
+    assert chunks == list(range(64, 4096 + 1, 64))
     assert 2048 in chunks
-    assert 128 in chunks
-    assert 16384 in chunks
-    assert all(chunk % 64 == 0 for chunk in chunks)
 
 
 def test_chunk_search_respects_budget_and_small_shards():
@@ -94,36 +84,44 @@ def test_chunk_search_respects_budget_and_small_shards():
 
     assert _search_chunks(17, lambda chunk: float(chunk)) == [64]
     assert _search_chunks(8192, lambda chunk: None) is None
-    assert 2048 in _search_chunks(8192, lambda chunk: abs(chunk - 2048))
+    assert _search_chunks(8192, lambda chunk: -float(chunk)) == list(
+        range(64, 8192 + 1, 64)
+    )
 
 
-def test_chunk_search_128k_tp4_starts_at_half_shard():
+def test_chunk_search_128k_tp4_resets_lookahead_after_improvement():
     pytest.importorskip("deep_symm")
     from vllm.v1.worker.tpsp_profile import _search_chunks
 
-    visited = []
-
     def score(chunk: int) -> float:
-        visited.append(chunk)
-        return abs(chunk - 2048)
+        return -2 if chunk == 2560 else -1 if chunk == 1024 else 0
 
     chunks = _search_chunks(32768, score)
-    assert chunks is not None
-    assert visited[:6] == [16384, 256, 32768, 8384, 16512, 24640]
-    assert 2048 in chunks
-    assert all(chunk % 64 == 0 for chunk in chunks)
+    assert chunks == list(range(64, 4608 + 1, 64))
 
 
-def test_chunk_search_can_miss_global_minimum():
+def test_chunk_search_can_stop_before_later_improvement():
     pytest.importorskip("deep_symm")
     from vllm.v1.worker.tpsp_profile import _search_chunks
 
     def score(chunk: int) -> float:
-        return -10 if chunk == 1024 else abs(chunk - 3072)
+        return -10 if chunk == 4096 else float(chunk)
 
     chunks = _search_chunks(16384, score)
-    assert chunks is not None
-    assert 1024 not in chunks
+    assert chunks == list(range(64, 2112 + 1, 64))
+
+
+def test_top_chunks_selects_distinct_global_front_runners():
+    pytest.importorskip("deep_symm")
+    from vllm.v1.worker.tpsp_profile import _top_chunks
+
+    scores = {
+        (mode, chunk): value
+        for chunk, value in ((64, 3.0), (128, 1.0), (192, 2.0))
+        for mode in ("p2p", "ordered", "independent")
+    }
+    assert _top_chunks([64, 128, 192], scores) == [128, 192]
+    assert _top_chunks([64], scores) == [64]
 
 
 def test_screen_score_uses_second_fastest_of_five():
