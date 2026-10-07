@@ -5,13 +5,13 @@
 import torch
 import torch.distributed as dist
 from deep_symm.async_tp import fused_matmul_reduce_scatter_norm_all_gather
-from deep_symm.async_tp.sp_profile import SPProfile, profile_sp_config, select_sp_config
 
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.model_executor.models.qwen3_moe import (
     Qwen3MoeDecoderLayer,
     Qwen3MoeForCausalLM,
 )
+from vllm.models.tpsp_profile import SPProfile, profile_sp_config, select_sp_config
 
 
 class TPSPQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
