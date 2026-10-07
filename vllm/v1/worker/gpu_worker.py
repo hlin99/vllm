@@ -613,6 +613,10 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
+        profile_tpsp = getattr(self.model_runner.model, "profile_tpsp_config", None)
+        if profile_tpsp is not None:
+            profile_tpsp(self.model_runner.max_num_tokens)
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens

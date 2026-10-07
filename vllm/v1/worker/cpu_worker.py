@@ -202,6 +202,10 @@ class CPUWorker(Worker):
         )
 
     def determine_available_memory(self) -> int:
+        profile_tpsp = getattr(self.model_runner.model, "profile_tpsp_config", None)
+        if profile_tpsp is not None:
+            profile_tpsp(self.model_runner.max_num_tokens)
+
         if self._should_warm_up_model():
             self.model_runner.warming_up_model()
 

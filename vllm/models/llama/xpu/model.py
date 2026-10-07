@@ -12,7 +12,11 @@ from vllm.model_executor.models.llama import (
     LlamaForCausalLM,
     LlamaModel,
 )
-from vllm.models.tpsp_profile import SPProfile, profile_sp_config, select_sp_config
+from vllm.v1.worker.tpsp_profile import (
+    SPProfile,
+    profile_sp_config,
+    select_sp_config,
+)
 
 
 class TPSPLlamaDecoderLayer(LlamaDecoderLayer):

@@ -11,7 +11,11 @@ from vllm.model_executor.models.qwen3_moe import (
     Qwen3MoeDecoderLayer,
     Qwen3MoeForCausalLM,
 )
-from vllm.models.tpsp_profile import SPProfile, profile_sp_config, select_sp_config
+from vllm.v1.worker.tpsp_profile import (
+    SPProfile,
+    profile_sp_config,
+    select_sp_config,
+)
 
 
 class TPSPQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
