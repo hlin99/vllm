@@ -18,6 +18,7 @@ _LOG = logging.getLogger(__name__)
 _MODES = ("p2p", "ordered", "independent")
 _EPS = 1e-5
 _TRIALS = 5
+_SCREEN_TRIALS = 5
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,10 @@ def _threshold(measurements: list[SPMeasurement]) -> tuple[str, int | None, str]
     return "enabled", measurements[first].tokens, ""
 
 
+def _screen_score(samples: list[float]) -> float:
+    return sorted(samples)[1]
+
+
 def _search_chunks(
     shard_rows: int, score: Callable[[int], float | None]
 ) -> list[int] | None:
@@ -107,8 +112,6 @@ def _search_chunks(
         center = (low + high) // 2
         left = (low + center) // 2
         right = (center + high + 1) // 2
-        if len(scores) + len({left, center, right} - scores.keys()) > 15:
-            break
         for index in (left, center, right):
             if not visit(index):
                 return None
@@ -320,7 +323,7 @@ def profile_sp_config(
             measure(data, candidate)
             if expired():
                 return None
-        for trial in range(3):
+        for trial in range(_SCREEN_TRIALS):
             for mode in _MODES[trial:] + _MODES[:trial]:
                 candidate = (mode, chunk)
                 os.environ["ASYNC_TP_ALL_GATHER_MODE"] = mode
@@ -328,7 +331,7 @@ def profile_sp_config(
                 if expired():
                     return None
         score = torch.tensor(
-            [min(statistics.median(samples[mode, chunk]) for mode in _MODES)],
+            [min(_screen_score(samples[mode, chunk]) for mode in _MODES)],
             dtype=torch.float64,
             device=device,
         )
@@ -340,7 +343,7 @@ def profile_sp_config(
         return inconclusive("screening time budget exceeded")
     candidates = [(mode, chunk) for mode in _MODES for chunk in chunks]
     scores = torch.tensor(
-        [statistics.median(samples[item]) for item in candidates],
+        [_screen_score(samples[item]) for item in candidates],
         dtype=torch.float64,
         device=device,
     )

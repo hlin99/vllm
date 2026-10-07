@@ -82,10 +82,9 @@ def test_chunk_search_starts_at_half_shard_and_refines_on_64_rows():
     chunks = _search_chunks(16384, score)
     assert chunks is not None
     assert visited[0] == 8192
-    assert min(abs(chunk - 2048) for chunk in chunks) <= 64
+    assert 2048 in chunks
     assert 128 in chunks
     assert 16384 in chunks
-    assert len(chunks) <= 15
     assert all(chunk % 64 == 0 for chunk in chunks)
 
 
@@ -98,7 +97,7 @@ def test_chunk_search_respects_budget_and_small_shards():
     assert 2048 in _search_chunks(8192, lambda chunk: abs(chunk - 2048))
 
 
-def test_chunk_search_128k_tp4_has_bounded_candidates():
+def test_chunk_search_128k_tp4_starts_at_half_shard():
     pytest.importorskip("deep_symm")
     from vllm.v1.worker.tpsp_profile import _search_chunks
 
@@ -111,5 +110,24 @@ def test_chunk_search_128k_tp4_has_bounded_candidates():
     chunks = _search_chunks(32768, score)
     assert chunks is not None
     assert visited[:6] == [16384, 256, 32768, 8384, 16512, 24640]
-    assert len(chunks) <= 15
+    assert 2048 in chunks
     assert all(chunk % 64 == 0 for chunk in chunks)
+
+
+def test_chunk_search_can_miss_global_minimum():
+    pytest.importorskip("deep_symm")
+    from vllm.v1.worker.tpsp_profile import _search_chunks
+
+    def score(chunk: int) -> float:
+        return -10 if chunk == 1024 else abs(chunk - 3072)
+
+    chunks = _search_chunks(16384, score)
+    assert chunks is not None
+    assert 1024 not in chunks
+
+
+def test_screen_score_uses_second_fastest_of_five():
+    pytest.importorskip("deep_symm")
+    from vllm.v1.worker.tpsp_profile import _screen_score
+
+    assert _screen_score([5.0, 40.0, 3.0, 2.0, 4.0]) == 3.0

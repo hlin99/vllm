@@ -24,7 +24,7 @@ def main() -> None:
         assert profile.input_widths == (1024, 3584)
         assert profile.norm_eps == 1e-5
         assert not profile.gather_residual_after_native
-        assert len(profile.candidates) <= 45
+        assert profile.candidates
         assert {mode for mode, _, _ in profile.candidates} == {
             "p2p",
             "ordered",
