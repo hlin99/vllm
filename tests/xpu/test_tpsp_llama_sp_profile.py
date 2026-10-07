@@ -24,7 +24,13 @@ def main() -> None:
         assert profile.input_widths == (1024, 3584)
         assert profile.norm_eps == 1e-5
         assert not profile.gather_residual_after_native
-        assert len(profile.candidates) == 15
+        assert len(profile.candidates) <= 45
+        assert {mode for mode, _, _ in profile.candidates} == {
+            "p2p",
+            "ordered",
+            "independent",
+        }
+        assert all(chunk % 64 == 0 for _, chunk, _ in profile.candidates)
         upper = next(m for m in profile.measurements if m.tokens == 65536)
         if rank == 0:
             best = min(profile.candidates, key=lambda item: item[2])

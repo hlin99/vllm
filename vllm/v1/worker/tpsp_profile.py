@@ -5,6 +5,7 @@ import math
 import os
 import statistics
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -82,6 +83,47 @@ def _threshold(measurements: list[SPMeasurement]) -> tuple[str, int | None, str]
     return "enabled", measurements[first].tokens, ""
 
 
+def _search_chunks(
+    shard_rows: int, score: Callable[[int], float | None]
+) -> list[int] | None:
+    unit = 64
+    low = max(1, math.ceil(shard_rows / (128 * unit)))
+    high = math.ceil(shard_rows / unit)
+    center = min(high, max(low, math.ceil(shard_rows / (2 * unit))))
+    scores: dict[int, float] = {}
+
+    def visit(index: int) -> bool:
+        if index not in scores:
+            value = score(index * unit)
+            if value is None:
+                return False
+            scores[index] = value
+        return True
+
+    for index in (center, low, high):
+        if not visit(index):
+            return None
+    while high - low > 1:
+        center = (low + high) // 2
+        left = (low + center) // 2
+        right = (center + high + 1) // 2
+        if len(scores) + len({left, center, right} - scores.keys()) > 15:
+            break
+        for index in (left, center, right):
+            if not visit(index):
+                return None
+        best = min((left, center, right), key=scores.__getitem__)
+        if best < center:
+            high = center
+        elif best > center:
+            low = center
+        else:
+            if high - low == 2:
+                break
+            low, high = left, right
+    return sorted(index * unit for index in scores)
+
+
 def profile_sp_config(
     tp_size: int,
     hidden_size: int,
@@ -145,8 +187,6 @@ def profile_sp_config(
             f"ASYNC_TP_OUTPUT_POOL_MB={pool_mb} is below the profile minimum "
             f"{minimum_pool_mb}"
         )
-    chunks = sorted({min(shard_rows, n) for n in (128, 512, 1024, 2048, shard_rows)})
-    candidates = [(mode, chunk) for mode in _MODES for chunk in chunks]
     deadline = time.monotonic() + time_budget_s
 
     def expired() -> bool:
@@ -270,28 +310,48 @@ def profile_sp_config(
         )
 
     data = inputs(max_batched_tokens)
-    samples: dict[tuple[str, int], list[float]] = {
-        candidate: [] for candidate in candidates
-    }
-    for candidate in candidates:
-        os.environ["ASYNC_TP_ALL_GATHER_MODE"] = candidate[0]
-        measure(data, candidate)
-        if expired():
-            return inconclusive("screening time budget exceeded")
-    for trial in range(3):
-        order = candidates[trial:] + candidates[:trial]
-        for candidate in order:
-            os.environ["ASYNC_TP_ALL_GATHER_MODE"] = candidate[0]
-            samples[candidate].append(measure(data, candidate))
+    samples: dict[tuple[str, int], list[float]] = {}
+
+    def screen_chunk(chunk: int) -> float | None:
+        for mode in _MODES:
+            candidate = (mode, chunk)
+            samples[candidate] = []
+            os.environ["ASYNC_TP_ALL_GATHER_MODE"] = mode
+            measure(data, candidate)
             if expired():
-                return inconclusive("screening time budget exceeded")
-    candidate = min(candidates, key=lambda item: statistics.median(samples[item]))
-    os.environ["ASYNC_TP_ALL_GATHER_MODE"] = candidate[0]
-    candidate_results = tuple(
-        (mode, chunk, statistics.median(samples[mode, chunk]))
-        for mode, chunk in candidates
+                return None
+        for trial in range(3):
+            for mode in _MODES[trial:] + _MODES[:trial]:
+                candidate = (mode, chunk)
+                os.environ["ASYNC_TP_ALL_GATHER_MODE"] = mode
+                samples[candidate].append(measure(data, candidate))
+                if expired():
+                    return None
+        score = torch.tensor(
+            [min(statistics.median(samples[mode, chunk]) for mode in _MODES)],
+            dtype=torch.float64,
+            device=device,
+        )
+        dist.all_reduce(score, op=dist.ReduceOp.MAX, group=group)
+        return float(score.item())
+
+    chunks = _search_chunks(shard_rows, screen_chunk)
+    if chunks is None:
+        return inconclusive("screening time budget exceeded")
+    candidates = [(mode, chunk) for mode in _MODES for chunk in chunks]
+    scores = torch.tensor(
+        [statistics.median(samples[item]) for item in candidates],
+        dtype=torch.float64,
+        device=device,
     )
-    del data
+    dist.all_reduce(scores, op=dist.ReduceOp.MAX, group=group)
+    candidate_results = tuple(
+        (mode, chunk, float(score))
+        for (mode, chunk), score in zip(candidates, scores.tolist())
+    )
+    candidate = min(candidate_results, key=lambda item: item[2])[:2]
+    os.environ["ASYNC_TP_ALL_GATHER_MODE"] = candidate[0]
+    data = None
 
     check_data = inputs(min(max_batched_tokens, tp_size * 5 + 1))
     conventional = run(check_data, None)
