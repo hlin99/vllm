@@ -14,6 +14,8 @@ import torch.nn.functional as F
 from deep_symm.async_tp import (
     fused_matmul_reduce_scatter_norm_all_gather,
     fused_matmul_reduce_scatter_norm_route_all_gather,
+    fused_matmul_reduce_scatter_norm_route_all_gather_with_residual,
+    fused_matmul_reduce_scatter_norm_route_all_gather_xccl_ready,
 )
 from torch.distributed import distributed_c10d as c10d
 
@@ -24,6 +26,23 @@ _MODES = ("p2p", "ordered", "independent")
 _EPS = 1e-5
 _TRIALS = 5
 _SCREEN_TRIALS = 5
+_RESIDUAL_AG_MODES = ("post", "dual_early", "xccl_early")
+
+
+def configured_residual_ag_mode() -> str:
+    mode = os.environ.get("ASYNC_TP_RESIDUAL_AG_MODE")
+    legacy = os.environ.get("ASYNC_TP_DUAL_EARLY_AG", "0")
+    if legacy not in ("0", "1"):
+        raise ValueError("ASYNC_TP_DUAL_EARLY_AG must be 0 or 1")
+    if mode is None:
+        mode = "dual_early" if legacy == "1" else "post"
+    if mode not in _RESIDUAL_AG_MODES:
+        raise ValueError(
+            "ASYNC_TP_RESIDUAL_AG_MODE must be post, dual_early or xccl_early"
+        )
+    if legacy == "1" and mode != "dual_early":
+        raise ValueError("ASYNC_TP_DUAL_EARLY_AG conflicts with ASYNC_TP_RESIDUAL_AG_MODE")
+    return mode
 
 
 @dataclass(frozen=True)
@@ -53,6 +72,7 @@ class SPProfile:
     finalists: tuple[tuple[str, int, float], ...] = ()
     gather_sharded_residual: bool = False
     mode_candidates: tuple[tuple[str, int, float], ...] = ()
+    residual_ag_mode: str = "post"
 
     @property
     def enabled(self) -> bool:
@@ -142,6 +162,14 @@ def profile_sp_config(
     """Profile the projection chain, including routing when requested."""
     if time_budget_s <= 0:
         raise ValueError("time_budget_s must be positive")
+    residual_ag_mode = configured_residual_ag_mode()
+    if residual_ag_mode != "post" and (
+        not gather_residual_after_native or router_num_experts is None
+        or os.environ.get("ASYNC_TP_ROUTE_EARLY_AG", "1") != "1"
+    ):
+        raise ValueError(
+            "early residual AG requires routed residual gathering and hidden early AG"
+        )
 
     def unsupported(reason: str) -> SPProfile:
         return SPProfile(
@@ -187,6 +215,7 @@ def profile_sp_config(
         raise RuntimeError("vLLM XPU fused_add_rms_norm is unavailable")
 
     device = torch.device("xpu", torch.xpu.current_device())
+    xccl_stream = torch.xpu.Stream(device=device) if residual_ag_mode == "xccl_early" else None
     rank = dist.get_rank(group)
     shard_rows = math.ceil(max_batched_tokens / tp_size)
     output_mb = math.ceil(max_batched_tokens * hidden_size * 2 / 2**20)
@@ -300,6 +329,8 @@ def profile_sp_config(
                 outputs.append(full)
                 if router_weight is not None:
                     outputs.extend(route_reference(full, router_weight))
+                if gather_residual_after_native:
+                    outputs.append(full_residual)
             else:
                 if router_weight is not None:
                     rows = local_residual.size(0)
@@ -325,33 +356,56 @@ def profile_sp_config(
                         )
                     )
                 else:
-                    reduced, _, normalized, route_weights, route_ids = (
-                        fused_matmul_reduce_scatter_norm_route_all_gather(
-                            a,
-                            b,
-                            weight,
-                            None,
-                            router_weight,
-                            route_top_k,
-                            group_name,
-                            renormalize=route_renormalize,
-                            eps=norm_eps,
-                            norm_type="rms_norm",
-                            residual=runtime_residual,
-                            microchunk_tokens=candidate[1],
-                        )
+                    route_op = (
+                        fused_matmul_reduce_scatter_norm_route_all_gather_with_residual
+                        if residual_ag_mode == "dual_early"
+                        else fused_matmul_reduce_scatter_norm_route_all_gather_xccl_ready
+                        if residual_ag_mode == "xccl_early"
+                        else fused_matmul_reduce_scatter_norm_route_all_gather
                     )
-                if gather_residual_after_native:
-                    torch.xpu.synchronize()
+                    result = route_op(
+                        a,
+                        b,
+                        weight,
+                        None,
+                        router_weight,
+                        route_top_k,
+                        group_name,
+                        renormalize=route_renormalize,
+                        eps=norm_eps,
+                        norm_type="rms_norm",
+                        residual=runtime_residual,
+                        microchunk_tokens=candidate[1],
+                        **({"xccl_stream": xccl_stream} if xccl_stream is not None else {}),
+                    )
+                    if residual_ag_mode == "dual_early":
+                        reduced, _, normalized, route_weights, route_ids, full_residual = result
+                    else:
+                        reduced, _, normalized, route_weights, route_ids = result
+                if gather_residual_after_native and residual_ag_mode != "dual_early":
+                    if residual_ag_mode == "post":
+                        torch.xpu.synchronize()
                     gathered_residual = torch.empty(
                         (tp_size * reduced.size(0), hidden_size),
                         device=device,
                         dtype=a.dtype,
                     )
-                    dist.all_gather_into_tensor(gathered_residual, reduced, group=group)
+                    if xccl_stream is None:
+                        dist.all_gather_into_tensor(gathered_residual, reduced, group=group)
+                    else:
+                        with torch.xpu.stream(xccl_stream):
+                            dist.all_gather_into_tensor(
+                                gathered_residual, reduced, group=group
+                            )
+                        reduced.record_stream(xccl_stream)
+                        gathered_residual.record_stream(xccl_stream)
+                        torch.xpu.current_stream().wait_stream(xccl_stream)
+                    full_residual = gathered_residual[: a.size(0)].contiguous()
                 outputs.append(normalized)
                 if router_weight is not None:
                     outputs.extend((route_weights, route_ids))
+                if gather_residual_after_native:
+                    outputs.append(full_residual)
         return tuple(outputs)
 
     def measure(data, candidate) -> float:
@@ -417,19 +471,20 @@ def profile_sp_config(
         dist.all_reduce(score, op=dist.ReduceOp.MAX, group=group)
         return float(score.item())
 
+    modes = ("p2p",) if residual_ag_mode != "post" else _MODES
     representative = max(64, math.ceil(min(4096, shard_rows) / 64) * 64)
     mode_samples: dict[tuple[str, int], list[float]] = {}
-    if screen_chunk(representative, mode_samples, _MODES) is None:
+    if screen_chunk(representative, mode_samples, modes) is None:
         return inconclusive("communication mode time budget exceeded")
     mode_scores = torch.tensor(
-        [_screen_score(mode_samples[mode, representative]) for mode in _MODES],
+        [_screen_score(mode_samples[mode, representative]) for mode in modes],
         dtype=torch.float64,
         device=device,
     )
     dist.all_reduce(mode_scores, op=dist.ReduceOp.MAX, group=group)
     mode_results = tuple(
         (mode, representative, float(score))
-        for mode, score in zip(_MODES, mode_scores.tolist())
+        for mode, score in zip(modes, mode_scores.tolist())
     )
     selected_mode = min(mode_results, key=lambda item: item[2])[0]
     selected_modes = (selected_mode,)
@@ -481,10 +536,11 @@ def profile_sp_config(
         router_weight = check_data[-1]
         assert router_weight is not None
 
+    stride = 4 if gather_residual_after_native else 3
     for index, (actual, expected) in enumerate(zip(native, conventional)):
-        if router_num_experts is not None and index % 3 in (1, 2):
-            expected = route_reference(native[index - index % 3], router_weight)[
-                index % 3 - 1
+        if router_num_experts is not None and index % stride in (1, 2):
+            expected = route_reference(native[index - index % stride], router_weight)[
+                index % stride - 1
             ]
         if actual.dtype in (torch.int32, torch.int64):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -563,12 +619,13 @@ def profile_sp_config(
         finalist_results,
         gather_sharded_residual,
         mode_results,
+        residual_ag_mode,
     )
     if rank == 0:
         _LOG.warning(
             "TPSP startup profile: status=%s threshold=%s chunk=%s mode=%s "
             "widths=%s norm_eps=%s gather_residual=%s "
-            "sharded_residual=%s pool_mb=%s "
+            "sharded_residual=%s residual_ag_mode=%s pool_mb=%s "
             "mode_candidates=%s candidates=%s finalists=%s measurements=%s reason=%s",
             status,
             threshold,
@@ -578,6 +635,7 @@ def profile_sp_config(
             norm_eps,
             gather_residual_after_native,
             gather_sharded_residual,
+            residual_ag_mode,
             pool_mb,
             mode_results,
             candidate_results,

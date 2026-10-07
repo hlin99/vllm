@@ -130,3 +130,49 @@ def test_screen_score_uses_second_fastest_of_five():
     from vllm.v1.worker.tpsp_profile import _screen_score
 
     assert _screen_score([5.0, 40.0, 3.0, 2.0, 4.0]) == 3.0
+
+
+@pytest.mark.parametrize(
+    ("configured", "legacy", "expected"),
+    [
+        (None, None, "post"),
+        ("post", None, "post"),
+        ("dual_early", None, "dual_early"),
+        ("xccl_early", None, "xccl_early"),
+        (None, "1", "dual_early"),
+        ("dual_early", "1", "dual_early"),
+    ],
+)
+def test_residual_ag_mode(monkeypatch, configured, legacy, expected):
+    pytest.importorskip("deep_symm")
+    from vllm.v1.worker.tpsp_profile import configured_residual_ag_mode
+
+    for name, value in (
+        ("ASYNC_TP_RESIDUAL_AG_MODE", configured),
+        ("ASYNC_TP_DUAL_EARLY_AG", legacy),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert configured_residual_ag_mode() == expected
+
+
+@pytest.mark.parametrize(
+    ("configured", "legacy"),
+    [("invalid", None), ("post", "1"), ("xccl_early", "1"), (None, "invalid")],
+)
+def test_residual_ag_mode_rejects_invalid_config(monkeypatch, configured, legacy):
+    pytest.importorskip("deep_symm")
+    from vllm.v1.worker.tpsp_profile import configured_residual_ag_mode
+
+    for name, value in (
+        ("ASYNC_TP_RESIDUAL_AG_MODE", configured),
+        ("ASYNC_TP_DUAL_EARLY_AG", legacy),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match="ASYNC_TP"):
+        configured_residual_ag_mode()

@@ -2,9 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Experimental BF16 Qwen3 MoE attention TP/SP adapter for vLLM XPU."""
 
+from functools import lru_cache
+
 import torch
 import torch.distributed as dist
-from deep_symm.async_tp import fused_matmul_reduce_scatter_norm_route_all_gather
+from deep_symm.async_tp import (
+    fused_matmul_reduce_scatter_norm_route_all_gather,
+    fused_matmul_reduce_scatter_norm_route_all_gather_with_residual,
+    fused_matmul_reduce_scatter_norm_route_all_gather_xccl_ready,
+)
 
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
@@ -20,6 +26,11 @@ from vllm.v1.worker.tpsp_profile import (
     profile_sp_config,
     select_sp_config,
 )
+
+
+@lru_cache(maxsize=8)
+def _residual_xccl_stream(device_index: int) -> torch.xpu.Stream:
+    return torch.xpu.Stream(device=device_index)
 
 
 class TPSPQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
@@ -85,34 +96,69 @@ class TPSPQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
         gate = self.mlp.gate
         if gate.weight.dtype != torch.bfloat16:
             raise RuntimeError("TP/SP Qwen3 MoE requires a BF16 router weight")
-        reduced, _, normalized, topk_weights, topk_ids = (
-            fused_matmul_reduce_scatter_norm_route_all_gather(
-                attn_output.contiguous(),
-                cached[1],
-                self.post_attention_layernorm.weight,
-                None,
-                gate.weight,
-                self.mlp.experts.router.top_k,
-                group.device_group.group_name,
-                renormalize=self.mlp.experts.router.renormalize,
-                eps=self.post_attention_layernorm.variance_epsilon,
-                norm_type="rms_norm",
-                residual=local_residual,
-                microchunk_tokens=profile.microchunk_tokens,
+        residual_ag_mode = profile.residual_ag_mode
+        if residual_ag_mode not in ("post", "dual_early", "xccl_early"):
+            raise RuntimeError(f"Unsupported residual AG mode: {residual_ag_mode}")
+        if residual_ag_mode != "post" and profile.all_gather_mode != "p2p":
+            raise RuntimeError("Early residual AG requires P2P hidden all-gather")
+        xccl_stream = (
+            _residual_xccl_stream(attn_output.device.index)
+            if residual_ag_mode == "xccl_early"
+            else None
+        )
+        route_op = (
+            fused_matmul_reduce_scatter_norm_route_all_gather_with_residual
+            if residual_ag_mode == "dual_early"
+            else fused_matmul_reduce_scatter_norm_route_all_gather_xccl_ready
+            if xccl_stream is not None
+            else fused_matmul_reduce_scatter_norm_route_all_gather
+        )
+        result = route_op(
+            attn_output.contiguous(),
+            cached[1],
+            self.post_attention_layernorm.weight,
+            None,
+            gate.weight,
+            self.mlp.experts.router.top_k,
+            group.device_group.group_name,
+            renormalize=self.mlp.experts.router.renormalize,
+            eps=self.post_attention_layernorm.variance_epsilon,
+            norm_type="rms_norm",
+            residual=local_residual,
+            microchunk_tokens=profile.microchunk_tokens,
+            **({"xccl_stream": xccl_stream} if xccl_stream is not None else {}),
+        )
+        if residual_ag_mode == "dual_early":
+            # Match the late-XCCL path's per-layer barrier so queued outputs can be reused.
+            torch.xpu.synchronize()
+            reduced, _, normalized, topk_weights, topk_ids, full_residual = result
+        else:
+            reduced, _, normalized, topk_weights, topk_ids = result
+            if xccl_stream is None:
+                torch.xpu.synchronize()
+            padded_residual = torch.empty(
+                (group.world_size * rows, self.hidden_size),
+                device=reduced.device,
+                dtype=reduced.dtype,
             )
-        )
-        torch.xpu.synchronize()
-        padded_residual = torch.empty(
-            (group.world_size * rows, self.hidden_size),
-            device=reduced.device,
-            dtype=reduced.dtype,
-        )
-        dist.all_gather_into_tensor(
-            padded_residual, reduced.contiguous(), group=group.device_group
-        )
+            if xccl_stream is None:
+                dist.all_gather_into_tensor(
+                    padded_residual, reduced.contiguous(), group=group.device_group
+                )
+            else:
+                with torch.xpu.stream(xccl_stream):
+                    dist.all_gather_into_tensor(
+                        padded_residual, reduced, group=group.device_group
+                    )
+                reduced.record_stream(xccl_stream)
+                padded_residual.record_stream(xccl_stream)
+                torch.xpu.current_stream().wait_stream(xccl_stream)
+            full_residual = padded_residual[:tokens].contiguous()
+            if xccl_stream is not None:
+                torch.xpu.synchronize()
         return (
             self.mlp(normalized, topk_weights=topk_weights, topk_ids=topk_ids),
-            padded_residual[:tokens].contiguous(),
+            full_residual,
         )
 
 
