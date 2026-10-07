@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Experimental BF16 Llama TP/SP integration for vLLM's eager XPU runner."""
 
+import os
+
 import torch
 import torch.distributed as dist
 from deep_symm.async_tp import fused_matmul_reduce_scatter_norm_all_gather
@@ -57,6 +59,9 @@ class TPSPLlamaDecoderLayer(LlamaDecoderLayer):
             local_residual = residual
 
         if select_sp_config(profile, x.size(0)):
+            if profile.microchunk_tokens is None or profile.all_gather_mode is None:
+                raise RuntimeError("TP/SP Llama profile has no enabled configuration")
+            os.environ["ASYNC_TP_ALL_GATHER_MODE"] = profile.all_gather_mode
             weight = projection.weight
             key = (weight.data_ptr(), weight._version)
             cached = getattr(projection, "_tpsp_transposed_weight", None)
@@ -104,7 +109,7 @@ class TPSPLlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states,
         residual,
         next_norm,
-        profile: SPProfile,
+        profiles: tuple[SPProfile, SPProfile],
         residual_is_sharded: bool,
     ):
         attention = self.self_attn
@@ -119,21 +124,21 @@ class TPSPLlamaDecoderLayer(LlamaDecoderLayer):
             attention.o_proj,
             residual,
             self.post_attention_layernorm,
-            profile,
+            profiles[0],
             residual_is_sharded,
         )
         mlp = self.mlp
         hidden_states, _ = mlp.gate_up_proj(hidden_states)
         hidden_states = mlp.act_fn(hidden_states)
         return self._project_and_normalize(
-            hidden_states, mlp.down_proj, residual, next_norm, profile, True
+            hidden_states, mlp.down_proj, residual, next_norm, profiles[1], True
         )
 
 
 class TPSPLlamaModel(LlamaModel):
     def __init__(self, *, vllm_config, prefix="", layer_type=TPSPLlamaDecoderLayer):
         super().__init__(vllm_config=vllm_config, prefix=prefix, layer_type=layer_type)
-        self.sp_profile: SPProfile | None = None
+        self.sp_profiles: tuple[SPProfile, SPProfile] | None = None
 
     def forward(
         self,
@@ -147,7 +152,7 @@ class TPSPLlamaModel(LlamaModel):
             raise RuntimeError("TP/SP Llama does not support pipeline parallelism")
         if extra_layer_kwargs:
             raise RuntimeError("TP/SP Llama does not support extra layer arguments")
-        if self.sp_profile is None:
+        if self.sp_profiles is None:
             raise RuntimeError("TP/SP Llama requires XPU V2 worker startup profiling")
         hidden_states = (
             inputs_embeds
@@ -163,7 +168,12 @@ class TPSPLlamaModel(LlamaModel):
                 else self.norm
             )
             hidden_states, residual = layer.forward_sp(
-                positions, hidden_states, residual, next_norm, self.sp_profile, idx != 0
+                positions,
+                hidden_states,
+                residual,
+                next_norm,
+                self.sp_profiles,
+                idx != 0,
             )
         return hidden_states
 
@@ -186,17 +196,25 @@ class TPSPLlamaForCausalLM(LlamaForCausalLM):
         )
 
     def profile_tpsp_config(self, max_num_batched_tokens: int) -> None:
-        if self.model.sp_profile is not None:
+        if self.model.sp_profiles is not None:
             return
         group = get_tp_group()
-        self.model.sp_profile = profile_sp_config(
-            tp_size=group.world_size,
-            hidden_size=self.config.hidden_size,
-            max_batched_tokens=max_num_batched_tokens,
-            group_name=group.device_group.group_name,
-            time_budget_s=240.0,
-            input_widths=(
-                self.config.hidden_size // group.world_size,
+
+        def profile_width(width: int, sharded_residual: bool = False) -> SPProfile:
+            return profile_sp_config(
+                tp_size=group.world_size,
+                hidden_size=self.config.hidden_size,
+                max_batched_tokens=max_num_batched_tokens,
+                group_name=group.device_group.group_name,
+                time_budget_s=240.0,
+                input_widths=(width,),
+                gather_sharded_residual=sharded_residual,
+            )
+
+        self.model.sp_profiles = (
+            profile_width(self.config.hidden_size // group.world_size),
+            profile_width(
                 self.config.intermediate_size // group.world_size,
+                sharded_residual=True,
             ),
         )

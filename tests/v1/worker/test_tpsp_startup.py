@@ -120,8 +120,9 @@ def test_top_chunks_selects_distinct_global_front_runners():
         for chunk, value in ((64, 3.0), (128, 1.0), (192, 2.0))
         for mode in ("p2p", "ordered", "independent")
     }
-    assert _top_chunks([64, 128, 192], scores) == [128, 192]
-    assert _top_chunks([64], scores) == [64]
+    scores["p2p", 128] = 5.0
+    assert _top_chunks([64, 128, 192], scores, "p2p") == [192, 64]
+    assert _top_chunks([64], scores, "p2p") == [64]
 
 
 def test_screen_score_uses_second_fastest_of_five():

@@ -46,6 +46,8 @@ class SPProfile:
     norm_eps: float = _EPS
     gather_residual_after_native: bool = False
     finalists: tuple[tuple[str, int, float], ...] = ()
+    gather_sharded_residual: bool = False
+    mode_candidates: tuple[tuple[str, int, float], ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -110,10 +112,10 @@ def _search_chunks(
     return chunks
 
 
-def _top_chunks(chunks: list[int], scores: dict[tuple[str, int], float]) -> list[int]:
-    return sorted(
-        chunks, key=lambda chunk: min(scores[mode, chunk] for mode in _MODES)
-    )[:2]
+def _top_chunks(
+    chunks: list[int], scores: dict[tuple[str, int], float], mode: str
+) -> list[int]:
+    return sorted(chunks, key=lambda chunk: scores[mode, chunk])[:2]
 
 
 def profile_sp_config(
@@ -125,6 +127,7 @@ def profile_sp_config(
     input_widths: tuple[int, ...] | None = None,
     norm_eps: float = _EPS,
     gather_residual_after_native: bool = False,
+    gather_sharded_residual: bool = False,
 ) -> SPProfile:
     """Profile the complete projection chain with one shared chunk on every TP rank."""
     if time_budget_s <= 0:
@@ -234,7 +237,7 @@ def profile_sp_config(
                 partial = F.linear(a, linear_weight)
                 full = partial.clone()
                 dist.all_reduce(full, op=dist.ReduceOp.SUM, group=group)
-                if index:
+                if index or gather_sharded_residual:
                     rows = local_residual.size(0)
                     gathered_residual = torch.empty(
                         (tp_size * rows, hidden_size), device=device, dtype=a.dtype
@@ -299,15 +302,18 @@ def profile_sp_config(
             input_widths=input_widths,
             norm_eps=norm_eps,
             gather_residual_after_native=gather_residual_after_native,
+            gather_sharded_residual=gather_sharded_residual,
         )
 
     data = inputs(max_batched_tokens)
     samples: dict[tuple[str, int], list[float]] = {}
 
     def screen_chunk(
-        chunk: int, results: dict[tuple[str, int], list[float]]
+        chunk: int,
+        results: dict[tuple[str, int], list[float]],
+        modes: tuple[str, ...],
     ) -> float | None:
-        for mode in _MODES:
+        for mode in modes:
             candidate = (mode, chunk)
             results[candidate] = []
             os.environ["ASYNC_TP_ALL_GATHER_MODE"] = mode
@@ -315,24 +321,44 @@ def profile_sp_config(
             if expired():
                 return None
         for trial in range(_SCREEN_TRIALS):
-            for mode in _MODES[trial:] + _MODES[:trial]:
+            offset = trial % len(modes)
+            for mode in modes[offset:] + modes[:offset]:
                 candidate = (mode, chunk)
                 os.environ["ASYNC_TP_ALL_GATHER_MODE"] = mode
                 results[candidate].append(measure(data, candidate))
                 if expired():
                     return None
         score = torch.tensor(
-            [min(_screen_score(results[mode, chunk]) for mode in _MODES)],
+            [min(_screen_score(results[mode, chunk]) for mode in modes)],
             dtype=torch.float64,
             device=device,
         )
         dist.all_reduce(score, op=dist.ReduceOp.MAX, group=group)
         return float(score.item())
 
-    chunks = _search_chunks(shard_rows, lambda chunk: screen_chunk(chunk, samples))
+    representative = max(64, math.ceil(min(4096, shard_rows) / 64) * 64)
+    mode_samples: dict[tuple[str, int], list[float]] = {}
+    if screen_chunk(representative, mode_samples, _MODES) is None:
+        return inconclusive("communication mode time budget exceeded")
+    mode_scores = torch.tensor(
+        [_screen_score(mode_samples[mode, representative]) for mode in _MODES],
+        dtype=torch.float64,
+        device=device,
+    )
+    dist.all_reduce(mode_scores, op=dist.ReduceOp.MAX, group=group)
+    mode_results = tuple(
+        (mode, representative, float(score))
+        for mode, score in zip(_MODES, mode_scores.tolist())
+    )
+    selected_mode = min(mode_results, key=lambda item: item[2])[0]
+    selected_modes = (selected_mode,)
+    chunks = _search_chunks(
+        shard_rows,
+        lambda chunk: screen_chunk(chunk, samples, selected_modes),
+    )
     if chunks is None:
         return inconclusive("screening time budget exceeded")
-    candidates = [(mode, chunk) for mode in _MODES for chunk in chunks]
+    candidates = [(selected_mode, chunk) for chunk in chunks]
     scores = torch.tensor(
         [_screen_score(samples[item]) for item in candidates],
         dtype=torch.float64,
@@ -344,14 +370,14 @@ def profile_sp_config(
         for (mode, chunk), score in zip(candidates, scores.tolist())
     )
     screened_scores = {(mode, chunk): score for mode, chunk, score in candidate_results}
-    finalists = _top_chunks(chunks, screened_scores)
+    finalists = _top_chunks(chunks, screened_scores, selected_mode)
     retested: dict[tuple[str, int], list[float]] = {}
     for chunk in finalists:
-        if screen_chunk(chunk, retested) is None:
+        if screen_chunk(chunk, retested, selected_modes) is None:
             return inconclusive(
                 "finalist time budget exceeded", candidate_results=candidate_results
             )
-    finalist_candidates = [(mode, chunk) for chunk in finalists for mode in _MODES]
+    finalist_candidates = [(selected_mode, chunk) for chunk in finalists]
     final_scores = torch.tensor(
         [_screen_score(retested[item]) for item in finalist_candidates],
         dtype=torch.float64,
@@ -440,12 +466,15 @@ def profile_sp_config(
         norm_eps,
         gather_residual_after_native,
         finalist_results,
+        gather_sharded_residual,
+        mode_results,
     )
     if rank == 0:
         _LOG.warning(
             "TPSP startup profile: status=%s threshold=%s chunk=%s mode=%s "
-            "widths=%s norm_eps=%s gather_residual=%s pool_mb=%s "
-            "candidates=%s finalists=%s measurements=%s reason=%s",
+            "widths=%s norm_eps=%s gather_residual=%s "
+            "sharded_residual=%s pool_mb=%s "
+            "mode_candidates=%s candidates=%s finalists=%s measurements=%s reason=%s",
             status,
             threshold,
             profile.microchunk_tokens,
@@ -453,7 +482,9 @@ def profile_sp_config(
             input_widths,
             norm_eps,
             gather_residual_after_native,
+            gather_sharded_residual,
             pool_mb,
+            mode_results,
             candidate_results,
             finalist_results,
             measurements,
