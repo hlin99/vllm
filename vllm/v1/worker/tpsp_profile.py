@@ -11,8 +11,13 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from deep_symm.async_tp import fused_matmul_reduce_scatter_norm_all_gather
+from deep_symm.async_tp import (
+    fused_matmul_reduce_scatter_norm_all_gather,
+    fused_matmul_reduce_scatter_norm_route_all_gather,
+)
 from torch.distributed import distributed_c10d as c10d
+
+import vllm._custom_ops as ops
 
 _LOG = logging.getLogger(__name__)
 _MODES = ("p2p", "ordered", "independent")
@@ -128,8 +133,13 @@ def profile_sp_config(
     norm_eps: float = _EPS,
     gather_residual_after_native: bool = False,
     gather_sharded_residual: bool = False,
+    check_rtol: float = 0.01,
+    check_atol: float = 0.02,
+    router_num_experts: int | None = None,
+    route_top_k: int | None = None,
+    route_renormalize: bool = True,
 ) -> SPProfile:
-    """Profile the complete projection chain with one shared chunk on every TP rank."""
+    """Profile the projection chain, including routing when requested."""
     if time_budget_s <= 0:
         raise ValueError("time_budget_s must be positive")
 
@@ -156,6 +166,14 @@ def profile_sp_config(
         )
     if norm_eps <= 0:
         raise ValueError("norm_eps must be positive")
+    if check_rtol < 0 or check_atol < 0:
+        raise ValueError("numerical check tolerances must be nonnegative")
+    if (router_num_experts is None) != (route_top_k is None):
+        raise ValueError("Routing requires both router_num_experts and route_top_k")
+    if router_num_experts is not None:
+        assert route_top_k is not None
+        if not 1 <= route_top_k <= min(32, router_num_experts):
+            raise ValueError("route_top_k must be in [1, min(32, router_num_experts)]")
     if not torch.xpu.is_available():
         return unsupported("requires XPU")
     group = c10d._resolve_process_group(group_name)
@@ -222,16 +240,46 @@ def profile_sp_config(
             tp_size * rows, hidden_size, dtype=torch.bfloat16, device=device
         )
         padded[:tokens].copy_(residual)
+        router_weight = None
+        if router_num_experts is not None:
+            router_weight = torch.randn(
+                router_num_experts,
+                hidden_size,
+                device=device,
+                dtype=torch.bfloat16,
+                generator=torch.Generator(device=device).manual_seed(291),
+            ) / math.sqrt(hidden_size)
         return (
             projections,
             weight,
             residual,
             padded.narrow(0, rank * rows, rows).contiguous(),
+            router_weight,
         )
 
+    def route_reference(normalized, router_weight):
+        assert route_top_k is not None
+        logits = torch.mm(normalized, router_weight.T, out_dtype=torch.float32)
+        route_weights = torch.empty(
+            (normalized.size(0), route_top_k), dtype=torch.float32, device=device
+        )
+        route_ids = torch.empty(
+            (normalized.size(0), route_top_k), dtype=torch.int32, device=device
+        )
+        token_expert_indices = torch.empty_like(route_ids)
+        ops.topk_softmax(
+            route_weights,
+            route_ids,
+            token_expert_indices,
+            logits,
+            route_renormalize,
+        )
+        return route_weights, route_ids
+
     def run(data, candidate):
-        projections, weight, residual, local_residual = data
+        projections, weight, residual, local_residual, router_weight = data
         outputs = []
+
         for index, (a, b, linear_weight) in enumerate(projections):
             if candidate is None:
                 partial = F.linear(a, linear_weight)
@@ -250,18 +298,49 @@ def profile_sp_config(
                     full_residual = residual.clone()
                 torch.ops._C.fused_add_rms_norm(full, full_residual, weight, norm_eps)
                 outputs.append(full)
+                if router_weight is not None:
+                    outputs.extend(route_reference(full, router_weight))
             else:
-                reduced, _, normalized = fused_matmul_reduce_scatter_norm_all_gather(
-                    a,
-                    b,
-                    weight,
-                    None,
-                    group_name,
-                    eps=norm_eps,
-                    norm_type="rms_norm",
-                    residual=local_residual,
-                    microchunk_tokens=candidate[1],
-                )
+                if router_weight is not None:
+                    rows = local_residual.size(0)
+                    start = rank * rows
+                    runtime_residual = torch.zeros_like(local_residual)
+                    count = min(rows, max(0, a.size(0) - start))
+                    if count:
+                        runtime_residual[:count] = residual[start : start + count]
+                else:
+                    runtime_residual = local_residual
+                if router_weight is None:
+                    reduced, _, normalized = (
+                        fused_matmul_reduce_scatter_norm_all_gather(
+                            a,
+                            b,
+                            weight,
+                            None,
+                            group_name,
+                            eps=norm_eps,
+                            norm_type="rms_norm",
+                            residual=runtime_residual,
+                            microchunk_tokens=candidate[1],
+                        )
+                    )
+                else:
+                    reduced, _, normalized, route_weights, route_ids = (
+                        fused_matmul_reduce_scatter_norm_route_all_gather(
+                            a,
+                            b,
+                            weight,
+                            None,
+                            router_weight,
+                            route_top_k,
+                            group_name,
+                            renormalize=route_renormalize,
+                            eps=norm_eps,
+                            norm_type="rms_norm",
+                            residual=runtime_residual,
+                            microchunk_tokens=candidate[1],
+                        )
+                    )
                 if gather_residual_after_native:
                     torch.xpu.synchronize()
                     gathered_residual = torch.empty(
@@ -271,6 +350,8 @@ def profile_sp_config(
                     )
                     dist.all_gather_into_tensor(gathered_residual, reduced, group=group)
                 outputs.append(normalized)
+                if router_weight is not None:
+                    outputs.extend((route_weights, route_ids))
         return tuple(outputs)
 
     def measure(data, candidate) -> float:
@@ -396,7 +477,21 @@ def profile_sp_config(
     conventional = run(check_data, None)
     native = run(check_data, candidate)
     torch.xpu.synchronize()
-    torch.testing.assert_close(native, conventional, rtol=0.01, atol=0.02)
+    if router_num_experts is not None:
+        router_weight = check_data[-1]
+        assert router_weight is not None
+
+    for index, (actual, expected) in enumerate(zip(native, conventional)):
+        if router_num_experts is not None and index % 3 in (1, 2):
+            expected = route_reference(native[index - index % 3], router_weight)[
+                index % 3 - 1
+            ]
+        if actual.dtype in (torch.int32, torch.int64):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(
+                actual, expected, rtol=check_rtol, atol=check_atol
+            )
     del check_data, conventional, native
 
     def measure_size(tokens: int) -> SPMeasurement | None:

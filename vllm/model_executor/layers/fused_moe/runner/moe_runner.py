@@ -121,8 +121,17 @@ def _moe_forward(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    if topk_weights is None:
+        return cast(
+            torch.Tensor,
+            layer._forward_impl(
+                hidden_states, router_logits, shared_experts_input, input_ids
+            ),
+        )
     return cast(
         torch.Tensor,
         layer._forward_impl(
@@ -130,6 +139,8 @@ def _moe_forward(
             router_logits,
             shared_experts_input,
             input_ids,
+            topk_weights,
+            topk_ids,
         ),
     )
 
@@ -141,6 +152,8 @@ def _moe_forward_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # `hidden_dim_unpadded > 0` only on the TRT-LLM MXFP4 path, where the
     # real kernel writes narrower than `hidden_states.shape[-1]`. Plumbed
@@ -158,8 +171,17 @@ def _moe_forward_shared(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    if topk_weights is None:
+        return cast(
+            tuple[torch.Tensor, torch.Tensor],
+            layer._forward_impl(
+                hidden_states, router_logits, shared_experts_input, input_ids
+            ),
+        )
     return cast(
         tuple[torch.Tensor, torch.Tensor],
         layer._forward_impl(
@@ -167,6 +189,8 @@ def _moe_forward_shared(
             router_logits,
             shared_experts_input,
             input_ids,
+            topk_weights,
+            topk_ids,
         ),
     )
 
@@ -178,6 +202,8 @@ def _moe_forward_shared_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # `fused_out`: see `_moe_forward_fake` for hidden_dim_unpadded semantics.
     # `shared_out`: matches `shared_experts_input` if provided (latent MoE),
@@ -599,6 +625,8 @@ class MoERunner(MoERunnerInterface):
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
         shared_experts_overlapping: bool = False,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | UnfinalizedMoEOutput]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -615,6 +643,8 @@ class MoERunner(MoERunnerInterface):
         )
 
         if self.routed_experts.quant_method.is_monolithic:
+            if topk_weights is not None:
+                raise RuntimeError("Precomputed MoE routing requires modular experts")
             # Monolithic kernels: pass router_logits to routed_experts
             fused_out = self.routed_experts.forward_monolithic(
                 x=hidden_states,
@@ -623,12 +653,18 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+            if topk_weights is None:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
+            else:
+                assert topk_ids is not None
+                indices_dtype = self._quant_method.topk_indices_dtype
+                if indices_dtype is not None and topk_ids.dtype != indices_dtype:
+                    topk_ids = topk_ids.to(indices_dtype)
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
@@ -688,6 +724,8 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
@@ -708,6 +746,27 @@ class MoERunner(MoERunnerInterface):
         1. pytorch cannot handle union types in custom op signatures so
            _moe_forward and _moe_forward_shared must be split.
         """
+        if (topk_weights is None) != (topk_ids is None):
+            raise ValueError(
+                "Precomputed MoE routing requires weights and IDs together"
+            )
+        if topk_weights is not None:
+            assert topk_ids is not None
+        if topk_weights is not None and (
+            self.gate is None
+            or self.router.capture_fn is not None
+            or self.do_naive_dispatch_combine
+            or self.moe_config.pcp_size > 1
+            or self.routed_input_transform is not None
+            or self._quant_method.is_monolithic
+            or topk_weights.shape != topk_ids.shape
+            or topk_weights.shape != (hidden_states.shape[0], self.router.top_k)
+            or topk_weights.dtype != torch.float32
+            or topk_ids.dtype not in (torch.int32, torch.int64)
+        ):
+            raise RuntimeError(
+                "MoE configuration or routing tensors do not support precomputed top-k"
+            )
         # Apply transform for routed experts (e.g., latent projection for
         # latent MoE). When the caller pre-applies the routed input transform
         # outside the runner (e.g. to overlap it on a separate stream), it
@@ -731,7 +790,7 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        result = self._forward_entry(
+        args = (
             hidden_states,
             router_logits,
             shared_experts_input,
@@ -740,6 +799,11 @@ class MoERunner(MoERunnerInterface):
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
             else 0,
+        )
+        result = (
+            self._forward_entry(*args)
+            if topk_weights is None
+            else self._forward_entry(*args, topk_weights, topk_ids)
         )
 
         #
@@ -868,6 +932,8 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
     ) -> (
         torch.Tensor
         | UnfinalizedMoEOutput
@@ -900,7 +966,7 @@ class MoERunner(MoERunnerInterface):
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
+        if self.gate is not None and topk_weights is None:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = dispatch_unquantized_gemm()(
@@ -918,12 +984,16 @@ class MoERunner(MoERunnerInterface):
                 router_logits,
             )
 
+            kwargs = {}
+            if topk_weights is not None:
+                kwargs = {"topk_weights": topk_weights, "topk_ids": topk_ids}
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
                 shared_experts_overlapping=shared_experts_overlapping,
+                **kwargs,
             )
 
             return self._maybe_combine(

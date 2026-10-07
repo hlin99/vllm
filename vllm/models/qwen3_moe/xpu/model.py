@@ -4,12 +4,16 @@
 
 import torch
 import torch.distributed as dist
-from deep_symm.async_tp import fused_matmul_reduce_scatter_norm_all_gather
+from deep_symm.async_tp import fused_matmul_reduce_scatter_norm_route_all_gather
 
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+    FusedTopKRouter,
+)
 from vllm.model_executor.models.qwen3_moe import (
     Qwen3MoeDecoderLayer,
     Qwen3MoeForCausalLM,
+    Qwen3MoeSparseMoeBlock,
 )
 from vllm.v1.worker.tpsp_profile import (
     SPProfile,
@@ -78,16 +82,24 @@ class TPSPQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
         count = min(rows, max(0, tokens - start))
         if count:
             local_residual[:count] = residual[start : start + count]
-        reduced, _, normalized = fused_matmul_reduce_scatter_norm_all_gather(
-            attn_output.contiguous(),
-            cached[1],
-            self.post_attention_layernorm.weight,
-            None,
-            group.device_group.group_name,
-            eps=self.post_attention_layernorm.variance_epsilon,
-            norm_type="rms_norm",
-            residual=local_residual,
-            microchunk_tokens=profile.microchunk_tokens,
+        gate = self.mlp.gate
+        if gate.weight.dtype != torch.bfloat16:
+            raise RuntimeError("TP/SP Qwen3 MoE requires a BF16 router weight")
+        reduced, _, normalized, topk_weights, topk_ids = (
+            fused_matmul_reduce_scatter_norm_route_all_gather(
+                attn_output.contiguous(),
+                cached[1],
+                self.post_attention_layernorm.weight,
+                None,
+                gate.weight,
+                self.mlp.experts.router.top_k,
+                group.device_group.group_name,
+                renormalize=self.mlp.experts.router.renormalize,
+                eps=self.post_attention_layernorm.variance_epsilon,
+                norm_type="rms_norm",
+                residual=local_residual,
+                microchunk_tokens=profile.microchunk_tokens,
+            )
         )
         torch.xpu.synchronize()
         padded_residual = torch.empty(
@@ -98,7 +110,10 @@ class TPSPQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
         dist.all_gather_into_tensor(
             padded_residual, reduced.contiguous(), group=group.device_group
         )
-        return self.mlp(normalized), padded_residual[:tokens].contiguous()
+        return (
+            self.mlp(normalized, topk_weights=topk_weights, topk_ids=topk_ids),
+            padded_residual[:tokens].contiguous(),
+        )
 
 
 class TPSPQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
@@ -130,15 +145,39 @@ class TPSPQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
             raise RuntimeError(
                 "TP/SP Qwen3 MoE attention projection widths differ across layers"
             )
+        width = widths.pop()
+        coder_shape = self.config.hidden_size == 6144 and width == 3072
+        for layer in self.model.layers:
+            if (
+                not isinstance(layer.mlp, Qwen3MoeSparseMoeBlock)
+                or not isinstance(layer.mlp.experts.router, FusedTopKRouter)
+                or layer.mlp.experts.router.scoring_func != "softmax"
+                or layer.mlp.experts.router.capture_fn is not None
+                or layer.mlp.experts.gate is not layer.mlp.gate
+                or layer.mlp.shared_expert is not None
+                or layer.mlp.is_sequence_parallel
+                or layer.mlp.enable_eplb
+                or layer.mlp.experts.is_monolithic
+                or layer.mlp.gate.weight.dtype != torch.bfloat16
+            ):
+                raise RuntimeError(
+                    "TP/SP Qwen3 MoE requires modular BF16 softmax routing "
+                    "without shared experts, EPLB or sequence parallelism"
+                )
         self.sp_profile = profile_sp_config(
             tp_size=group.world_size,
             hidden_size=self.config.hidden_size,
             max_batched_tokens=max_num_batched_tokens,
             group_name=group.device_group.group_name,
             time_budget_s=180.0,
-            input_widths=(widths.pop(),),
+            input_widths=(width,),
             norm_eps=self.config.rms_norm_eps,
             gather_residual_after_native=True,
+            check_rtol=0.02 if coder_shape else 0.01,
+            check_atol=0.05 if coder_shape else 0.02,
+            router_num_experts=self.config.num_experts,
+            route_top_k=self.config.num_experts_per_tok,
+            route_renormalize=self.config.norm_topk_prob,
         )
         for layer in self.model.layers:
             layer.sp_profile = self.sp_profile

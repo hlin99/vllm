@@ -216,7 +216,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             is_fused_checkpoint_transposed=is_fused_checkpoint_transposed,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         assert hidden_states.dim() <= 2, (
             "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
         )
@@ -225,10 +230,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         if self.is_sequence_parallel:
+            if topk_weights is not None:
+                raise RuntimeError(
+                    "Precomputed routing does not support MoE sequence parallelism"
+                )
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=hidden_states
+            hidden_states=hidden_states,
+            router_logits=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
         )
 
         if self.is_sequence_parallel:
