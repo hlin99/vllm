@@ -561,7 +561,13 @@ class Qwen3MoeForCausalLM(
 
     fall_back_to_pt_during_load = False
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        decoder_layer_type: type[torch.nn.Module] = Qwen3MoeDecoderLayer,
+    ):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
         quant_config = vllm_config.quant_config
@@ -571,7 +577,9 @@ class Qwen3MoeForCausalLM(
         if getattr(config, "mlp_only_layers", []):
             self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
         self.model = Qwen3MoeModel(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+            decoder_layer_type=decoder_layer_type,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,

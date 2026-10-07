@@ -14,6 +14,12 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.mm_encoder_model_runner import MMEncoderModelRunner
 
 
+def _profile_tpsp_config(model, max_num_tokens: int) -> None:
+    profile_tpsp = getattr(model, "profile_tpsp_config", None)
+    if profile_tpsp is not None:
+        profile_tpsp(max_num_tokens)
+
+
 class XPUModelRunner(GPUModelRunner):
     """A model runner for XPU devices."""
 
@@ -27,6 +33,10 @@ class XPUModelRunner(GPUModelRunner):
         # FIXME: To be verified.
         self.cascade_attn_enabled = False
 
+    def profile_run(self, randomize_inputs: bool = False) -> None:
+        _profile_tpsp_config(self.model, self.max_num_tokens)
+        super().profile_run(randomize_inputs=randomize_inputs)
+
 
 class XPUModelRunnerV2(GPUModelRunnerV2):
     """A model runner for XPU devices."""
@@ -38,6 +48,10 @@ class XPUModelRunnerV2(GPUModelRunnerV2):
     ):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+
+    def profile_run(self, randomize_inputs: bool = False) -> None:
+        _profile_tpsp_config(self.model, self.max_num_tokens)
+        super().profile_run(randomize_inputs=randomize_inputs)
 
 
 class XPUMMEncoderModelRunner(MMEncoderModelRunner):
