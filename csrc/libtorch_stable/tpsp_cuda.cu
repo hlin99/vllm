@@ -347,14 +347,20 @@ struct TpspP2pContext {
   bool direct_gather = false;
   ncclComm_t comm;
   void* workspace = nullptr;
+  void* output_workspace = nullptr;
   void* signal_one = nullptr;
   std::vector<void*> peers;
+  std::vector<void*> output_peers;
 
   void close_peer_mappings() {
     for (int source = 0; source < tp_size; ++source) {
       if (source != rank && peers[source]) {
         STD_CUDA_CHECK(cudaIpcCloseMemHandle(peers[source]));
         peers[source] = nullptr;
+      }
+      if (source != rank && output_peers[source]) {
+        STD_CUDA_CHECK(cudaIpcCloseMemHandle(output_peers[source]));
+        output_peers[source] = nullptr;
       }
     }
   }
@@ -368,6 +374,10 @@ struct TpspP2pContext {
       STD_CUDA_CHECK(cudaFree(workspace));
       workspace = nullptr;
     }
+    if (output_workspace) {
+      STD_CUDA_CHECK(cudaFree(output_workspace));
+      output_workspace = nullptr;
+    }
   }
 
   ~TpspP2pContext() {
@@ -375,12 +385,18 @@ struct TpspP2pContext {
       if (source != rank && peers[source]) {
         cudaIpcCloseMemHandle(peers[source]);
       }
+      if (source != rank && output_peers[source]) {
+        cudaIpcCloseMemHandle(output_peers[source]);
+      }
     }
     if (signal_one) {
       cudaFree(signal_one);
     }
     if (workspace) {
       cudaFree(workspace);
+    }
+    if (output_workspace) {
+      cudaFree(output_workspace);
     }
   }
 };
@@ -411,6 +427,12 @@ torch::stable::Tensor make_bf16(const torch::stable::Tensor& a, int64_t rows,
                                 int64_t cols) {
   return torch::stable::empty({rows, cols}, a.scalar_type(), std::nullopt,
                               a.device());
+}
+
+torch::stable::Tensor make_p2p_output(const torch::stable::Tensor& a,
+                                      void* data, int64_t rows, int64_t cols) {
+  return torch::stable::from_blob(data, {rows, cols}, {cols, 1}, a.device(),
+                                  a.scalar_type());
 }
 
 template <typename Gemm>
@@ -447,7 +469,9 @@ int64_t init_tpsp_p2p(int64_t device_index, int64_t comm_address,
           max_chunk_rows <= (std::numeric_limits<int64_t>::max() -
                              kTpspFlagPhases * tp_size * int64_t(sizeof(int))) /
                                 tp_size / hidden_size /
-                                (kTpspDataRegions * int64_t(sizeof(bf16))),
+                                (kTpspDataRegions * int64_t(sizeof(bf16))) &&
+          max_tokens <= std::numeric_limits<int64_t>::max() / hidden_size /
+                            int64_t(sizeof(bf16)),
       "Invalid TPSP P2P configuration");
   const torch::stable::accelerator::DeviceGuard guard(device_index);
   auto stream = get_current_cuda_stream();
@@ -468,17 +492,28 @@ int64_t init_tpsp_p2p(int64_t device_index, int64_t comm_address,
   context->max_tokens = max_tokens;
   context->direct_gather = true;
   context->peers.resize(tp_size, nullptr);
+  context->output_peers.resize(tp_size, nullptr);
   size_t bytes =
       context->flag_offset + context->pipeline_slots * context->flag_slot_bytes;
+  size_t output_bytes = max_tokens * hidden_size * sizeof(bf16);
 
   cudaError_t allocated = cudaMalloc(&context->workspace, bytes);
   if (allocated == cudaSuccess) {
+    allocated = cudaMalloc(&context->output_workspace, output_bytes);
+  }
+  if (allocated == cudaSuccess) {
     allocated = cudaMalloc(&context->signal_one, sizeof(unsigned int));
   }
-  cudaIpcMemHandle_t own_handle{};
-  bool exported =
-      allocated == cudaSuccess &&
-      cudaIpcGetMemHandle(&own_handle, context->workspace) == cudaSuccess;
+  struct IpcHandles {
+    cudaIpcMemHandle_t workspace;
+    cudaIpcMemHandle_t output;
+  };
+  IpcHandles own_handles{};
+  bool exported = allocated == cudaSuccess &&
+                  cudaIpcGetMemHandle(&own_handles.workspace,
+                                      context->workspace) == cudaSuccess &&
+                  cudaIpcGetMemHandle(&own_handles.output,
+                                      context->output_workspace) == cudaSuccess;
   if (!all_tpsp_ranks_ready(exported, comm, stream)) {
     context->free_local();
     return 0;
@@ -486,30 +521,38 @@ int64_t init_tpsp_p2p(int64_t device_index, int64_t comm_address,
 
   unsigned char* send = nullptr;
   unsigned char* recv = nullptr;
-  STD_CUDA_CHECK(cudaMalloc(&send, sizeof(own_handle)));
+  STD_CUDA_CHECK(cudaMalloc(&send, sizeof(own_handles)));
   auto send_buffer =
       std::unique_ptr<unsigned char, decltype(&cudaFree)>(send, cudaFree);
-  STD_CUDA_CHECK(cudaMalloc(&recv, tp_size * sizeof(own_handle)));
+  STD_CUDA_CHECK(cudaMalloc(&recv, tp_size * sizeof(own_handles)));
   auto recv_buffer =
       std::unique_ptr<unsigned char, decltype(&cudaFree)>(recv, cudaFree);
-  STD_CUDA_CHECK(cudaMemcpyAsync(send, &own_handle, sizeof(own_handle),
+  STD_CUDA_CHECK(cudaMemcpyAsync(send, &own_handles, sizeof(own_handles),
                                  cudaMemcpyHostToDevice, stream));
   // Bootstrap IPC mappings over the existing NCCL communicator.
-  STD_TORCH_CHECK(ncclAllGather(send, recv, sizeof(own_handle), ncclUint8, comm,
-                                stream) == ncclSuccess,
+  STD_TORCH_CHECK(ncclAllGather(send, recv, sizeof(own_handles), ncclUint8,
+                                comm, stream) == ncclSuccess,
                   "TPSP P2P handle exchange failed");
-  std::vector<cudaIpcMemHandle_t> handles(tp_size);
+  std::vector<IpcHandles> handles(tp_size);
   STD_CUDA_CHECK(cudaMemcpyAsync(handles.data(), recv,
-                                 tp_size * sizeof(own_handle),
+                                 tp_size * sizeof(own_handles),
                                  cudaMemcpyDeviceToHost, stream));
   STD_CUDA_CHECK(cudaStreamSynchronize(stream));
   context->peers[rank] = context->workspace;
+  context->output_peers[rank] = context->output_workspace;
   bool mapped = true;
   for (int source = 0; source < tp_size; ++source) {
-    if (source != rank &&
-        cudaIpcOpenMemHandle(&context->peers[source], handles[source],
+    if (source == rank) {
+      continue;
+    }
+    if (cudaIpcOpenMemHandle(&context->peers[source], handles[source].workspace,
                              cudaIpcMemLazyEnablePeerAccess) != cudaSuccess) {
-      context->peers[source] = nullptr;
+      mapped = false;
+      break;
+    }
+    if (cudaIpcOpenMemHandle(&context->output_peers[source],
+                             handles[source].output,
+                             cudaIpcMemLazyEnablePeerAccess) != cudaSuccess) {
       mapped = false;
       break;
     }
@@ -663,7 +706,8 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
     pipeline = state.get();
   }
   bool direct_p2p_gather = p2p && p2p_context->direct_gather;
-  STD_TORCH_CHECK(!direct_p2p_gather || tokens <= p2p_context->max_tokens,
+  STD_TORCH_CHECK(!direct_p2p_gather || (tokens <= p2p_context->max_tokens &&
+                                         p2p_context->output_workspace),
                   "TPSP direct P2P output exceeds workspace capacity");
   std::vector<ChunkBuffers> buffers;
   int buffer_slots =
@@ -679,7 +723,10 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
     });
   }
   auto new_residual = make_bf16(a, rows, hidden);
-  auto gathered = make_bf16(a, tokens, hidden);
+  auto gathered =
+      direct_p2p_gather
+          ? make_p2p_output(a, p2p_context->output_workspace, tokens, hidden)
+          : make_bf16(a, tokens, hidden);
   bool direct_output_alias = direct_p2p_gather && tokens % tp_size == 0;
   auto normalized = direct_output_alias
                         ? torch::stable::narrow(gathered, 0, rank * rows, rows)
@@ -890,11 +937,16 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
         if (gather_bytes == 0) {
           continue;
         }
-        STD_CUDA_CHECK(
-            cudaMemcpyAsync(peer_base + p2p_slot * pipeline_slot_bytes +
-                                tp_size * slot_bytes + rank * slot_bytes,
-                            normalized_chunk, gather_bytes,
-                            cudaMemcpyDeviceToDevice, comm_stream));
+        auto* gather_destination =
+            direct_p2p_gather
+                ? reinterpret_cast<bf16*>(p2p_context->output_peers[dest]) +
+                      (int64_t(rank) * rows + offset) * hidden
+                : reinterpret_cast<bf16*>(
+                      peer_base + p2p_slot * pipeline_slot_bytes +
+                      tp_size * slot_bytes + rank * slot_bytes);
+        STD_CUDA_CHECK(cudaMemcpyAsync(gather_destination, normalized_chunk,
+                                       gather_bytes, cudaMemcpyDeviceToDevice,
+                                       comm_stream));
       }
       tpsp_system_fence<<<1, 1, 0, comm_stream>>>();
       STD_CUDA_CHECK(cudaGetLastError());
@@ -912,22 +964,11 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
                                     comm_stream>>>(
           local_flags + kTpspGatherReady * tp_size, rank, tp_size);
       STD_CUDA_CHECK(cudaGetLastError());
-      for (int source = 0; source < tp_size; ++source) {
-        if (source == rank) {
-          continue;
-        }
-        if (direct_p2p_gather) {
-          int source_rows = std::max(
-              0, std::min(chunk_rows,
-                          static_cast<int>(tokens - source * rows - offset)));
-          size_t source_bytes = int64_t(source_rows) * hidden * sizeof(bf16);
-          if (source_bytes != 0) {
-            STD_CUDA_CHECK(cudaMemcpyAsync(
-                output_ptr + (int64_t(source) * rows + offset) * hidden,
-                reinterpret_cast<char*>(local_gather) + source * slot_bytes,
-                source_bytes, cudaMemcpyDeviceToDevice, comm_stream));
+      if (!direct_p2p_gather) {
+        for (int source = 0; source < tp_size; ++source) {
+          if (source == rank) {
+            continue;
           }
-        } else {
           STD_CUDA_CHECK(cudaMemcpyAsync(
               target + source * shard_elems,
               reinterpret_cast<char*>(local_gather) + source * slot_bytes,
