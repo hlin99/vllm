@@ -32,13 +32,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 #ifndef USE_ROCM
   ops.def(
       "init_tpsp_p2p(int device_index, int comm_address, int tp_size, "
-      "int rank, int max_chunk_rows, int hidden_size) -> int");
+      "int rank, int max_chunk_rows, int hidden_size, int max_tokens) -> int");
   ops.def("destroy_tpsp_p2p(int handle) -> ()");
   ops.def(
       "tpsp_fused_matmul_reduce_scatter_norm_all_gather("
       "Tensor a, Tensor b, Tensor weight, Tensor residual, "
       "Tensor? projection_bias, Tensor? norm_bias, float eps, int norm_kind, "
-      "int microchunk_rows, int comm_address, int tp_size, int p2p_handle) "
+      "int microchunk_rows, int comm_address, int tp_size, int p2p_handle, "
+      "int sm_count_target=0) "
       "-> (Tensor, Tensor, Tensor)");
 
   // Note about marlin kernel 'workspace' arguments:

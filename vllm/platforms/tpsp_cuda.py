@@ -16,6 +16,13 @@ from vllm.model_executor.tpsp import TPSPBackend
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class CudaTPSPConfig:
+    chunk_rows: int
+    use_p2p: bool
+    sm_count_target: int = 0
+
+
 @dataclass
 class CudaTPSPContext:
     device: torch.device
@@ -24,7 +31,7 @@ class CudaTPSPContext:
     comm_address: int
     max_chunk_rows: int
     p2p_handle: int = 0
-    config: int | None = None
+    config: int | CudaTPSPConfig | None = None
 
 
 class CudaTPSPBackend(TPSPBackend):
@@ -131,11 +138,13 @@ class CudaTPSPBackend(TPSPBackend):
             rank,
             max_chunk_rows,
             hidden_size,
+            max_batched_tokens,
         )
         if rank == 0:
             logger.info(
-                "TPSP transport=%s for %s rows per rank",
-                "P2P" if context.p2p_handle else "NCCL",
+                "TPSP available transports=%s with direct P2P gather for "
+                "%s rows per rank",
+                "P2P,NCCL" if context.p2p_handle else "NCCL",
                 max_chunk_rows,
             )
         self._open_context_ids.add(id(context))
@@ -161,9 +170,40 @@ class CudaTPSPBackend(TPSPBackend):
 
     def set_config(self, handle: object, config: object) -> None:
         context = self._profile_context(handle)
-        if type(config) is not int or config <= 0:
-            raise ValueError("CUDA TPSP requires a positive microchunk size")
-        context.config = config
+        context.config = self._resolve_config(context, config)
+
+    def _resolve_config(
+        self, context: CudaTPSPContext, config: object
+    ) -> CudaTPSPConfig:
+        if type(config) is int:
+            config = CudaTPSPConfig(config, bool(context.p2p_handle))
+        if (
+            not isinstance(config, CudaTPSPConfig)
+            or type(config.chunk_rows) is not int
+            or config.chunk_rows <= 0
+            or type(config.use_p2p) is not bool
+            or type(config.sm_count_target) is not int
+            or config.sm_count_target < 0
+        ):
+            raise ValueError("Invalid CUDA TPSP tuning configuration")
+        if config.use_p2p and not context.p2p_handle:
+            raise ValueError("CUDA TPSP P2P transport is unavailable")
+        return config
+
+    def get_tuning_configs(
+        self, handle: object, chunk: int
+    ) -> tuple[CudaTPSPConfig, ...]:
+        context = self._profile_context(handle)
+        sm_count = torch.cuda.get_device_properties(
+            context.device
+        ).multi_processor_count
+        targets = dict.fromkeys(
+            (0, max(1, sm_count * 85 // 100), max(1, sm_count * 70 // 100))
+        )
+        configs = [CudaTPSPConfig(chunk, False, target) for target in targets]
+        if context.p2p_handle:
+            configs.insert(0, CudaTPSPConfig(chunk, True))
+        return tuple(configs)
 
     def fused_gemm_rs_norm_ag(
         self,
@@ -196,11 +236,13 @@ class CudaTPSPBackend(TPSPBackend):
         eps = norm.eps if norm_type == "layer_norm" else norm.variance_epsilon
         projection_bias = projection.bias
         norm_bias = getattr(norm, "bias", None)
-        chunk = context.config if config is None else config
-        if type(chunk) is not int or chunk <= 0:
-            raise ValueError("CUDA TPSP requires a positive microchunk size")
+        selected = self._resolve_config(
+            context, context.config if config is None else config
+        )
+        chunk = selected.chunk_rows
+        p2p_handle = context.p2p_handle if selected.use_p2p else 0
         if (
-            context.p2p_handle
+            p2p_handle
             and min((a.size(0) + context.tp_size - 1) // context.tp_size, chunk)
             > context.max_chunk_rows
         ):
@@ -245,7 +287,8 @@ class CudaTPSPBackend(TPSPBackend):
                 chunk,
                 context.comm_address,
                 context.tp_size,
-                context.p2p_handle,
+                p2p_handle,
+                selected.sm_count_target,
             )
         )
         return gathered, reduced

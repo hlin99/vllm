@@ -109,7 +109,7 @@ def _check_tpsp_backend(
                     dtype=torch.bfloat16,
                     tp_size=world_size,
                     hidden_size=4096,
-                    max_batched_tokens=129,
+                    max_batched_tokens=513,
                     group_name=dist.group.WORLD.group_name,
                     device=device,
                 )
@@ -178,7 +178,14 @@ def _check_tpsp_backend(
         if old_handle:
             with pytest.raises(RuntimeError, match="Invalid TPSP P2P context"):
                 torch.ops._C.destroy_tpsp_p2p(old_handle)
-        for tokens, width in ((1, 64), (5, 2048), (128, 2048), (129, 7168)):
+        for tokens, width in (
+            (1, 64),
+            (5, 2048),
+            (128, 2048),
+            (129, 7168),
+            (512, 1024),
+            (513, 1024),
+        ):
             generator = torch.Generator(device=device).manual_seed(123 + rank)
             a = torch.randn(
                 (tokens + 1, width),
@@ -244,6 +251,18 @@ def _check_tpsp_backend(
                 rtol=0.02,
                 atol=0.05,
             )
+            if tokens in (512, 513):
+                for config in backend.get_tuning_configs(context, 32):
+                    tuned, tuned_residual = backend.fused_gemm_rs_norm_ag(
+                        context, a, projection, local_residual, norm, config=config
+                    )
+                    torch.testing.assert_close(tuned, expected, rtol=0.02, atol=0.05)
+                    torch.testing.assert_close(
+                        tuned_residual[:count],
+                        expected_residual[start : start + count],
+                        rtol=0.02,
+                        atol=0.05,
+                    )
             if tokens == 1 and context.p2p_handle:
                 p2p_handle = context.p2p_handle
                 context.p2p_handle = 0
@@ -346,7 +365,8 @@ def _check_tpsp_backend(
         assert profile.hidden_size == 4096
         assert profile.max_batched_tokens == 128
         assert profile.status == "candidate"
-        assert isinstance(profile.config, int)
+        assert profile.config is not None
+        backend.set_config(context, profile.config)
         assert profile.threshold_tokens is None
 
         handles = []
@@ -410,6 +430,104 @@ def test_tpsp_backend(tp_size: int):
         )
         if not availability.get():
             pytest.skip("TPSP backend is unavailable for this configuration")
+
+
+@pytest.mark.parametrize("p2p_handle", (0, 7))
+def test_cuda_tpsp_refines_only_available_transports(monkeypatch, p2p_handle):
+    from vllm.platforms.tpsp_cuda import (
+        CudaTPSPBackend,
+        CudaTPSPConfig,
+        CudaTPSPContext,
+    )
+
+    device = torch.device("cuda", 0)
+    backend = CudaTPSPBackend("test", device)
+    context = CudaTPSPContext(device, 4, 0, 1, 4096, p2p_handle)
+    backend._open_context_ids.add(id(context))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=78),
+    )
+    expected = [CudaTPSPConfig(512, False, target) for target in (0, 66, 54)]
+    if p2p_handle:
+        expected.insert(0, CudaTPSPConfig(512, True))
+    assert backend.get_tuning_configs(context, 512) == tuple(expected)
+    backend.set_config(context, CudaTPSPConfig(512, False, 66))
+    assert context.config == CudaTPSPConfig(512, False, 66)
+    assert context.p2p_handle == p2p_handle
+    if not p2p_handle:
+        with pytest.raises(ValueError, match="P2P transport is unavailable"):
+            backend.set_config(context, CudaTPSPConfig(512, True))
+
+
+def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch):
+    clock = [0.0]
+
+    class Projection(nn.Module):
+        input_size_per_partition = 2
+
+        def forward(self, x):
+            return x, None
+
+    class Norm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2))
+            self.variance_epsilon = 1e-5
+
+        def forward(self, x, residual):
+            return x, residual
+
+    class Backend(TPSPBackend):
+        tpsp_chunk_granularity = 64
+
+        def open(self, **kwargs):
+            return None
+
+        def set_config(self, handle, config):
+            raise NotImplementedError
+
+        def close(self, context=None):
+            pass
+
+        def get_tuning_configs(self, handle, chunk):
+            return (chunk, (chunk, "refined"))
+
+        def fused_gemm_rs_norm_ag(
+            self,
+            handle,
+            x,
+            projection,
+            residual,
+            norm,
+            *,
+            config=None,
+            norm_type="rms_norm",
+        ):
+            costs = {64: 4, 128: 3, (64, "refined"): 1, (128, "refined"): 2}
+            clock[0] += costs[config] / 1000
+            return x, residual
+
+    monkeypatch.setattr(tpsp_utils.c10d, "_resolve_process_group", lambda name: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(dist, "barrier", lambda **kwargs: None)
+    monkeypatch.setattr(dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: None)
+    monkeypatch.setattr(tpsp_utils.time, "perf_counter", lambda: clock[0])
+    result = tpsp_utils._scan_chunk(
+        Backend("test", torch.device("cpu")),
+        object(),
+        Projection(),
+        Norm(),
+        tp_size=2,
+        max_batched_tokens=256,
+        time_budget_s=10,
+    )
+    assert min(result.candidates, key=lambda item: item[1])[0] == 128
+    assert result.config == (64, "refined")
+    assert len(result.finalists) == 4
 
 
 @pytest.mark.parametrize(
