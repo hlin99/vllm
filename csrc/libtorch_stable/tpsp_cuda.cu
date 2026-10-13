@@ -305,9 +305,10 @@ struct CudaEvent {
 };
 
 struct PipelineState {
-  // Reuse a scratch slot only after its communication has finished.
+  // Reuse a scratch slot after all local reads from it have finished.
   std::array<CudaEvent, kTpspDirectPipelineSlots> gemm_ready;
   std::array<CudaEvent, kTpspDirectPipelineSlots> comm_done;
+  CudaEvent comm_complete;
   cudaStream_t comm_stream{};
 
   PipelineState() {
@@ -958,6 +959,10 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
                 (kTpspGatherReady * tp_size + rank) * sizeof(unsigned int),
             one, sizeof(unsigned int), cudaMemcpyDeviceToDevice, comm_stream));
       }
+      if (pipeline && direct_p2p_gather) {
+        STD_CUDA_CHECK(
+            cudaEventRecord(pipeline->comm_done[slot].handle, comm_stream));
+      }
       wait_and_clear_tpsp_signals<<<(tp_size + 255) / 256, 256, 0,
                                     comm_stream>>>(
           local_flags + kTpspGatherReady * tp_size, rank, tp_size);
@@ -1002,15 +1007,16 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
       }
       STD_CUDA_CHECK(cudaGetLastError());
     }
-    if (pipeline) {
+    if (pipeline && !direct_p2p_gather) {
       STD_CUDA_CHECK(
           cudaEventRecord(pipeline->comm_done[slot].handle, comm_stream));
     }
   }
   if (pipeline) {
-    STD_CUDA_CHECK(cudaStreamWaitEvent(
-        stream, pipeline->comm_done[(num_chunks - 1) % buffers.size()].handle,
-        0));
+    STD_CUDA_CHECK(
+        cudaEventRecord(pipeline->comm_complete.handle, comm_stream));
+    STD_CUDA_CHECK(
+        cudaStreamWaitEvent(stream, pipeline->comm_complete.handle, 0));
   }
   return {new_residual, normalized, gathered};
 }
