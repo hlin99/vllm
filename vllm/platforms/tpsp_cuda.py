@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -191,7 +192,7 @@ class CudaTPSPBackend(TPSPBackend):
         return config
 
     def get_tuning_configs(
-        self, handle: object, chunk: int
+        self, handle: object, chunk: int, group_name: str | None = None
     ) -> tuple[CudaTPSPConfig, ...]:
         context = self._profile_context(handle)
         sm_count = torch.cuda.get_device_properties(
@@ -201,8 +202,63 @@ class CudaTPSPBackend(TPSPBackend):
             (0, max(1, sm_count * 85 // 100), max(1, sm_count * 70 // 100))
         )
         configs = [CudaTPSPConfig(chunk, False, target) for target in targets]
+        fixed_p2p_sm_targets = os.environ.get("VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS")
+        fixed_p2p_sm_target = os.environ.get("VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET")
+        if fixed_p2p_sm_targets is not None and fixed_p2p_sm_target is not None:
+            raise ValueError(
+                "Set only one of VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS and "
+                "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET"
+            )
         if context.p2p_handle:
-            configs.insert(0, CudaTPSPConfig(chunk, True))
+            if fixed_p2p_sm_targets is not None:
+                if group_name is None:
+                    raise ValueError(
+                        "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS requires a "
+                        "TPSP group name"
+                    )
+                targets_by_group = {}
+                for target_spec in fixed_p2p_sm_targets.split(","):
+                    name, separator, value = target_spec.partition("=")
+                    if (
+                        not separator
+                        or not name
+                        or not value.isdecimal()
+                        or name in targets_by_group
+                    ):
+                        raise ValueError(
+                            "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS must use "
+                            "unique group_name=integer entries"
+                        )
+                    targets_by_group[name] = int(value)
+                if group_name not in targets_by_group:
+                    raise ValueError(
+                        "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS does not include "
+                        f"group {group_name!r}"
+                    )
+                p2p_sm_target = targets_by_group[group_name]
+                if not 0 <= p2p_sm_target <= sm_count:
+                    raise ValueError(
+                        "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS values must be "
+                        f"between 0 and {sm_count}"
+                    )
+                return (CudaTPSPConfig(chunk, True, p2p_sm_target),)
+            if fixed_p2p_sm_target is None:
+                configs.insert(0, CudaTPSPConfig(chunk, True))
+            else:
+                try:
+                    p2p_sm_target = int(fixed_p2p_sm_target)
+                except ValueError as exc:
+                    raise ValueError(
+                        "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET must be an integer"
+                    ) from exc
+                if not 0 <= p2p_sm_target <= sm_count:
+                    raise ValueError(
+                        "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET must be between "
+                        f"0 and {sm_count}"
+                    )
+                return (CudaTPSPConfig(chunk, True, p2p_sm_target),)
+        elif fixed_p2p_sm_target is not None or fixed_p2p_sm_targets is not None:
+            raise RuntimeError("A fixed P2P SM target was set, but P2P is unavailable")
         return tuple(configs)
 
     def fused_gemm_rs_norm_ag(

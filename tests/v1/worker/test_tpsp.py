@@ -502,6 +502,59 @@ def test_cuda_tpsp_refines_only_available_transports(monkeypatch, p2p_handle):
             backend.set_config(context, CudaTPSPConfig(512, True))
 
 
+def test_cuda_tpsp_can_pin_p2p_sm_target(monkeypatch):
+    from vllm.platforms.tpsp_cuda import (
+        CudaTPSPBackend,
+        CudaTPSPConfig,
+        CudaTPSPContext,
+    )
+
+    device = torch.device("cuda", 0)
+    backend = CudaTPSPBackend("test", device)
+    context = CudaTPSPContext(device, 4, 0, 1, 4096, 7)
+    backend._open_context_ids.add(id(context))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=78),
+    )
+    monkeypatch.setenv("VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET", "66")
+    assert backend.get_tuning_configs(context, 512) == (CudaTPSPConfig(512, True, 66),)
+
+    monkeypatch.setenv("VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET", "79")
+    with pytest.raises(ValueError, match="between 0 and 78"):
+        backend.get_tuning_configs(context, 512)
+
+    context.p2p_handle = 0
+    with pytest.raises(RuntimeError, match="P2P is unavailable"):
+        backend.get_tuning_configs(context, 512)
+
+
+def test_cuda_tpsp_can_pin_p2p_sm_targets_by_group(monkeypatch):
+    from vllm.platforms.tpsp_cuda import (
+        CudaTPSPBackend,
+        CudaTPSPConfig,
+        CudaTPSPContext,
+    )
+
+    device = torch.device("cuda", 0)
+    backend = CudaTPSPBackend("test", device)
+    context = CudaTPSPContext(device, 4, 0, 1, 4096, 7)
+    backend._open_context_ids.add(id(context))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=78),
+    )
+    monkeypatch.setenv("VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS", "o_proj=67,down_proj=74")
+    assert backend.get_tuning_configs(context, 1024, "o_proj") == (
+        CudaTPSPConfig(1024, True, 67),
+    )
+    assert backend.get_tuning_configs(context, 1024, "down_proj") == (
+        CudaTPSPConfig(1024, True, 74),
+    )
+
+
 def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch):
     clock = [0.0]
 
@@ -532,7 +585,7 @@ def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch):
         def close(self, context=None):
             pass
 
-        def get_tuning_configs(self, handle, chunk):
+        def get_tuning_configs(self, handle, chunk, group_name=None):
             return (chunk, (chunk, "refined"))
 
         def fused_gemm_rs_norm_ag(
@@ -1064,7 +1117,7 @@ def test_tpsp_profile_accepts_multiple_named_groups(monkeypatch):
         parallel_state,
         "get_tp_group",
         lambda: SimpleNamespace(
-            world_size=2,
+            world_size=4,
             rank_in_group=0,
             device_group=SimpleNamespace(group_name="test"),
         ),
@@ -1095,17 +1148,18 @@ def test_tpsp_profile_accepts_multiple_named_groups(monkeypatch):
 
     def scan_chunk(selected_backend, handle, *, projection, **kwargs):
         assert selected_backend is backend
+        assert kwargs["max_batched_tokens"] == 10
         backend.profiled.append(projection)
-        return TPSPScanResult(2, 2, 8, "candidate", "", config=1)
+        return TPSPScanResult(4, 4, 10, "candidate", "", config=1)
 
     monkeypatch.setattr(tpsp_utils, "_scan_chunk", scan_chunk)
     groups = []
     for name in ("first", "second", "third"):
         projection = nn.Module()
-        projection.weight = nn.Parameter(torch.ones(2, 2))
-        projection.input_size_per_partition = 2
+        projection.weight = nn.Parameter(torch.ones(4, 4))
+        projection.input_size_per_partition = 4
         norm = nn.Module()
-        norm.weight = nn.Parameter(torch.ones(2))
+        norm.weight = nn.Parameter(torch.ones(4))
         norm.variance_epsilon = 1e-5
         groups.append(TPSPOpsGroup(name, projection, norm))
 
@@ -1114,11 +1168,12 @@ def test_tpsp_profile_accepts_multiple_named_groups(monkeypatch):
         assert [entry.ops for entry in selected_groups] == groups
         assert list(handles) == [group.name for group in groups]
         assert max_tokens == 8
-        return TPSPScanResult(2, 2, 8, "enabled", "", threshold_tokens=3)
+        return TPSPScanResult(4, 4, 8, "enabled", "", threshold_tokens=3)
 
     monkeypatch.setattr(tpsp_utils, "_scan_threshold", check_threshold)
-    context = backend.profile(groups, 8)
+    context = backend.profile(groups, 10)
     assert context is not None
+    assert context.profile.max_batched_tokens == 10
     assert backend.profiled == [group.projection for group in groups]
     assert list(context.handles) == [group.name for group in groups]
     assert len({id(handle) for handle in context.handles.values()}) == 3

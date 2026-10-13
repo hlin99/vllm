@@ -48,6 +48,10 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+    VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET: str | None = None
+    VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS: str | None = None
+    VLLM_TPSP_FIXED_PROFILE_THRESHOLD: str | None = None
+    VLLM_TPSP_FIXED_PROFILE_CHUNKS: str | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -874,6 +878,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
         else True
+    ),
+    "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET": lambda: os.getenv(
+        "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET"
+    ),
+    "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS": lambda: os.getenv(
+        "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS"
+    ),
+    "VLLM_TPSP_FIXED_PROFILE_THRESHOLD": lambda: os.getenv(
+        "VLLM_TPSP_FIXED_PROFILE_THRESHOLD"
+    ),
+    "VLLM_TPSP_FIXED_PROFILE_CHUNKS": lambda: os.getenv(
+        "VLLM_TPSP_FIXED_PROFILE_CHUNKS"
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),

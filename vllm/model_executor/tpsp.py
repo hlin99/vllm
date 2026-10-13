@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import statistics
 import time
 from abc import ABC, abstractmethod
@@ -55,6 +56,12 @@ class TPSPBackend(ABC):
 
     @abstractmethod
     def set_config(self, handle: object, config: object) -> None: ...
+
+    def get_tuning_configs(
+        self, handle: object, chunk: int, group_name: str | None = None
+    ) -> Sequence[object]:
+        """Refine a shortlisted chunk without expanding the initial scan."""
+        return (chunk,)
 
     @abstractmethod
     def fused_gemm_rs_norm_ag(
@@ -106,7 +113,7 @@ class TPSPScanResult:
     measurements: tuple[TPSPMeasurement, ...] = ()
     candidates: tuple[tuple[int, float], ...] = ()
     input_width: int | None = None
-    finalists: tuple[tuple[int, float], ...] = ()
+    finalists: tuple[tuple[object, float], ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -181,7 +188,7 @@ def profile_tpsp(
     """Profile named ops groups in four steps.
 
     1. Connect each group's projection and norm into a runnable path.
-    2. Open a handle and select a chunk independently for each group.
+    2. Open a handle, screen chunks, and refine each group's finalists.
     3. Find one threshold from the sum of separately timed group paths.
     4. Return a shared profile with the named handles, or use regular forward
        if any scan is inconclusive or finds no benefit.
@@ -200,11 +207,16 @@ def profile_tpsp(
         _LOG.warning("TPSP using regular forward: %s", reason)
         return None
 
+    scan_max_batched_tokens = max_batched_tokens - max_batched_tokens % group.world_size
+
     started = time.perf_counter()
     enabled = False
     threshold = None
     handles: dict[str, object] = {}
     try:
+        if scan_max_batched_tokens < group.world_size:
+            return disabled("no TP-aligned token count within max_batched_tokens")
+
         # Step 2: select a chunk for each group.
         if reason := _scan_group_chunks(
             backend, compiled, group, max_batched_tokens, handles
@@ -212,7 +224,29 @@ def profile_tpsp(
             return disabled(reason)
 
         # Step 3: scan one threshold using the sum of per-group timings.
-        measurement = _scan_threshold(backend, compiled, handles, max_batched_tokens)
+        if fixed_threshold := os.environ.get("VLLM_TPSP_FIXED_PROFILE_THRESHOLD"):
+            threshold = int(fixed_threshold)
+            if not 1 <= threshold <= max_batched_tokens:
+                raise ValueError("TPSP fixed profile threshold is out of range")
+            measurement = TPSPScanResult(
+                group.world_size,
+                compiled[0].ops.norm.weight.numel(),
+                max_batched_tokens,
+                "enabled",
+                "",
+                threshold_tokens=threshold,
+            )
+        else:
+            if group.rank_in_group == 0:
+                _LOG.info(
+                    "TPSP threshold scan max_batched_tokens=%d "
+                    "(scheduler max_batched_tokens=%d)",
+                    scan_max_batched_tokens,
+                    max_batched_tokens,
+                )
+            measurement = _scan_threshold(
+                backend, compiled, handles, scan_max_batched_tokens
+            )
         if not measurement.enabled:
             return disabled(
                 f"projection profile {measurement.status}: {measurement.reason}"
@@ -339,6 +373,7 @@ def _scan_group_chunks(
         raise ValueError("TPSP chunk granularity must be a positive integer")
     parameter = groups[0].ops.projection.weight
     hidden_size = groups[0].ops.norm.weight.numel()
+    fixed_chunks = _fixed_tpsp_chunks()
     if (
         tp_group.world_size < 2
         or hidden_size <= 0
@@ -362,21 +397,52 @@ def _scan_group_chunks(
         if handle is None:
             return f"fused backend unavailable for {entry.name}"
         handles[entry.name] = handle
-        candidate = _scan_chunk(
-            backend,
-            handle,
-            projection=entry.projection,
-            norm=entry.norm,
-            tp_size=tp_group.world_size,
-            max_batched_tokens=max_batched_tokens,
-            time_budget_s=240.0,
-        )
-        if candidate.status != "candidate" or candidate.config is None:
-            return (
-                f"{entry.name} chunk selection {candidate.status}: {candidate.reason}"
+        if entry.name in fixed_chunks:
+            config = next(
+                (
+                    config
+                    for config in backend.get_tuning_configs(
+                        handle, fixed_chunks[entry.name], group_name=entry.name
+                    )
+                    if getattr(config, "use_p2p", False)
+                ),
+                None,
             )
-        backend.set_config(handle, candidate.config)
+            if config is None:
+                return f"{entry.name} fixed P2P chunk is unavailable"
+        else:
+            candidate = _scan_chunk(
+                backend,
+                handle,
+                projection=entry.projection,
+                norm=entry.norm,
+                tp_size=tp_group.world_size,
+                max_batched_tokens=max_batched_tokens,
+                time_budget_s=240.0,
+            )
+            if candidate.status != "candidate" or candidate.config is None:
+                return (
+                    f"{entry.name} chunk selection "
+                    f"{candidate.status}: {candidate.reason}"
+                )
+            config = candidate.config
+        backend.set_config(handle, config)
+        if tp_group.rank_in_group == 0:
+            _LOG.info("TPSP selected group=%s config=%s", entry.name, config)
     return None
+
+
+def _fixed_tpsp_chunks() -> dict[str, int]:
+    value = os.environ.get("VLLM_TPSP_FIXED_PROFILE_CHUNKS", "")
+    if not value:
+        return {}
+    chunks: dict[str, int] = {}
+    for entry in value.split(","):
+        name, separator, chunk = entry.partition("=")
+        if not separator or not name or not chunk.isdecimal() or int(chunk) <= 0:
+            raise ValueError("TPSP fixed chunks must use name=positive_integer")
+        chunks[name] = int(chunk)
+    return chunks
 
 
 def _build_tpsp_context(
@@ -544,10 +610,10 @@ def _scan_chunk(
     max_batched_tokens: int,
     time_budget_s: float,
 ) -> TPSPScanResult:
-    """Screen chunks, retest the finalists, and check numerical parity.
+    """Screen chunks, refine the finalists, and check numerical parity.
 
     Returns:
-        TPSPScanResult with candidate timings and the selected chunk in ``config``.
+        TPSPScanResult with timings and the selected configuration in ``config``.
         The shared group profile determines the token threshold.
 
     """
@@ -569,12 +635,12 @@ def _scan_chunk(
             tokens, projection, hidden_size, tp_size, rank, device
         )
 
-    def run_fused(inputs: _ProjectionInputs, chunk: int) -> torch.Tensor:
+    def run_fused(inputs: _ProjectionInputs, chunk: object) -> torch.Tensor:
         return _run_fused_projection(
             backend, projection_context, projection, norm, inputs, chunk
         )
 
-    def time_chunk_ms(inputs: _ProjectionInputs, chunk: int) -> float:
+    def time_chunk_ms(inputs: _ProjectionInputs, chunk: object) -> float:
         dist.barrier(group=group)
         torch.accelerator.synchronize(device)
         start = time.perf_counter()
@@ -604,7 +670,7 @@ def _scan_chunk(
     # Stage 1: screen micro-chunk sizes for this projection at maximum load.
     screening_inputs = make_inputs(max_batched_tokens)
 
-    def score_chunk_ms(chunk: int, inputs: _ProjectionInputs) -> float | None:
+    def score_chunk_ms(chunk: object, inputs: _ProjectionInputs) -> float | None:
         """Warm up, then score the second-fastest of five slowest-rank trials."""
         time_chunk_ms(inputs, chunk)
         if _deadline_expired(deadline, group, device):
@@ -644,16 +710,20 @@ def _scan_chunk(
             without_improvement += 1
         if without_improvement == 32:
             break
-    # Stage 2: retest the two fastest chunks before committing to one.
+    # Stage 2: refine only the two fastest chunks with backend-specific configs.
     finalists = sorted(candidate_results, key=lambda result: result[1])[:2]
-    finalist_results: list[tuple[int, float]] = []
+    finalist_results: list[tuple[object, float]] = []
     for finalist, _ in finalists:
-        score = score_chunk_ms(finalist, screening_inputs)
-        if score is None:
-            return inconclusive(
-                "finalist time budget exceeded", candidate_results=candidate_results
-            )
-        finalist_results.append((finalist, score))
+        configs = backend.get_tuning_configs(projection_context, finalist)
+        if not configs:
+            raise ValueError("TPSP backend returned no tuning configurations")
+        for config in configs:
+            score = score_chunk_ms(config, screening_inputs)
+            if score is None:
+                return inconclusive(
+                    "finalist time budget exceeded", candidate_results=candidate_results
+                )
+            finalist_results.append((config, score))
     candidate = min(finalist_results, key=lambda item: item[1])[0]
     del screening_inputs
 
