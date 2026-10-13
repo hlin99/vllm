@@ -1048,8 +1048,8 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
       unsigned int expected = ++p2p_context->completion_epoch;
       STD_CUDA_CHECK(cudaMemcpyAsync(p2p_context->signal_epoch, &expected,
                                      sizeof(expected), cudaMemcpyHostToDevice,
-                                     comm_stream));
-      tpsp_system_fence<<<1, 1, 0, comm_stream>>>();
+                                     pipeline->comm_stream));
+      tpsp_system_fence<<<1, 1, 0, pipeline->comm_stream>>>();
       STD_CUDA_CHECK(cudaGetLastError());
       for (int dest = 0; dest < tp_size; ++dest) {
         if (dest == rank) {
@@ -1058,7 +1058,7 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
         auto* peer_base = reinterpret_cast<char*>(p2p_context->peers[dest]);
         STD_CUDA_CHECK(cudaMemcpyAsync(
             peer_base + completion_offset + rank * sizeof(unsigned int), epoch,
-            sizeof(expected), cudaMemcpyDeviceToDevice, comm_stream));
+            sizeof(expected), cudaMemcpyDeviceToDevice, pipeline->comm_stream));
       }
       wait_tpsp_epoch<<<(tp_size + 255) / 256, 256, 0,
                         pipeline->completion_stream>>>(local_completion, rank,
@@ -1069,8 +1069,8 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
       STD_CUDA_CHECK(
           cudaStreamWaitEvent(stream, pipeline->output_complete.handle, 0));
     } else {
-      STD_CUDA_CHECK(
-          cudaEventRecord(pipeline->comm_complete.handle, comm_stream));
+      STD_CUDA_CHECK(cudaEventRecord(pipeline->comm_complete.handle,
+                                     pipeline->comm_stream));
       STD_CUDA_CHECK(
           cudaStreamWaitEvent(stream, pipeline->comm_complete.handle, 0));
     }
