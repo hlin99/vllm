@@ -1060,6 +1060,10 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
             peer_base + completion_offset + rank * sizeof(unsigned int), epoch,
             sizeof(expected), cudaMemcpyDeviceToDevice, pipeline->comm_stream));
       }
+      STD_CUDA_CHECK(cudaEventRecord(pipeline->comm_complete.handle,
+                                     pipeline->comm_stream));
+      STD_CUDA_CHECK(cudaStreamWaitEvent(pipeline->completion_stream,
+                                         pipeline->comm_complete.handle, 0));
       wait_tpsp_epoch<<<(tp_size + 255) / 256, 256, 0,
                         pipeline->completion_stream>>>(local_completion, rank,
                                                        tp_size, expected);
