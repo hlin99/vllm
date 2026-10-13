@@ -28,8 +28,7 @@ constexpr int kTpspDataRegions = 2;
 // P2P flags are cleared by the receiver after each phase.
 constexpr int kTpspInboxReady = 0;
 constexpr int kTpspGatherReady = 1;
-constexpr int kTpspGatherConsumed = 2;
-constexpr int kTpspFlagPhases = kTpspGatherConsumed + 1;
+constexpr int kTpspFlagPhases = kTpspGatherReady + 1;
 constexpr int kTpspDirectPipelineSlots = 3;
 
 struct alignas(16) TpspBf16Vec {
@@ -912,8 +911,7 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
       }
       STD_CUDA_CHECK(cudaGetLastError());
     }
-    // Stage 4: All-gather normalized shards, waiting for P2P readers before
-    // peers can reuse their gather slots.
+    // Stage 4: All-gather normalized shards.
     if (p2p) {
       auto* target =
           direct_p2p_gather ? nullptr : (whole_input ? output_ptr : chunk_ptr);
@@ -975,20 +973,6 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
               shard_bytes, cudaMemcpyDeviceToDevice, comm_stream));
         }
       }
-      for (int dest = 0; dest < tp_size; ++dest) {
-        if (dest == rank) {
-          continue;
-        }
-        auto* peer_base = reinterpret_cast<char*>(p2p_context->peers[dest]);
-        STD_CUDA_CHECK(cudaMemcpyAsync(
-            peer_base + flag_offset + p2p_slot * flag_slot_bytes +
-                (kTpspGatherConsumed * tp_size + rank) * sizeof(unsigned int),
-            one, sizeof(unsigned int), cudaMemcpyDeviceToDevice, comm_stream));
-      }
-      wait_and_clear_tpsp_signals<<<(tp_size + 255) / 256, 256, 0,
-                                    comm_stream>>>(
-          local_flags + kTpspGatherConsumed * tp_size, rank, tp_size);
-      STD_CUDA_CHECK(cudaGetLastError());
     } else {
       STD_TORCH_CHECK(
           ncclAllGather(normalized_ptr + offset * hidden,
