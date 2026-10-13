@@ -10,7 +10,7 @@ import os
 import statistics
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -21,12 +21,87 @@ from torch import nn
 from torch.distributed import distributed_c10d as c10d
 
 _LOG = logging.getLogger(__name__)
-_TRIALS = 5
-_SCREEN_TRIALS = 5
+_TRIALS = 3
+_COARSE_CHUNK_STEP = 256
+_FINE_CHUNK_STEP = 64
+_COARSE_COMPUTE_ENGINE_STEP = 6
+_FINE_COMPUTE_ENGINE_STEP = 1
+_FINALIST_COUNT = 3
+_FINE_NEIGHBORHOOD_RADIUS = 4
+_COARSE_TIMINGS = 1
+_FINE_TIMINGS = 3
+_COARSE_THRESHOLD_STEP = 512
+_FINE_THRESHOLD_STEP = 128
+
+
+class _TPSPProgress:
+    def __init__(
+        self,
+        group_name: str,
+        stage: str,
+        total: int,
+        rank: int,
+        *,
+        started_at: float | None = None,
+    ) -> None:
+        self.group_name = group_name
+        self.stage = stage
+        self.total = max(total, 1)
+        self.rank = rank
+        self.started_at = time.perf_counter() if started_at is None else started_at
+        self.percent = 0
+        self.detail = f"0/{self.total}"
+        self.last_logged_bucket = 0
+        self._log()
+
+    def update(self, completed: int, *, percent_limit: int = 100) -> None:
+        self.detail = f"{completed}/{self.total}"
+        self.percent = min(
+            percent_limit, int(100 * min(completed, self.total) / self.total)
+        )
+        bucket = self.percent // 10
+        if bucket > self.last_logged_bucket and self.percent < 100:
+            self.last_logged_bucket = bucket
+            self._log()
+
+    def update_percent(self, percent: int, *, detail: str) -> None:
+        self.detail = detail
+        self.percent = min(99, max(self.percent, percent))
+        bucket = self.percent // 10
+        if bucket > self.last_logged_bucket:
+            self.last_logged_bucket = bucket
+            self._log()
+
+    def finish(
+        self, status: str, *, complete: bool = True, detail: str | None = None
+    ) -> None:
+        if complete:
+            self.percent = 100
+        if detail is not None:
+            self.detail = detail
+        self._log(status=status)
+
+    def _log(self, status: str = "running") -> None:
+        if self.rank != 0:
+            return
+        width = 20
+        filled = width * self.percent // 100
+        bar = "#" * filled + "-" * (width - filled)
+        _LOG.info(
+            "TPSP profile group=%s stage=%s [%s] %3d%% %s elapsed=%.1fs status=%s",
+            self.group_name,
+            self.stage,
+            bar,
+            self.percent,
+            self.detail,
+            time.perf_counter() - self.started_at,
+            status,
+        )
 
 
 class TPSPBackend(ABC):
     tpsp_chunk_granularity: int
+    tpsp_max_microchunk_rows: int | None = None
     tpsp_max_microchunk_tokens: int | None = None
 
     def __init__(self, group_name: str, device: torch.device) -> None:
@@ -48,20 +123,77 @@ class TPSPBackend(ABC):
 
     def profile(
         self,
-        ops_groups: list[TPSPOpsGroup],
+        ops_groups: Sequence[TPSPOpsGroup],
         max_batched_tokens: int,
+        *,
+        compute_engine_count_min: int | Mapping[str, int] | None = None,
+        compute_engine_count_max: int | Mapping[str, int] | None = None,
+        compute_engine_step_coarse: int = _COARSE_COMPUTE_ENGINE_STEP,
+        compute_engine_step_fine: int = _FINE_COMPUTE_ENGINE_STEP,
+        chunk_min_max: tuple[int, int] | Mapping[str, tuple[int, int]] | None = None,
+        chunk_step_coarse: int = _COARSE_CHUNK_STEP,
+        chunk_step_fine: int = _FINE_CHUNK_STEP,
     ) -> TPSPContext | None:
-        """Select independent chunks and a shared threshold for ops groups."""
-        return profile_tpsp(self, ops_groups, max_batched_tokens)
+        """Select independent chunks and a shared threshold for ops groups.
+
+        Args:
+            ops_groups: Named projection and normalization pairs to profile.
+            max_batched_tokens: Maximum scheduler token count to profile.
+            compute_engine_count_min: Per-group minimum count, or a shared
+                minimum. A backend may add its default-selection candidate.
+            compute_engine_count_max: Per-group maximum count, or a shared
+                maximum.
+            compute_engine_step_coarse: Step for the full-grid count scan.
+            compute_engine_step_fine: Step around finalist counts.
+            chunk_min_max: Per-group chunk bounds, or shared row bounds.
+            chunk_step_coarse: Step for the full-grid chunk scan.
+            chunk_step_fine: Step around finalist chunks.
+
+        Returns:
+            The selected TPSP context, or None when profiling is inconclusive.
+
+        """
+        return profile_tpsp(
+            self,
+            ops_groups,
+            max_batched_tokens,
+            compute_engine_count_min=compute_engine_count_min,
+            compute_engine_count_max=compute_engine_count_max,
+            compute_engine_step_coarse=compute_engine_step_coarse,
+            compute_engine_step_fine=compute_engine_step_fine,
+            chunk_min_max=chunk_min_max,
+            chunk_step_coarse=chunk_step_coarse,
+            chunk_step_fine=chunk_step_fine,
+        )
 
     @abstractmethod
     def set_config(self, handle: object, config: object) -> None: ...
 
     def get_tuning_configs(
-        self, handle: object, chunk: int, group_name: str | None = None
+        self,
+        handle: object,
+        chunk: int,
+        group_name: str | None = None,
+        *,
+        compute_engine_counts: Sequence[int] | None = None,
+        compute_engine_step: int = _COARSE_COMPUTE_ENGINE_STEP,
     ) -> Sequence[object]:
-        """Refine a shortlisted chunk without expanding the initial scan."""
+        """Return chunk configs for the requested compute-engine counts."""
         return (chunk,)
+
+    def get_compute_engine_count(self, config: object) -> int | None:
+        """Return the compute-engine count represented by a tuning config."""
+        count = getattr(config, "compute_engine_count", None)
+        return count if type(count) is int else None
+
+    def get_default_compute_engine_count(self) -> int | None:
+        """Return the backend's default-selection sentinel, if it has one."""
+        return None
+
+    def get_max_microchunk_rows(self, tp_size: int) -> int | None:
+        if self.tpsp_max_microchunk_tokens is not None:
+            return math.ceil(self.tpsp_max_microchunk_tokens / tp_size)
+        return self.tpsp_max_microchunk_rows
 
     @abstractmethod
     def fused_gemm_rs_norm_ag(
@@ -98,7 +230,7 @@ class TPSPMeasurement:
     tokens: int
     conventional_ms: float
     tpsp_ms: float
-    lower_benefit_ms: float
+    benefit_ms: float
 
 
 @dataclass(frozen=True)
@@ -111,9 +243,12 @@ class TPSPScanResult:
     threshold_tokens: int | None = None
     config: object | None = None
     measurements: tuple[TPSPMeasurement, ...] = ()
-    candidates: tuple[tuple[int, float], ...] = ()
+    candidates: tuple[tuple[object, float], ...] = ()
     input_width: int | None = None
     finalists: tuple[tuple[object, float], ...] = ()
+    selected_coarse_rank: int | None = None
+    selected_seed_rank: int | None = None
+    refined_candidates: tuple[tuple[int, object, float], ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -180,10 +315,26 @@ def tpsp_shard_residual(residual: torch.Tensor) -> torch.Tensor:
     return shard
 
 
+def _group_parameter(value: Any, group_name: str, name: str) -> Any:
+    if isinstance(value, Mapping):
+        if group_name not in value:
+            raise ValueError(f"{name} does not include TPSP group {group_name!r}")
+        return value[group_name]
+    return value
+
+
 def profile_tpsp(
     backend: Any,
     ops_groups: Sequence[TPSPOpsGroup],
     max_batched_tokens: int,
+    *,
+    compute_engine_count_min: int | Mapping[str, int] | None = None,
+    compute_engine_count_max: int | Mapping[str, int] | None = None,
+    compute_engine_step_coarse: int = _COARSE_COMPUTE_ENGINE_STEP,
+    compute_engine_step_fine: int = _FINE_COMPUTE_ENGINE_STEP,
+    chunk_min_max: tuple[int, int] | Mapping[str, tuple[int, int]] | None = None,
+    chunk_step_coarse: int = _COARSE_CHUNK_STEP,
+    chunk_step_fine: int = _FINE_CHUNK_STEP,
 ) -> TPSPContext | None:
     """Profile named ops groups in four steps.
 
@@ -192,6 +343,23 @@ def profile_tpsp(
     3. Find one threshold from the sum of separately timed group paths.
     4. Return a shared profile with the named handles, or use regular forward
        if any scan is inconclusive or finds no benefit.
+
+    Args:
+        backend: Backend that opens contexts and evaluates tuning candidates.
+        ops_groups: Named projection and normalization pairs to profile.
+        max_batched_tokens: Maximum scheduler token count to profile.
+        compute_engine_count_min: Per-group minimum count, or a shared
+            minimum. A backend may add its default-selection candidate.
+        compute_engine_count_max: Per-group maximum count, or a shared maximum.
+        compute_engine_step_coarse: Step for the full-grid count scan.
+        compute_engine_step_fine: Step around finalist counts.
+        chunk_min_max: Per-group chunk bounds, or shared row bounds.
+        chunk_step_coarse: Step for the full-grid chunk scan.
+        chunk_step_fine: Step around finalist chunks.
+
+    Returns:
+        The selected TPSP context, or None when profiling is inconclusive.
+
     """
     if backend is None:
         raise ValueError("TPSP profiling requires a backend")
@@ -219,7 +387,18 @@ def profile_tpsp(
 
         # Step 2: select a chunk for each group.
         if reason := _scan_group_chunks(
-            backend, compiled, group, max_batched_tokens, handles
+            backend,
+            compiled,
+            group,
+            max_batched_tokens,
+            handles,
+            compute_engine_count_min=compute_engine_count_min,
+            compute_engine_count_max=compute_engine_count_max,
+            compute_engine_step_coarse=compute_engine_step_coarse,
+            compute_engine_step_fine=compute_engine_step_fine,
+            chunk_min_max=chunk_min_max,
+            chunk_step_coarse=chunk_step_coarse,
+            chunk_step_fine=chunk_step_fine,
         ):
             return disabled(reason)
 
@@ -364,6 +543,14 @@ def _scan_group_chunks(
     tp_group: Any,
     max_batched_tokens: int,
     handles: dict[str, object],
+    *,
+    compute_engine_count_min: int | Mapping[str, int] | None,
+    compute_engine_count_max: int | Mapping[str, int] | None,
+    compute_engine_step_coarse: int,
+    compute_engine_step_fine: int,
+    chunk_min_max: tuple[int, int] | Mapping[str, tuple[int, int]] | None,
+    chunk_step_coarse: int,
+    chunk_step_fine: int,
 ) -> str | None:
     """Select an independent chunk per group, retaining opened handles."""
     if backend._closed:
@@ -397,38 +584,45 @@ def _scan_group_chunks(
         if handle is None:
             return f"fused backend unavailable for {entry.name}"
         handles[entry.name] = handle
-        if entry.name in fixed_chunks:
-            config = next(
-                (
-                    config
-                    for config in backend.get_tuning_configs(
-                        handle, fixed_chunks[entry.name], group_name=entry.name
-                    )
-                    if getattr(config, "use_p2p", False)
-                ),
-                None,
+        candidate = _scan_chunk(
+            backend,
+            handle,
+            projection=entry.projection,
+            norm=entry.norm,
+            tp_size=tp_group.world_size,
+            max_batched_tokens=max_batched_tokens,
+            group_name=entry.name,
+            fixed_chunk_rows=fixed_chunks.get(entry.name),
+            compute_engine_count_min=_group_parameter(
+                compute_engine_count_min,
+                entry.name,
+                "compute_engine_count_min",
+            ),
+            compute_engine_count_max=_group_parameter(
+                compute_engine_count_max,
+                entry.name,
+                "compute_engine_count_max",
+            ),
+            compute_engine_step_coarse=compute_engine_step_coarse,
+            compute_engine_step_fine=compute_engine_step_fine,
+            chunk_min_max=_group_parameter(chunk_min_max, entry.name, "chunk_min_max"),
+            chunk_step_coarse=chunk_step_coarse,
+            chunk_step_fine=chunk_step_fine,
+        )
+        if candidate.status != "candidate" or candidate.config is None:
+            return (
+                f"{entry.name} chunk selection {candidate.status}: {candidate.reason}"
             )
-            if config is None:
-                return f"{entry.name} fixed P2P chunk is unavailable"
-        else:
-            candidate = _scan_chunk(
-                backend,
-                handle,
-                projection=entry.projection,
-                norm=entry.norm,
-                tp_size=tp_group.world_size,
-                max_batched_tokens=max_batched_tokens,
-                time_budget_s=240.0,
-            )
-            if candidate.status != "candidate" or candidate.config is None:
-                return (
-                    f"{entry.name} chunk selection "
-                    f"{candidate.status}: {candidate.reason}"
-                )
-            config = candidate.config
+        config = candidate.config
         backend.set_config(handle, config)
         if tp_group.rank_in_group == 0:
-            _LOG.info("TPSP selected group=%s config=%s", entry.name, config)
+            _LOG.info(
+                "TPSP selected group=%s config=%s coarse_rank=%s seed_rank=%s",
+                entry.name,
+                config,
+                candidate.selected_coarse_rank,
+                candidate.selected_seed_rank,
+            )
     return None
 
 
@@ -465,17 +659,7 @@ def _build_tpsp_context(
 
 
 def _beneficial(measurement: TPSPMeasurement) -> bool:
-    return measurement.lower_benefit_ms > max(0.05, 0.02 * measurement.conventional_ms)
-
-
-def _deadline_expired(
-    deadline: float, group: dist.ProcessGroup, device: torch.device
-) -> bool:
-    flag = torch.tensor(
-        [time.monotonic() >= deadline], dtype=torch.int32, device=device
-    )
-    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
-    return bool(flag.item())
+    return measurement.benefit_ms > max(0.05, 0.02 * measurement.conventional_ms)
 
 
 @torch.inference_mode()
@@ -491,8 +675,8 @@ def _scan_threshold(
     hidden_size = ops_groups[0].ops.norm.weight.numel()
     rank = dist.get_rank(group)
     device = backend.device
+    threshold_started = time.perf_counter()
     entries = tuple((handles[entry.ops.name], entry) for entry in ops_groups)
-    deadline = time.monotonic() + 240.0
 
     def measure(
         handle: object,
@@ -519,7 +703,7 @@ def _scan_threshold(
         del result
         return elapsed.item()
 
-    def measure_size(tokens: int) -> TPSPMeasurement | None:
+    def measure_size(tokens: int) -> TPSPMeasurement:
         data = tuple(
             _projection_inputs(
                 tokens, compiled.ops.projection, hidden_size, tp_size, rank, device
@@ -529,64 +713,100 @@ def _scan_threshold(
         for (handle, compiled), inputs in zip(entries, data):
             measure(handle, compiled, inputs, False)
             measure(handle, compiled, inputs, True)
-        conventional: list[float] = []
-        fused: list[float] = []
-        for trial in range(_TRIALS):
-            order = (False, True) if trial % 2 == 0 else (True, False)
-            timings = {False: 0.0, True: 0.0}
-            for (handle, compiled), inputs in zip(entries, data):
-                for enabled in order:
-                    timings[enabled] += measure(handle, compiled, inputs, enabled)
-            conventional.append(timings[False])
-            fused.append(timings[True])
-            if _deadline_expired(deadline, group, device):
-                return None
-        savings = [normal - sp for normal, sp in zip(conventional, fused)]
-        lower = statistics.mean(savings) - 2.776 * statistics.stdev(
-            savings
-        ) / math.sqrt(_TRIALS)
+        conventional = sum(
+            measure(handle, compiled, inputs, False)
+            for (handle, compiled), inputs in zip(entries, data)
+        )
+        fused = [
+            sum(
+                measure(handle, compiled, inputs, True)
+                for (handle, compiled), inputs in zip(entries, data)
+            )
+            for _ in range(_TRIALS)
+        ]
+        median_tpsp = statistics.median(fused)
         return TPSPMeasurement(
-            tokens, statistics.median(conventional), statistics.median(fused), lower
+            tokens, conventional, median_tpsp, conventional - median_tpsp
         )
 
-    sizes = list(range(128, max_batched_tokens + 1, 128))
+    sizes = list(range(128, max_batched_tokens + 1, _COARSE_THRESHOLD_STEP))
     if not sizes or sizes[-1] != max_batched_tokens:
         sizes.append(max_batched_tokens)
-    measurements: list[TPSPMeasurement] = []
+    threshold_progress = _TPSPProgress(
+        ",".join(entry.ops.name for entry in ops_groups),
+        "threshold",
+        len(sizes),
+        rank,
+        started_at=threshold_started,
+    )
+    measurements_by_size: dict[int, TPSPMeasurement] = {}
     threshold = None
     streak = 0
-    for tokens in sizes:
+    streak_start = None
+    refine_start = None
+    previous_size = None
+    for coarse_steps, tokens in enumerate(sizes, start=1):
         result = measure_size(tokens)
-        if result is None:
-            break
-        measurements.append(result)
-        streak = streak + 1 if _beneficial(result) else 0
-        if streak == min(3, len(sizes)):
-            threshold = measurements[-streak].tokens
-            break
-    if threshold is not None and sizes[-1] != tokens:
-        maximum = measure_size(sizes[-1])
-        if maximum is None:
-            threshold = None
+        measurements_by_size[tokens] = result
+        threshold_progress.update_percent(
+            70 * coarse_steps // len(sizes),
+            detail=f"coarse points={coarse_steps}/{len(sizes)}",
+        )
+        if _beneficial(result):
+            if streak == 0:
+                streak_start = tokens
+                refine_start = previous_size if previous_size is not None else tokens
+            streak += 1
         else:
-            measurements.append(maximum)
-            if not _beneficial(maximum):
-                threshold = None
-    if (
-        threshold is None
-        and measurements
-        and measurements[-1].tokens == max_batched_tokens
-        and measurements[-1].lower_benefit_ms > 0
-    ):
+            streak = 0
+            streak_start = None
+            refine_start = None
+        if streak == 3:
+            break
+        previous_size = tokens
+
+    threshold_progress.update_percent(70, detail="coarse phase complete")
+    if streak == 3 and streak_start is not None and refine_start is not None:
+        fine_end = min(max_batched_tokens, streak_start + 2 * _FINE_THRESHOLD_STEP)
+        fine_sizes = list(range(refine_start, fine_end + 1, _FINE_THRESHOLD_STEP))
+        if fine_sizes[-1] != fine_end:
+            fine_sizes.append(fine_end)
+        fine_streak = 0
+        previous_fine_size = None
+        for index, tokens in enumerate(fine_sizes, start=1):
+            fine_result = measurements_by_size.get(tokens)
+            if fine_result is None:
+                fine_result = measure_size(tokens)
+                measurements_by_size[tokens] = fine_result
+            threshold_progress.update_percent(
+                70 + 25 * index // len(fine_sizes),
+                detail=f"fine points={index}/{len(fine_sizes)}",
+            )
+            if previous_fine_size is not None and (
+                tokens - previous_fine_size != _FINE_THRESHOLD_STEP
+            ):
+                fine_streak = 0
+            fine_streak = fine_streak + 1 if _beneficial(fine_result) else 0
+            if fine_streak == 3:
+                threshold = tokens - 2 * _FINE_THRESHOLD_STEP
+                break
+            previous_fine_size = tokens
+    else:
+        threshold_progress.update_percent(95, detail="fine refinement not needed")
+
+    maximum = measurements_by_size.get(max_batched_tokens)
+    if maximum is None:
+        maximum = measure_size(max_batched_tokens)
+        measurements_by_size[max_batched_tokens] = maximum
+    if threshold is not None and (maximum is None or not _beneficial(maximum)):
+        threshold = None
+    if threshold is None and maximum is not None and maximum.benefit_ms > 0:
         threshold = max_batched_tokens
     status = "enabled" if threshold is not None else "disabled"
     reason = "" if threshold is not None else "no sustained summed TPSP benefit"
-    if _deadline_expired(deadline, group, device):
-        status, reason, threshold = (
-            "inconclusive",
-            "projection profiling time budget exceeded",
-            None,
-        )
+    threshold_progress.finish(
+        status, detail=f"measured sizes={len(measurements_by_size)}"
+    )
     profile = TPSPScanResult(
         tp_size,
         hidden_size,
@@ -594,7 +814,9 @@ def _scan_threshold(
         status,
         reason,
         threshold_tokens=threshold,
-        measurements=tuple(measurements),
+        measurements=tuple(
+            measurements_by_size[tokens] for tokens in sorted(measurements_by_size)
+        ),
     )
     if rank == 0:
         _LOG.info("TPSP projection startup profile: %s", profile)
@@ -608,9 +830,17 @@ def _scan_chunk(
     norm: nn.Module,
     tp_size: int,
     max_batched_tokens: int,
-    time_budget_s: float,
+    group_name: str | None = None,
+    fixed_chunk_rows: int | None = None,
+    compute_engine_count_min: int | None = None,
+    compute_engine_count_max: int | None = None,
+    compute_engine_step_coarse: int = _COARSE_COMPUTE_ENGINE_STEP,
+    compute_engine_step_fine: int = _FINE_COMPUTE_ENGINE_STEP,
+    chunk_min_max: tuple[int, int] | None = None,
+    chunk_step_coarse: int = _COARSE_CHUNK_STEP,
+    chunk_step_fine: int = _FINE_CHUNK_STEP,
 ) -> TPSPScanResult:
-    """Screen chunks, refine the finalists, and check numerical parity.
+    """Screen the chunk/compute-engine grid, refine finalists, and check parity.
 
     Returns:
         TPSPScanResult with timings and the selected configuration in ``config``.
@@ -621,30 +851,53 @@ def _scan_chunk(
     chunk_granularity = backend.tpsp_chunk_granularity
     hidden_size = norm.weight.numel()
     input_width = projection.input_size_per_partition
-    if time_budget_s <= 0:
-        raise ValueError("time_budget_s must be positive")
+    if any(
+        type(step) is not int or step <= 0
+        for step in (
+            compute_engine_step_coarse,
+            compute_engine_step_fine,
+            chunk_step_coarse,
+            chunk_step_fine,
+        )
+    ):
+        raise ValueError("TPSP scan steps must be positive integers")
+    if (
+        compute_engine_step_fine > compute_engine_step_coarse
+        or chunk_step_fine > chunk_step_coarse
+    ):
+        raise ValueError("Fine TPSP scan steps cannot exceed coarse steps")
+    if (compute_engine_count_min is None) != (compute_engine_count_max is None):
+        raise ValueError(
+            "compute_engine_count_min and compute_engine_count_max must be set together"
+        )
+    if compute_engine_count_min is not None and (
+        type(compute_engine_count_min) is not int
+        or type(compute_engine_count_max) is not int
+        or compute_engine_count_min < 0
+        or compute_engine_count_min > compute_engine_count_max
+    ):
+        raise ValueError("Invalid compute-engine count range")
     group = c10d._resolve_process_group(backend.group_name)
     if dist.get_world_size(group) != tp_size:
         raise ValueError("group_name and tp_size disagree")
     rank = dist.get_rank(group)
     shard_rows = math.ceil(max_batched_tokens / tp_size)
-    deadline = time.monotonic() + time_budget_s
 
     def make_inputs(tokens: int) -> _ProjectionInputs:
         return _projection_inputs(
             tokens, projection, hidden_size, tp_size, rank, device
         )
 
-    def run_fused(inputs: _ProjectionInputs, chunk: object) -> torch.Tensor:
+    def run_fused(inputs: _ProjectionInputs, config: object) -> torch.Tensor:
         return _run_fused_projection(
-            backend, projection_context, projection, norm, inputs, chunk
+            backend, projection_context, projection, norm, inputs, config
         )
 
-    def time_chunk_ms(inputs: _ProjectionInputs, chunk: object) -> float:
+    def time_config_ms(inputs: _ProjectionInputs, config: object) -> float:
         dist.barrier(group=group)
         torch.accelerator.synchronize(device)
         start = time.perf_counter()
-        result = run_fused(inputs, chunk)
+        result = run_fused(inputs, config)
         torch.accelerator.synchronize(device)
         elapsed = torch.tensor(
             [(time.perf_counter() - start) * 1000], dtype=torch.float64, device=device
@@ -667,81 +920,320 @@ def _scan_chunk(
             input_width=input_width,
         )
 
-    # Stage 1: screen micro-chunk sizes for this projection at maximum load.
+    def inclusive_range(minimum: int, maximum: int, step: int) -> tuple[int, ...]:
+        values = tuple(range(minimum, maximum + 1, step))
+        if not values or values[-1] != maximum:
+            values += (maximum,)
+        return values
+
+    # Stage 1 covers every chunk in the configured coarse grid at full load.
     screening_inputs = make_inputs(max_batched_tokens)
-
-    def score_chunk_ms(chunk: object, inputs: _ProjectionInputs) -> float | None:
-        """Warm up, then score the second-fastest of five slowest-rank trials."""
-        time_chunk_ms(inputs, chunk)
-        if _deadline_expired(deadline, group, device):
-            return None
-        timings = []
-        for _ in range(_SCREEN_TRIALS):
-            timings.append(time_chunk_ms(inputs, chunk))
-            if _deadline_expired(deadline, group, device):
-                return None
-        return sorted(timings)[1]
-
-    candidate_results: list[tuple[int, float]] = []
-    best = float("inf")
-    without_improvement = 0
-    max_chunk_rows = math.ceil(shard_rows / chunk_granularity) * chunk_granularity
-    if backend.tpsp_max_microchunk_tokens is not None:
-        cap_rows = math.ceil(backend.tpsp_max_microchunk_tokens / tp_size)
+    supported_max_chunk_rows = (
+        math.ceil(shard_rows / chunk_granularity) * chunk_granularity
+    )
+    cap_rows = backend.get_max_microchunk_rows(tp_size)
+    if cap_rows is not None:
         cap_rows = (
             cap_rows // chunk_granularity * chunk_granularity
             if cap_rows >= chunk_granularity
             else cap_rows
         )
-        max_chunk_rows = min(max_chunk_rows, cap_rows)
-    for chunk in range(
-        min(chunk_granularity, max_chunk_rows),
-        max_chunk_rows + 1,
-        chunk_granularity,
+        supported_max_chunk_rows = min(supported_max_chunk_rows, cap_rows)
+    supported_min_chunk_rows = min(chunk_granularity, supported_max_chunk_rows)
+    min_chunk_rows, max_chunk_rows = (
+        chunk_min_max
+        if chunk_min_max is not None
+        else (supported_min_chunk_rows, supported_max_chunk_rows)
+    )
+    if (
+        type(min_chunk_rows) is not int
+        or type(max_chunk_rows) is not int
+        or min_chunk_rows < supported_min_chunk_rows
+        or max_chunk_rows > supported_max_chunk_rows
+        or min_chunk_rows > max_chunk_rows
+        or (
+            supported_max_chunk_rows >= chunk_granularity
+            and (
+                min_chunk_rows % chunk_granularity or max_chunk_rows % chunk_granularity
+            )
+        )
     ):
-        score = score_chunk_ms(chunk, screening_inputs)
-        if score is None:
-            return inconclusive("screening time budget exceeded")
-        candidate_results.append((chunk, score))
-        if score < best:
-            best = score
-            without_improvement = 0
-        else:
-            without_improvement += 1
-        if without_improvement == 32:
-            break
-    # Stage 2: refine only the two fastest chunks with backend-specific configs.
-    finalists = sorted(candidate_results, key=lambda result: result[1])[:2]
-    finalist_results: list[tuple[object, float]] = []
-    for finalist, _ in finalists:
-        configs = backend.get_tuning_configs(projection_context, finalist)
+        raise ValueError("Invalid TPSP chunk range")
+    if fixed_chunk_rows is not None:
+        if (
+            type(fixed_chunk_rows) is not int
+            or fixed_chunk_rows < min_chunk_rows
+            or fixed_chunk_rows > max_chunk_rows
+            or (
+                supported_max_chunk_rows >= chunk_granularity
+                and fixed_chunk_rows % chunk_granularity
+            )
+        ):
+            return inconclusive("fixed chunk is outside the supported range")
+        coarse_chunks: tuple[int, ...] = (fixed_chunk_rows,)
+    else:
+        if supported_max_chunk_rows >= chunk_granularity and (
+            chunk_step_coarse % chunk_granularity or chunk_step_fine % chunk_granularity
+        ):
+            raise ValueError("Chunk scan steps must align with chunk granularity")
+        coarse_chunks = inclusive_range(
+            min_chunk_rows, max_chunk_rows, chunk_step_coarse
+        )
+    coarse_results: list[tuple[object, float, int]] = []
+
+    def top_results(
+        results: Sequence[tuple[Any, ...]],
+    ) -> tuple[tuple[object, float], ...]:
+        return tuple(
+            (result[0], result[1])
+            for result in sorted(results, key=lambda result: result[1])[
+                :_FINALIST_COUNT
+            ]
+        )
+
+    def coarse_targets() -> tuple[int, ...] | None:
+        if compute_engine_count_min is None:
+            return None
+        assert compute_engine_count_max is not None
+        targets = inclusive_range(
+            compute_engine_count_min,
+            compute_engine_count_max,
+            compute_engine_step_coarse,
+        )
+        default_count = backend.get_default_compute_engine_count()
+        if default_count is not None:
+            targets = tuple(dict.fromkeys((default_count, *targets)))
+        return targets
+
+    def fine_targets(
+        center: int | None, available: Sequence[int]
+    ) -> tuple[int, ...] | None:
+        if center is None:
+            return None
+        if center == backend.get_default_compute_engine_count():
+            return (center,)
+        positive = [count for count in available if count > 0]
+        lower = (
+            compute_engine_count_min
+            if compute_engine_count_min is not None
+            else min(positive, default=center)
+        )
+        upper = (
+            compute_engine_count_max
+            if compute_engine_count_max is not None
+            else max(positive, default=center)
+        )
+        minimum = max(
+            lower, center - _FINE_NEIGHBORHOOD_RADIUS * compute_engine_step_fine
+        )
+        maximum = min(
+            upper, center + _FINE_NEIGHBORHOOD_RADIUS * compute_engine_step_fine
+        )
+        targets: tuple[int, ...] = inclusive_range(
+            minimum, maximum, compute_engine_step_fine
+        )
+        if center not in targets:
+            targets = tuple(sorted((*targets, center)))
+        return targets
+
+    def local_chunks(center: int) -> tuple[int, ...]:
+        if fixed_chunk_rows is not None:
+            return (fixed_chunk_rows,)
+        radius = _FINE_NEIGHBORHOOD_RADIUS * chunk_step_fine
+        minimum = max(min_chunk_rows, center - radius)
+        maximum = min(max_chunk_rows, center + radius)
+        chunks = inclusive_range(minimum, maximum, chunk_step_fine)
+        if center not in chunks:
+            chunks = tuple(sorted((*chunks, center)))
+        return chunks
+
+    def score_config_ms(
+        config: object, inputs: _ProjectionInputs, timings_count: int
+    ) -> float:
+        time_config_ms(inputs, config)
+        timings = []
+        for _ in range(timings_count):
+            timings.append(time_config_ms(inputs, config))
+        return statistics.median(timings)
+
+    coarse_started = time.perf_counter()
+    coarse_configs = []
+    for chunk in coarse_chunks:
+        configs = backend.get_tuning_configs(
+            projection_context,
+            chunk,
+            group_name=group_name,
+            compute_engine_counts=coarse_targets(),
+            compute_engine_step=compute_engine_step_coarse,
+        )
         if not configs:
             raise ValueError("TPSP backend returned no tuning configurations")
+        coarse_configs.append((chunk, configs))
+    coarse_progress = _TPSPProgress(
+        group_name or backend.group_name,
+        "coarse",
+        sum(len(configs) for _, configs in coarse_configs),
+        rank,
+        started_at=coarse_started,
+    )
+    for chunk, configs in coarse_configs:
         for config in configs:
-            score = score_chunk_ms(config, screening_inputs)
-            if score is None:
-                return inconclusive(
-                    "finalist time budget exceeded", candidate_results=candidate_results
-                )
-            finalist_results.append((config, score))
-    candidate = min(finalist_results, key=lambda item: item[1])[0]
-    del screening_inputs
+            score = score_config_ms(config, screening_inputs, _COARSE_TIMINGS)
+            coarse_results.append((config, score, chunk))
+            coarse_progress.update(len(coarse_results))
+    coarse_progress.finish("complete")
+    coarse_ranked_results = tuple(sorted(coarse_results, key=lambda result: result[1]))
+    coarse_top = coarse_ranked_results[:_FINALIST_COUNT]
+    coarse_candidates = tuple((config, score) for config, score, _ in coarse_top)
+    available_engine_counts = tuple(
+        dict.fromkeys(
+            count
+            for config, _, _ in coarse_results
+            if (count := backend.get_compute_engine_count(config)) is not None
+        )
+    )
+    fine_measurements: dict[
+        tuple[int, int | None], tuple[tuple[object, float], ...]
+    ] = {}
+    fine_progress = _TPSPProgress(
+        group_name or backend.group_name,
+        "fine",
+        len(coarse_top),
+        rank,
+    )
 
-    # Stage 3: verify numerical parity before passing this chunk to the pair.
-    check_inputs = make_inputs(min(max_batched_tokens, tp_size * 5 + 1))
-    conventional = _run_conventional_projection(projection, norm, check_inputs)
-    native = run_fused(check_inputs, candidate)
-    torch.accelerator.synchronize(device)
-    torch.testing.assert_close(native, conventional, rtol=0.02, atol=0.05)
-    del check_inputs, conventional, native
+    def measure_pair(
+        chunk: int, count: int | None, inputs: _ProjectionInputs
+    ) -> tuple[tuple[object, float], ...]:
+        pair = (chunk, count)
+        if pair in fine_measurements:
+            return fine_measurements[pair]
+        configs = backend.get_tuning_configs(
+            projection_context,
+            chunk,
+            group_name=group_name,
+            compute_engine_counts=(count,) if count is not None else None,
+            compute_engine_step=compute_engine_step_fine,
+        )
+        if not configs:
+            raise ValueError("TPSP backend returned no fine tuning configurations")
+        results = []
+        for config in configs:
+            prior = None
+            for measured in fine_measurements.values():
+                prior = next(
+                    (
+                        score
+                        for measured_config, score in measured
+                        if measured_config == config
+                    ),
+                    None,
+                )
+                if prior is not None:
+                    break
+            score = prior
+            if score is None:
+                score = score_config_ms(config, inputs, _FINE_TIMINGS)
+            results.append((config, score))
+        fine_measurements[pair] = tuple(results)
+        return fine_measurements[pair]
+
+    refined_candidates: list[tuple[int, object, float]] = []
+    for seed_rank, (seed_config, _, seed_chunk) in enumerate(coarse_top, start=1):
+        seed_count = backend.get_compute_engine_count(seed_config)
+        chunk_results: list[tuple[int, object, float]] = []
+        for chunk in local_chunks(seed_chunk):
+            measured = measure_pair(chunk, seed_count, screening_inputs)
+            chunk_results.extend((chunk, config, score) for config, score in measured)
+        selected_chunk = min(chunk_results, key=lambda result: result[2])[0]
+
+        counts = fine_targets(seed_count, available_engine_counts)
+        count_results: list[tuple[object, float]] = []
+        for count in counts if counts is not None else (None,):
+            measured = measure_pair(selected_chunk, count, screening_inputs)
+            count_results.extend(measured)
+        candidate, candidate_score = min(count_results, key=lambda result: result[1])
+        refined_candidates.append((seed_rank, candidate, candidate_score))
+        fine_progress.update(seed_rank, percent_limit=90)
+
+    if not refined_candidates:
+        raise ValueError("TPSP coarse scan returned no finalist candidates")
+    ranked_candidates: list[tuple[int, object, float]] = []
+    for result in sorted(refined_candidates, key=lambda candidate: candidate[2]):
+        if not any(config == result[1] for _, config, _ in ranked_candidates):
+            ranked_candidates.append(result)
+    selected_config: object | None = None
+    selected_score: float | None = None
+    selected_seed_rank: int | None = None
+    parity_inputs = min(max_batched_tokens, tp_size * 5 + 1)
+    for seed_rank, candidate_config, score in ranked_candidates:
+        check_inputs = make_inputs(parity_inputs)
+        conventional = _run_conventional_projection(projection, norm, check_inputs)
+        native = run_fused(check_inputs, candidate_config)
+        torch.accelerator.synchronize(device)
+        local_failure = False
+        try:
+            torch.testing.assert_close(native, conventional, rtol=0.02, atol=0.05)
+        except AssertionError:
+            local_failure = True
+        del check_inputs, conventional, native
+        failed = torch.tensor([int(local_failure)], dtype=torch.int32, device=device)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
+        if failed.item():
+            if rank == 0:
+                _LOG.warning(
+                    "TPSP parity failed group=%s seed_rank=%d config=%s; "
+                    "trying next finalist",
+                    group_name,
+                    seed_rank,
+                    candidate_config,
+                )
+            continue
+        selected_config = candidate_config
+        selected_score = score
+        selected_seed_rank = seed_rank
+        break
+    if selected_config is None or selected_score is None:
+        fine_progress.finish("inconclusive")
+        return inconclusive(
+            "all refined candidates failed numerical parity",
+            tuple((config, score) for _, config, score in refined_candidates),
+        )
+    fine_progress.finish("complete")
+    selected_coarse_rank = next(
+        (
+            coarse_rank
+            for coarse_rank, (coarse_config, _, _) in enumerate(
+                coarse_ranked_results, start=1
+            )
+            if coarse_config == selected_config
+        ),
+        None,
+    )
+    if rank == 0:
+        _LOG.info(
+            "TPSP selected group=%s config=%s latency=%.3fms "
+            "coarse_rank=%s seed_rank=%d",
+            group_name,
+            selected_config,
+            selected_score,
+            selected_coarse_rank,
+            selected_seed_rank,
+        )
+    del screening_inputs
     return TPSPScanResult(
         tp_size,
         hidden_size,
         max_batched_tokens,
         "candidate",
         "",
-        config=candidate,
-        candidates=tuple(candidate_results),
+        config=selected_config,
+        candidates=coarse_candidates,
         input_width=input_width,
-        finalists=tuple(finalist_results),
+        finalists=tuple(
+            (config, score) for _, config, score in ranked_candidates[:_FINALIST_COUNT]
+        ),
+        selected_coarse_rank=selected_coarse_rank,
+        selected_seed_rank=selected_seed_rank,
+        refined_candidates=tuple(refined_candidates),
     )

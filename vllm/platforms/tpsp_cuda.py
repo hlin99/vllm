@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -12,9 +14,22 @@ import torch.distributed as dist
 from torch.distributed import distributed_c10d as c10d
 
 from vllm.logger import init_logger
-from vllm.model_executor.tpsp import TPSPBackend
+from vllm.model_executor.tpsp import TPSPBackend, TPSPContext, TPSPOpsGroup
 
 logger = init_logger(__name__)
+
+_O_PROJ_COMM_SM_MAX = 20
+_DOWN_PROJ_COMM_SM_MAX = 10
+
+
+def _compute_engine_count_min(group_name: str | None, sm_count: int) -> int:
+    if group_name == "o_proj":
+        reserved = min(sm_count * 50 // 100, _O_PROJ_COMM_SM_MAX)
+    elif group_name == "down_proj":
+        reserved = min(sm_count * 30 // 100, _DOWN_PROJ_COMM_SM_MAX)
+    else:
+        reserved = 0
+    return sm_count - reserved
 
 
 @dataclass(frozen=True)
@@ -37,11 +52,71 @@ class CudaTPSPContext:
 
 class CudaTPSPBackend(TPSPBackend):
     tpsp_chunk_granularity = 64
-    tpsp_max_microchunk_tokens = 16_384
+    tpsp_max_microchunk_rows = 4_096
 
     def __init__(self, group_name: str, device: torch.device):
         super().__init__(group_name, device)
         self._open_context_ids: set[int] = set()
+
+    def profile(
+        self,
+        ops_groups: Sequence[TPSPOpsGroup],
+        max_batched_tokens: int,
+        *,
+        compute_engine_count_min: int | Mapping[str, int] | None = None,
+        compute_engine_count_max: int | Mapping[str, int] | None = None,
+        compute_engine_step_coarse: int = 6,
+        compute_engine_step_fine: int = 1,
+        chunk_min_max: tuple[int, int] | Mapping[str, tuple[int, int]] | None = None,
+        chunk_step_coarse: int = 256,
+        chunk_step_fine: int = 64,
+    ) -> TPSPContext | None:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_size = get_tp_group().world_size
+        sm_count = torch.cuda.get_device_properties(self.device).multi_processor_count
+        if compute_engine_count_min is None and compute_engine_count_max is None:
+            compute_engine_count_min = {
+                entry.name: _compute_engine_count_min(entry.name, sm_count)
+                for entry in ops_groups
+            }
+            compute_engine_count_max = {entry.name: sm_count for entry in ops_groups}
+        if chunk_min_max is None:
+            chunk_min_max = self._chunk_rows_range(max_batched_tokens, tp_size)
+        return super().profile(
+            ops_groups,
+            max_batched_tokens,
+            compute_engine_count_min=compute_engine_count_min,
+            compute_engine_count_max=compute_engine_count_max,
+            compute_engine_step_coarse=compute_engine_step_coarse,
+            compute_engine_step_fine=compute_engine_step_fine,
+            chunk_min_max=chunk_min_max,
+            chunk_step_coarse=chunk_step_coarse,
+            chunk_step_fine=chunk_step_fine,
+        )
+
+    def _chunk_rows_range(
+        self, max_batched_tokens: int, tp_size: int
+    ) -> tuple[int, int]:
+        shard_rows = math.ceil(max_batched_tokens / tp_size)
+        max_chunk_rows = math.ceil(shard_rows / self.tpsp_chunk_granularity)
+        max_chunk_rows *= self.tpsp_chunk_granularity
+        cap_rows = self.get_max_microchunk_rows(tp_size)
+        if cap_rows is not None:
+            if cap_rows >= self.tpsp_chunk_granularity:
+                cap_rows = (
+                    cap_rows // self.tpsp_chunk_granularity
+                ) * self.tpsp_chunk_granularity
+            max_chunk_rows = min(max_chunk_rows, cap_rows)
+        return min(self.tpsp_chunk_granularity, max_chunk_rows), max_chunk_rows
+
+    def get_compute_engine_count(self, config: object) -> int | None:
+        if isinstance(config, CudaTPSPConfig):
+            return config.sm_count_target
+        return None
+
+    def get_default_compute_engine_count(self) -> int:
+        return 0
 
     def open(
         self,
@@ -125,9 +200,10 @@ class CudaTPSPBackend(TPSPBackend):
         else:
             comm_address = 0
         rank = dist.get_rank(group)
-        max_chunk_rows = (
-            min(max_batched_tokens, self.tpsp_max_microchunk_tokens) + tp_size - 1
-        ) // tp_size
+        max_chunk_rows = math.ceil(max_batched_tokens / tp_size)
+        cap_rows = self.get_max_microchunk_rows(tp_size)
+        if cap_rows is not None:
+            max_chunk_rows = min(max_chunk_rows, cap_rows)
         context = CudaTPSPContext(device, tp_size, rank, comm_address, max_chunk_rows)
         if not self._all_ranks_ready(nccl_ready, group, device):
             logger.warning("CUDA TPSP default NCCL transport is unavailable")
@@ -192,16 +268,20 @@ class CudaTPSPBackend(TPSPBackend):
         return config
 
     def get_tuning_configs(
-        self, handle: object, chunk: int, group_name: str | None = None
+        self,
+        handle: object,
+        chunk: int,
+        group_name: str | None = None,
+        *,
+        compute_engine_counts: Sequence[int] | None = None,
+        compute_engine_step: int = 6,
     ) -> tuple[CudaTPSPConfig, ...]:
         context = self._profile_context(handle)
+        if compute_engine_step <= 0:
+            raise ValueError("Compute-engine scan step must be positive")
         sm_count = torch.cuda.get_device_properties(
             context.device
         ).multi_processor_count
-        targets = dict.fromkeys(
-            (0, max(1, sm_count * 85 // 100), max(1, sm_count * 70 // 100))
-        )
-        configs = [CudaTPSPConfig(chunk, False, target) for target in targets]
         fixed_p2p_sm_targets = os.environ.get("VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS")
         fixed_p2p_sm_target = os.environ.get("VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET")
         if fixed_p2p_sm_targets is not None and fixed_p2p_sm_target is not None:
@@ -209,6 +289,7 @@ class CudaTPSPBackend(TPSPBackend):
                 "Set only one of VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS and "
                 "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET"
             )
+        fixed_target = None
         if context.p2p_handle:
             if fixed_p2p_sm_targets is not None:
                 if group_name is None:
@@ -241,25 +322,39 @@ class CudaTPSPBackend(TPSPBackend):
                         "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGETS values must be "
                         f"between 0 and {sm_count}"
                     )
-                return (CudaTPSPConfig(chunk, True, p2p_sm_target),)
-            if fixed_p2p_sm_target is None:
-                configs.insert(0, CudaTPSPConfig(chunk, True))
-            else:
+                fixed_target = p2p_sm_target
+            elif fixed_p2p_sm_target is not None:
                 try:
-                    p2p_sm_target = int(fixed_p2p_sm_target)
+                    fixed_target = int(fixed_p2p_sm_target)
                 except ValueError as exc:
                     raise ValueError(
                         "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET must be an integer"
                     ) from exc
-                if not 0 <= p2p_sm_target <= sm_count:
+                if not 0 <= fixed_target <= sm_count:
                     raise ValueError(
                         "VLLM_TPSP_FIXED_P2P_SM_COUNT_TARGET must be between "
                         f"0 and {sm_count}"
                     )
-                return (CudaTPSPConfig(chunk, True, p2p_sm_target),)
         elif fixed_p2p_sm_target is not None or fixed_p2p_sm_targets is not None:
             raise RuntimeError("A fixed P2P SM target was set, but P2P is unavailable")
-        return tuple(configs)
+
+        targets: tuple[int, ...]
+        if fixed_target is not None:
+            targets = (fixed_target,)
+        elif compute_engine_counts is not None:
+            targets = tuple(dict.fromkeys(compute_engine_counts))
+        else:
+            start = _compute_engine_count_min(group_name, sm_count)
+            values = list(range(start, sm_count + 1, compute_engine_step))
+            if values[-1] != sm_count:
+                values.append(sm_count)
+            targets = tuple(dict.fromkeys((0, *values)))
+        if not targets or any(
+            type(target) is not int or not 0 <= target <= sm_count for target in targets
+        ):
+            raise ValueError("Invalid TPSP SM count targets")
+        use_p2p = bool(context.p2p_handle)
+        return tuple(CudaTPSPConfig(chunk, use_p2p, target) for target in targets)
 
     def fused_gemm_rs_norm_ag(
         self,

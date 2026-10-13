@@ -145,9 +145,7 @@ def _check_tpsp_backend(
         large_norm = nn.Module()
         large_norm.weight = torch.ones(64, dtype=torch.bfloat16, device=device)
         large_norm.variance_epsilon = 1e-5
-        capped_rows = (
-            backend.tpsp_max_microchunk_tokens + world_size - 1
-        ) // world_size
+        capped_rows = backend.tpsp_max_microchunk_rows
         assert large_context.max_chunk_rows == capped_rows
         with pytest.raises(RuntimeError, match="residual shard"):
             backend.fused_gemm_rs_norm_ag(
@@ -400,7 +398,7 @@ def _check_tpsp_backend(
             norm=o_norm,
             tp_size=world_size,
             max_batched_tokens=128,
-            time_budget_s=60,
+            group_name="o_proj",
         )
         assert profile.tp_size == world_size
         assert profile.hidden_size == 4096
@@ -490,10 +488,11 @@ def test_cuda_tpsp_refines_only_available_transports(monkeypatch, p2p_handle):
         "get_device_properties",
         lambda device: SimpleNamespace(multi_processor_count=78),
     )
-    expected = [CudaTPSPConfig(512, False, target) for target in (0, 66, 54)]
-    if p2p_handle:
-        expected.insert(0, CudaTPSPConfig(512, True))
-    assert backend.get_tuning_configs(context, 512) == tuple(expected)
+    expected = tuple(
+        CudaTPSPConfig(512, bool(p2p_handle), target)
+        for target in (0, 58, 64, 70, 76, 78)
+    )
+    assert backend.get_tuning_configs(context, 512, group_name="o_proj") == expected
     backend.set_config(context, CudaTPSPConfig(512, False, 66))
     assert context.config == CudaTPSPConfig(512, False, 66)
     assert context.p2p_handle == p2p_handle
@@ -555,8 +554,85 @@ def test_cuda_tpsp_can_pin_p2p_sm_targets_by_group(monkeypatch):
     )
 
 
-def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch):
+def test_cuda_tpsp_scans_group_sm_ranges_and_transport(monkeypatch):
+    from vllm.platforms.tpsp_cuda import (
+        CudaTPSPBackend,
+        CudaTPSPConfig,
+        CudaTPSPContext,
+    )
+
+    device = torch.device("cuda", 0)
+    backend = CudaTPSPBackend("test", device)
+    context = CudaTPSPContext(device, 4, 0, 1, 4096, 7)
+    backend._open_context_ids.add(id(context))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=78),
+    )
+    assert backend.get_tuning_configs(context, 64, "down_proj") == tuple(
+        CudaTPSPConfig(64, True, target) for target in (0, 68, 74, 78)
+    )
+    assert backend.get_tuning_configs(
+        context,
+        64,
+        "o_proj",
+        compute_engine_counts=(49, 50, 51),
+        compute_engine_step=1,
+    ) == tuple(CudaTPSPConfig(64, True, target) for target in (49, 50, 51))
+
+
+def test_cuda_tpsp_profile_passes_generic_scan_parameters(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.platforms.tpsp_cuda import CudaTPSPBackend
+
+    captured = {}
+
+    def profile(backend, ops_groups, max_batched_tokens, **kwargs):
+        captured["parameters"] = kwargs
+        return None
+
+    monkeypatch.setattr(TPSPBackend, "profile", profile)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=4),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=78),
+    )
+    backend = CudaTPSPBackend("test", torch.device("cuda", 0))
+    ops_groups = [
+        SimpleNamespace(name="o_proj"),
+        SimpleNamespace(name="down_proj"),
+    ]
+
+    backend.profile(ops_groups, 65_536)
+
+    assert captured["parameters"] == {
+        "compute_engine_count_min": {"o_proj": 58, "down_proj": 68},
+        "compute_engine_count_max": {"o_proj": 78, "down_proj": 78},
+        "compute_engine_step_coarse": 6,
+        "compute_engine_step_fine": 1,
+        "chunk_min_max": (64, 4096),
+        "chunk_step_coarse": 256,
+        "chunk_step_fine": 64,
+    }
+
+
+def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch, caplog):
+    from dataclasses import dataclass
+
+    caplog.set_level("INFO", logger=tpsp_utils.__name__)
     clock = [0.0]
+    coarse_grid: set[tuple[int, int]] = set()
+
+    @dataclass(frozen=True)
+    class Config:
+        chunk_rows: int
+        compute_engine_count: int
 
     class Projection(nn.Module):
         input_size_per_partition = 2
@@ -585,8 +661,19 @@ def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch):
         def close(self, context=None):
             pass
 
-        def get_tuning_configs(self, handle, chunk, group_name=None):
-            return (chunk, (chunk, "refined"))
+        def get_tuning_configs(
+            self,
+            handle,
+            chunk,
+            group_name=None,
+            *,
+            compute_engine_counts=None,
+            compute_engine_step=3,
+        ):
+            counts = (0, 1) if compute_engine_counts is None else compute_engine_counts
+            if compute_engine_step == 2 and compute_engine_counts is not None:
+                coarse_grid.update((chunk, count) for count in counts)
+            return tuple(Config(chunk, count) for count in counts)
 
         def fused_gemm_rs_norm_ag(
             self,
@@ -599,9 +686,23 @@ def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch):
             config=None,
             norm_type="rms_norm",
         ):
-            costs = {64: 4, 128: 3, (64, "refined"): 1, (128, "refined"): 2}
-            clock[0] += costs[config] / 1000
-            return x, residual
+            costs = {
+                (64, 0): 4,
+                (64, 1): 5,
+                (64, 2): 6,
+                (128, 0): 1.1,
+                (128, 1): 1.2,
+                (128, 2): 5,
+                (192, 0): 2,
+                (192, 1): 0.5,
+                (192, 2): 1,
+                (256, 0): 4,
+                (256, 1): 5,
+                (256, 2): 6,
+            }
+            clock[0] += costs[(config.chunk_rows, config.compute_engine_count)] / 1000
+            output = x + 1 if config == Config(192, 1) else x
+            return output, residual
 
     monkeypatch.setattr(tpsp_utils.c10d, "_resolve_process_group", lambda name: None)
     monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
@@ -616,12 +717,114 @@ def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch):
         Projection(),
         Norm(),
         tp_size=2,
-        max_batched_tokens=256,
-        time_budget_s=10,
+        max_batched_tokens=512,
+        group_name="o_proj",
+        compute_engine_count_min=0,
+        compute_engine_count_max=2,
+        compute_engine_step_coarse=2,
+        compute_engine_step_fine=1,
+        chunk_min_max=(64, 256),
+        chunk_step_coarse=64,
+        chunk_step_fine=64,
     )
-    assert min(result.candidates, key=lambda item: item[1])[0] == 128
-    assert result.config == (64, "refined")
-    assert len(result.finalists) == 4
+    assert result.config == Config(128, 0)
+    assert len(result.candidates) == 3
+    assert len(result.finalists) == 2
+    assert result.selected_coarse_rank == 2
+    assert result.selected_seed_rank == 2
+    assert tuple(rank for rank, _, _ in result.refined_candidates) == (
+        1,
+        2,
+        3,
+    )
+    assert result.refined_candidates[0][1] == Config(192, 1)
+    assert result.refined_candidates[1][1] == Config(128, 0)
+    assert "stage=coarse [####################] 100%" in caplog.text
+    assert "stage=fine [####################] 100%" in caplog.text
+    assert coarse_grid == {
+        (chunk, count) for chunk in (64, 128, 192, 256) for count in (0, 2)
+    }
+
+
+def test_tpsp_threshold_scan_coarsely_finds_and_finely_refines_boundary(
+    monkeypatch, caplog
+):
+    caplog.set_level("INFO", logger=tpsp_utils.__name__)
+    clock = [0.0]
+    measured_tokens = []
+    baseline_calls: dict[int, int] = {}
+    fused_calls: dict[int, int] = {}
+
+    class Projection(nn.Module):
+        input_size_per_partition = 2
+
+        def forward(self, x):
+            tokens = x.size(0)
+            baseline_calls[tokens] = baseline_calls.get(tokens, 0) + 1
+            clock[0] += 0.001
+            return x, None
+
+    class Norm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2))
+            self.variance_epsilon = 1e-5
+
+        def forward(self, x, residual):
+            return x, residual
+
+    class Backend:
+        group_name = "test"
+        device = torch.device("cpu")
+
+    def make_inputs(tokens, projection, hidden_size, tp_size, rank, device):
+        measured_tokens.append(tokens)
+        hidden_states = torch.zeros(tokens, hidden_size)
+        residual = torch.zeros_like(hidden_states)
+        return tpsp_utils._ProjectionInputs(
+            hidden_states, residual, residual, residual.clone()
+        )
+
+    def run_fused(backend, handle, projection, norm, inputs):
+        tokens = inputs.hidden_states.size(0)
+        fused_calls[tokens] = fused_calls.get(tokens, 0) + 1
+        clock[0] += 0.002 if tokens < 300 else 0.0005
+        return inputs.hidden_states
+
+    monkeypatch.setattr(tpsp_utils.c10d, "_resolve_process_group", lambda name: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(dist, "barrier", lambda **kwargs: None)
+    monkeypatch.setattr(dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: None)
+    monkeypatch.setattr(tpsp_utils.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(tpsp_utils, "_projection_inputs", make_inputs)
+    monkeypatch.setattr(tpsp_utils, "_run_fused_projection", run_fused)
+    ops_groups = tpsp_utils._compile_ops_groups(
+        [TPSPOpsGroup("o_proj", Projection(), Norm())]
+    )
+
+    result = tpsp_utils._scan_threshold(
+        Backend(),
+        ops_groups,
+        {"o_proj": object()},
+        max_batched_tokens=2048,
+    )
+
+    assert result.threshold_tokens == 384
+    assert set(measured_tokens) == {
+        128,
+        256,
+        384,
+        512,
+        640,
+        1152,
+        1664,
+        2048,
+    }
+    assert all(baseline_calls[tokens] == 2 for tokens in measured_tokens)
+    assert all(fused_calls[tokens] == 4 for tokens in measured_tokens)
+    assert "stage=threshold [####################] 100%" in caplog.text
 
 
 @pytest.mark.parametrize(
