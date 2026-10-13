@@ -173,6 +173,47 @@ def _check_tpsp_backend(
                     large_norm,
                     config=capped_rows + 1,
                 )
+        tokens = 65_538
+        generator = torch.Generator(device=device).manual_seed(123 + rank)
+        a = torch.randn(
+            (tokens, 64),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        rows = (tokens + world_size - 1) // world_size
+        residual = torch.randn(
+            (tokens, 64),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=torch.Generator(device=device).manual_seed(407),
+        )
+        local_residual = torch.zeros((rows, 64), device=device, dtype=torch.bfloat16)
+        start = rank * rows
+        count = min(rows, max(tokens - start, 0))
+        local_residual[:count] = residual[start : start + count]
+        expected = a @ large_projection.weight.T
+        dist.all_reduce(expected)
+        expected_residual = residual.clone()
+        torch.ops._C.fused_add_rms_norm(
+            expected, expected_residual, large_norm.weight, 1e-5
+        )
+        for config in (1024, 2048):
+            gathered, reduced = backend.fused_gemm_rs_norm_ag(
+                large_context,
+                a,
+                large_projection,
+                local_residual,
+                large_norm,
+                config=config,
+            )
+            torch.testing.assert_close(gathered, expected, rtol=0.02, atol=0.05)
+            torch.testing.assert_close(
+                reduced[:count],
+                expected_residual[start : start + count],
+                rtol=0.02,
+                atol=0.05,
+            )
         old_handle = large_context.p2p_handle
         backend.close(large_context)
         if old_handle:

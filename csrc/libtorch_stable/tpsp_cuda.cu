@@ -32,10 +32,35 @@ constexpr int kTpspInboxReady = 0;
 constexpr int kTpspGatherReady = 1;
 constexpr int kTpspFlagPhases = kTpspGatherReady + 1;
 constexpr int kTpspDirectPipelineSlots = 3;
+constexpr double kTpspTailMergeThreshold = 0.5;
 
 struct alignas(16) TpspBf16Vec {
   bf16 data[8];
 };
+
+std::vector<int64_t> make_tpsp_chunk_sizes(int64_t rows,
+                                           int64_t target_chunk_rows,
+                                           bool merge_small_tail = true) {
+  const int64_t full_chunks = rows / target_chunk_rows;
+  const int64_t tail_rows = rows % target_chunk_rows;
+  if (merge_small_tail && full_chunks > 0 && tail_rows > 0 &&
+      static_cast<double>(tail_rows) / target_chunk_rows <=
+          kTpspTailMergeThreshold) {
+    const int64_t base_rows = rows / full_chunks;
+    const int64_t larger_chunks = rows % full_chunks;
+    std::vector<int64_t> chunk_sizes(full_chunks, base_rows);
+    for (int64_t i = full_chunks - larger_chunks; i < full_chunks; ++i) {
+      ++chunk_sizes[i];
+    }
+    return chunk_sizes;
+  }
+
+  std::vector<int64_t> chunk_sizes(full_chunks, target_chunk_rows);
+  if (tail_rows > 0) {
+    chunk_sizes.push_back(tail_rows);
+  }
+  return chunk_sizes;
+}
 
 __global__ void pack_tpsp_chunk(const bf16* input, bf16* packed, int tokens,
                                 int width, int rows, int chunk_rows, int offset,
@@ -708,8 +733,10 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
   cudaStream_t stream = get_current_cuda_stream();
   cublasHandle_t blas = get_current_cuda_blas_handle();
   ncclComm_t comm = reinterpret_cast<ncclComm_t>(comm_address);
-  int64_t max_chunk = std::min(rows, microchunk_rows);
-  int64_t num_chunks = (rows + max_chunk - 1) / max_chunk;
+  const int64_t target_chunk_rows = std::min(rows, microchunk_rows);
+  auto chunk_sizes = make_tpsp_chunk_sizes(rows, target_chunk_rows);
+  int64_t max_chunk = *std::max_element(chunk_sizes.begin(), chunk_sizes.end());
+  int64_t num_chunks = chunk_sizes.size();
   bool p2p = p2p_handle != 0;
   std::shared_ptr<TpspP2pContext> p2p_context;
   char* local_base = nullptr;
@@ -730,6 +757,11 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
       auto it = tpsp_contexts.find(p2p_handle);
       STD_TORCH_CHECK(it != tpsp_contexts.end(), "Invalid TPSP P2P context");
       p2p_context = it->second;
+    }
+    if (max_chunk > p2p_context->max_chunk_rows) {
+      chunk_sizes = make_tpsp_chunk_sizes(rows, target_chunk_rows, false);
+      max_chunk = *std::max_element(chunk_sizes.begin(), chunk_sizes.end());
+      num_chunks = chunk_sizes.size();
     }
     STD_TORCH_CHECK(p2p_context->device_index == a.get_device_index() &&
                         p2p_context->tp_size == tp_size &&
@@ -814,10 +846,19 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
   constexpr int threads = 256;
   const float alpha = 1.0f;
   const float beta = 0.0f;
+  std::vector<int64_t> chunk_offsets;
+  chunk_offsets.reserve(num_chunks);
+  int64_t next_offset = 0;
+  for (int64_t chunk_rows : chunk_sizes) {
+    chunk_offsets.push_back(next_offset);
+    next_offset += chunk_rows;
+  }
+  STD_TORCH_CHECK(next_offset == rows, "TPSP chunk schedule is incomplete");
 
-  for (int64_t offset = 0; offset < rows; offset += max_chunk) {
-    int slot = (offset / max_chunk) % buffers.size();
-    if (pipelined && offset >= int64_t(buffers.size()) * max_chunk) {
+  for (int64_t chunk_index = 0; chunk_index < num_chunks; ++chunk_index) {
+    int64_t offset = chunk_offsets[chunk_index];
+    int slot = static_cast<int>(chunk_index % buffers.size());
+    if (pipelined && chunk_index >= int64_t(buffers.size())) {
       STD_CUDA_CHECK(
           cudaStreamWaitEvent(stream, pipeline->comm_done[slot].handle, 0));
     }
@@ -831,7 +872,7 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
         direct_p2p_gather
             ? nullptr
             : reinterpret_cast<bf16*>(scratch.gathered->mutable_data_ptr());
-    int chunk_rows = static_cast<int>(std::min(max_chunk, rows - offset));
+    int chunk_rows = static_cast<int>(chunk_sizes[chunk_index]);
     bool whole_input = tokens % tp_size == 0 && chunk_rows == rows;
     int p2p_slot = direct_p2p_gather ? slot : 0;
     if (p2p) {
