@@ -98,12 +98,18 @@ __global__ void wait_and_clear_tpsp_signals(unsigned int* signals, int rank,
   }
 }
 
-__global__ void wait_tpsp_epoch(unsigned int* epochs, int rank, int tp_size,
-                                unsigned int expected) {
+__global__ void increment_tpsp_epoch(unsigned int* epoch) {
+  atomicAdd(epoch, 1);
+}
+
+__global__ void wait_tpsp_epoch(unsigned int* epochs,
+                                const unsigned int* expected_epoch, int rank,
+                                int tp_size) {
   int peer = blockIdx.x * blockDim.x + threadIdx.x;
   if (peer >= tp_size || peer == rank) {
     return;
   }
+  unsigned int expected = *expected_epoch;
   auto start = clock64();
   while (atomicAdd(epochs + peer, 0) < expected) {
     if (clock64() - start > 30000000000ULL) {
@@ -344,7 +350,7 @@ struct PipelineState {
 };
 
 thread_local std::unordered_map<int, std::unique_ptr<PipelineState>>
-    pipeline_states;
+    nccl_pipeline_states;
 
 struct ChunkBuffers {
   torch::stable::Tensor packed;
@@ -366,7 +372,6 @@ struct TpspP2pContext {
   int64_t completion_offset;
   int pipeline_slots;
   int64_t max_tokens = 0;
-  unsigned int completion_epoch = 0;
   bool direct_gather = false;
   ncclComm_t comm;
   void* workspace = nullptr;
@@ -375,6 +380,7 @@ struct TpspP2pContext {
   void* signal_epoch = nullptr;
   std::vector<void*> peers;
   std::vector<void*> output_peers;
+  std::unique_ptr<PipelineState> pipeline;
 
   void close_peer_mappings() {
     for (int source = 0; source < tp_size; ++source) {
@@ -604,6 +610,8 @@ int64_t init_tpsp_p2p(int64_t device_index, int64_t comm_address,
   unsigned int one = 1;
   STD_CUDA_CHECK(cudaMemcpyAsync(context->signal_one, &one, sizeof(one),
                                  cudaMemcpyHostToDevice, stream));
+  STD_CUDA_CHECK(
+      cudaMemsetAsync(context->signal_epoch, 0, sizeof(unsigned int), stream));
   all_tpsp_ranks_ready(true, comm, stream);
   std::lock_guard<std::mutex> lock(tpsp_context_mutex);
   int64_t handle = next_tpsp_handle++;
@@ -712,7 +720,7 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
   int64_t flag_slot_bytes = 0;
   int64_t completion_offset = 0;
   unsigned int* local_completion = nullptr;
-  const unsigned int* epoch = nullptr;
+  unsigned int* epoch = nullptr;
   if (p2p) {
     {
       std::lock_guard<std::mutex> lock(tpsp_context_mutex);
@@ -735,14 +743,20 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
     local_completion =
         reinterpret_cast<unsigned int*>(local_base + completion_offset);
     one = reinterpret_cast<const unsigned int*>(p2p_context->signal_one);
-    epoch = reinterpret_cast<const unsigned int*>(p2p_context->signal_epoch);
+    epoch = reinterpret_cast<unsigned int*>(p2p_context->signal_epoch);
   }
   STD_TORCH_CHECK(comm_address != 0, "TPSP requires an NCCL communicator");
   int rank = p2p ? p2p_context->rank : -1;
   bool direct_p2p_gather = p2p && p2p_context->direct_gather;
+  bool pipelined = num_chunks > 1;
   PipelineState* pipeline = nullptr;
-  if (num_chunks > 1 || direct_p2p_gather) {
-    auto& state = pipeline_states[a.get_device_index()];
+  if (direct_p2p_gather) {
+    if (!p2p_context->pipeline) {
+      p2p_context->pipeline = std::make_unique<PipelineState>();
+    }
+    pipeline = p2p_context->pipeline.get();
+  } else if (pipelined) {
+    auto& state = nccl_pipeline_states[a.get_device_index()];
     if (!state) {
       state = std::make_unique<PipelineState>();
     }
@@ -753,7 +767,7 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
                   "TPSP direct P2P output exceeds workspace capacity");
   std::vector<ChunkBuffers> buffers;
   int buffer_slots =
-      pipeline ? (direct_p2p_gather ? kTpspDirectPipelineSlots : 2) : 1;
+      pipelined ? (direct_p2p_gather ? kTpspDirectPipelineSlots : 2) : 1;
   for (int slot = 0; slot < buffer_slots; ++slot) {
     buffers.push_back({
         make_bf16(a, max_chunk * tp_size, width),
@@ -795,7 +809,7 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
 
   for (int64_t offset = 0; offset < rows; offset += max_chunk) {
     int slot = (offset / max_chunk) % buffers.size();
-    if (pipeline && offset >= int64_t(buffers.size()) * max_chunk) {
+    if (pipelined && offset >= int64_t(buffers.size()) * max_chunk) {
       STD_CUDA_CHECK(
           cudaStreamWaitEvent(stream, pipeline->comm_done[slot].handle, 0));
     }
@@ -989,7 +1003,7 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
                                        gather_bytes, cudaMemcpyDeviceToDevice,
                                        comm_stream));
       }
-      if (pipeline && direct_p2p_gather) {
+      if (pipelined && direct_p2p_gather) {
         STD_CUDA_CHECK(
             cudaEventRecord(pipeline->comm_done[slot].handle, comm_stream));
       }
@@ -1042,13 +1056,8 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
   }
   if (pipeline) {
     if (direct_p2p_gather) {
-      STD_TORCH_CHECK(p2p_context->completion_epoch !=
-                          std::numeric_limits<unsigned int>::max(),
-                      "TPSP P2P completion epoch overflow");
-      unsigned int expected = ++p2p_context->completion_epoch;
-      STD_CUDA_CHECK(cudaMemcpyAsync(p2p_context->signal_epoch, &expected,
-                                     sizeof(expected), cudaMemcpyHostToDevice,
-                                     pipeline->comm_stream));
+      increment_tpsp_epoch<<<1, 1, 0, pipeline->comm_stream>>>(epoch);
+      STD_CUDA_CHECK(cudaGetLastError());
       tpsp_system_fence<<<1, 1, 0, pipeline->comm_stream>>>();
       STD_CUDA_CHECK(cudaGetLastError());
       for (int dest = 0; dest < tp_size; ++dest) {
@@ -1058,15 +1067,16 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
         auto* peer_base = reinterpret_cast<char*>(p2p_context->peers[dest]);
         STD_CUDA_CHECK(cudaMemcpyAsync(
             peer_base + completion_offset + rank * sizeof(unsigned int), epoch,
-            sizeof(expected), cudaMemcpyDeviceToDevice, pipeline->comm_stream));
+            sizeof(unsigned int), cudaMemcpyDeviceToDevice,
+            pipeline->comm_stream));
       }
       STD_CUDA_CHECK(cudaEventRecord(pipeline->comm_complete.handle,
                                      pipeline->comm_stream));
       STD_CUDA_CHECK(cudaStreamWaitEvent(pipeline->completion_stream,
                                          pipeline->comm_complete.handle, 0));
       wait_tpsp_epoch<<<(tp_size + 255) / 256, 256, 0,
-                        pipeline->completion_stream>>>(local_completion, rank,
-                                                       tp_size, expected);
+                        pipeline->completion_stream>>>(local_completion, epoch,
+                                                       rank, tp_size);
       STD_CUDA_CHECK(cudaGetLastError());
       STD_CUDA_CHECK(cudaEventRecord(pipeline->output_complete.handle,
                                      pipeline->completion_stream));
