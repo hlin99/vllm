@@ -622,12 +622,15 @@ def test_cuda_tpsp_profile_passes_generic_scan_parameters(monkeypatch):
     }
 
 
-def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch, caplog):
+def test_tpsp_joint_refinement_uses_upper_midpoint_probe_and_default_fallback(
+    monkeypatch, caplog
+):
     from dataclasses import dataclass
 
     caplog.set_level("INFO", logger=tpsp_utils.__name__)
     clock = [0.0]
     coarse_grid: set[tuple[int, int]] = set()
+    fine_grid: set[tuple[int, int]] = set()
 
     @dataclass(frozen=True)
     class Config:
@@ -651,6 +654,7 @@ def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch, caplog
 
     class Backend(TPSPBackend):
         tpsp_chunk_granularity = 64
+        fixed_count = None
 
         def open(self, **kwargs):
             return None
@@ -661,6 +665,9 @@ def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch, caplog
         def close(self, context=None):
             pass
 
+        def get_default_compute_engine_count(self):
+            return 0
+
         def get_tuning_configs(
             self,
             handle,
@@ -670,9 +677,16 @@ def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch, caplog
             compute_engine_counts=None,
             compute_engine_step=3,
         ):
-            counts = (0, 1) if compute_engine_counts is None else compute_engine_counts
-            if compute_engine_step == 2 and compute_engine_counts is not None:
+            if self.fixed_count is not None:
+                counts = (self.fixed_count,)
+            else:
+                counts = (
+                    (0, 3) if compute_engine_counts is None else compute_engine_counts
+                )
+            if compute_engine_step > 1:
                 coarse_grid.update((chunk, count) for count in counts)
+            elif compute_engine_step == 1:
+                fine_grid.update((chunk, count) for count in counts)
             return tuple(Config(chunk, count) for count in counts)
 
         def fused_gemm_rs_norm_ag(
@@ -687,21 +701,25 @@ def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch, caplog
             norm_type="rms_norm",
         ):
             costs = {
-                (64, 0): 4,
-                (64, 1): 5,
-                (64, 2): 6,
-                (128, 0): 1.1,
-                (128, 1): 1.2,
-                (128, 2): 5,
-                (192, 0): 2,
-                (192, 1): 0.5,
-                (192, 2): 1,
-                (256, 0): 4,
-                (256, 1): 5,
-                (256, 2): 6,
+                (64, 0): 3,
+                (128, 0): 2,
+                (192, 0): 0.8,
+                (256, 0): 2.5,
+                (64, 3): 4,
+                (128, 3): 3,
+                (192, 3): 2,
+                (256, 3): 4,
             }
-            clock[0] += costs[(config.chunk_rows, config.compute_engine_count)] / 1000
-            output = x + 1 if config == Config(192, 1) else x
+            cost = costs.get(
+                (config.chunk_rows, config.compute_engine_count),
+                1.5
+                + abs(config.chunk_rows - 192) / 256
+                + abs(config.compute_engine_count - 2) / 10,
+            )
+            if config == Config(192, 2):
+                cost = 0.5
+            clock[0] += cost / 1000
+            output = x + 1 if config == Config(192, 2) else x
             return output, residual
 
     monkeypatch.setattr(tpsp_utils.c10d, "_resolve_process_group", lambda name: None)
@@ -711,39 +729,68 @@ def test_tpsp_chunk_refinement_can_change_the_initial_winner(monkeypatch, caplog
     monkeypatch.setattr(dist, "all_reduce", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: None)
     monkeypatch.setattr(tpsp_utils.time, "perf_counter", lambda: clock[0])
+    backend = Backend("test", torch.device("cpu"))
     result = tpsp_utils._scan_chunk(
-        Backend("test", torch.device("cpu")),
+        backend,
         object(),
         Projection(),
         Norm(),
         tp_size=2,
         max_batched_tokens=512,
         group_name="o_proj",
-        compute_engine_count_min=0,
-        compute_engine_count_max=2,
-        compute_engine_step_coarse=2,
+        compute_engine_count_min=1,
+        compute_engine_count_max=5,
+        compute_engine_step_coarse=4,
         compute_engine_step_fine=1,
         chunk_min_max=(64, 256),
-        chunk_step_coarse=64,
+        chunk_step_coarse=128,
         chunk_step_fine=64,
     )
-    assert result.config == Config(128, 0)
+    assert result.config == Config(192, 0)
     assert len(result.candidates) == 3
     assert len(result.finalists) == 2
-    assert result.selected_coarse_rank == 2
     assert result.selected_seed_rank == 2
     assert tuple(rank for rank, _, _ in result.refined_candidates) == (
         1,
         2,
-        3,
     )
-    assert result.refined_candidates[0][1] == Config(192, 1)
-    assert result.refined_candidates[1][1] == Config(128, 0)
+    assert result.refined_candidates[0][1] == Config(192, 2)
+    assert result.refined_candidates[1][1] == Config(192, 0)
     assert "stage=coarse [####################] 100%" in caplog.text
     assert "stage=fine [####################] 100%" in caplog.text
+    assert "stage=fine [--------------------]   0% 0/21" in caplog.text
+    assert "14% 3/21" in caplog.text
     assert coarse_grid == {
-        (chunk, count) for chunk in (64, 128, 192, 256) for count in (0, 2)
+        *((chunk, 5) for chunk in (64, 128, 192, 256)),
+        *((chunk, 0) for chunk in (64, 192, 256)),
     }
+    assert fine_grid == {
+        *((chunk, count) for chunk in (64, 128, 192, 256) for count in range(1, 6)),
+        (192, 0),
+    }
+
+    backend.fixed_count = 4
+    coarse_grid.clear()
+    fine_grid.clear()
+    result = tpsp_utils._scan_chunk(
+        backend,
+        object(),
+        Projection(),
+        Norm(),
+        tp_size=2,
+        max_batched_tokens=512,
+        group_name="o_proj",
+        compute_engine_count_min=1,
+        compute_engine_count_max=5,
+        compute_engine_step_coarse=4,
+        compute_engine_step_fine=1,
+        chunk_min_max=(64, 256),
+        chunk_step_coarse=128,
+        chunk_step_fine=64,
+    )
+    assert result.status == "candidate"
+    assert result.config == Config(192, 4)
+    assert "TPSP midpoint probe unavailable" in caplog.text
 
 
 def test_tpsp_threshold_scan_coarsely_finds_and_finely_refines_boundary(
@@ -825,6 +872,14 @@ def test_tpsp_threshold_scan_coarsely_finds_and_finely_refines_boundary(
     assert all(baseline_calls[tokens] == 2 for tokens in measured_tokens)
     assert all(fused_calls[tokens] == 4 for tokens in measured_tokens)
     assert "stage=threshold [####################] 100%" in caplog.text
+
+
+def test_tpsp_benefit_threshold_is_one_percent():
+    measurement = tpsp_utils.TPSPMeasurement
+    assert tpsp_utils._beneficial(measurement(1, 100, 98.9, 1.1))
+    assert not tpsp_utils._beneficial(measurement(1, 100, 99, 1))
+    assert tpsp_utils._beneficial(measurement(1, 2, 1.97, 0.03))
+    assert not tpsp_utils._beneficial(measurement(1, 2, 1.98, 0.02))
 
 
 @pytest.mark.parametrize(

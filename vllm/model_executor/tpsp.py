@@ -146,8 +146,8 @@ class TPSPBackend(ABC):
             compute_engine_step_coarse: Step for the full-grid count scan.
             compute_engine_step_fine: Step around finalist counts.
             chunk_min_max: Per-group chunk bounds, or shared row bounds.
-            chunk_step_coarse: Step for the full-grid chunk scan.
-            chunk_step_fine: Step around finalist chunks.
+            chunk_step_coarse: Step for default-count chunk candidates.
+            chunk_step_fine: Step for the full chunk probe and local refinement.
 
         Returns:
             The selected TPSP context, or None when profiling is inconclusive.
@@ -339,7 +339,7 @@ def profile_tpsp(
     """Profile named ops groups in four steps.
 
     1. Connect each group's projection and norm into a runnable path.
-    2. Open a handle, screen chunks, and refine each group's finalists.
+    2. Open a handle, probe chunks, and jointly refine each group's best region.
     3. Find one threshold from the sum of separately timed group paths.
     4. Return a shared profile with the named handles, or use regular forward
        if any scan is inconclusive or finds no benefit.
@@ -354,8 +354,8 @@ def profile_tpsp(
         compute_engine_step_coarse: Step for the full-grid count scan.
         compute_engine_step_fine: Step around finalist counts.
         chunk_min_max: Per-group chunk bounds, or shared row bounds.
-        chunk_step_coarse: Step for the full-grid chunk scan.
-        chunk_step_fine: Step around finalist chunks.
+        chunk_step_coarse: Step for default-count chunk candidates.
+        chunk_step_fine: Step for the full chunk probe and local refinement.
 
     Returns:
         The selected TPSP context, or None when profiling is inconclusive.
@@ -659,7 +659,7 @@ def _build_tpsp_context(
 
 
 def _beneficial(measurement: TPSPMeasurement) -> bool:
-    return measurement.benefit_ms > max(0.05, 0.02 * measurement.conventional_ms)
+    return measurement.benefit_ms > 0.01 * measurement.conventional_ms
 
 
 @torch.inference_mode()
@@ -840,7 +840,7 @@ def _scan_chunk(
     chunk_step_coarse: int = _COARSE_CHUNK_STEP,
     chunk_step_fine: int = _FINE_CHUNK_STEP,
 ) -> TPSPScanResult:
-    """Screen the chunk/compute-engine grid, refine finalists, and check parity.
+    """Probe chunks, jointly refine a local grid, and check candidate parity.
 
     Returns:
         TPSPScanResult with timings and the selected configuration in ``config``.
@@ -926,7 +926,7 @@ def _scan_chunk(
             values += (maximum,)
         return values
 
-    # Stage 1 covers every chunk in the configured coarse grid at full load.
+    # Stage 1 screens the selected chunk/count candidates at full load.
     screening_inputs = make_inputs(max_batched_tokens)
     supported_max_chunk_rows = (
         math.ceil(shard_rows / chunk_granularity) * chunk_granularity
@@ -959,6 +959,7 @@ def _scan_chunk(
         )
     ):
         raise ValueError("Invalid TPSP chunk range")
+    probe_count: int | None = None
     if fixed_chunk_rows is not None:
         if (
             type(fixed_chunk_rows) is not int
@@ -976,9 +977,37 @@ def _scan_chunk(
             chunk_step_coarse % chunk_granularity or chunk_step_fine % chunk_granularity
         ):
             raise ValueError("Chunk scan steps must align with chunk granularity")
-        coarse_chunks = inclusive_range(
+        sparse_chunks = inclusive_range(
             min_chunk_rows, max_chunk_rows, chunk_step_coarse
         )
+        if compute_engine_count_min is not None:
+            assert compute_engine_count_max is not None
+            positive_min = max(1, compute_engine_count_min)
+            positive_counts = (
+                inclusive_range(
+                    positive_min,
+                    compute_engine_count_max,
+                    compute_engine_step_coarse,
+                )
+                if positive_min <= compute_engine_count_max
+                else ()
+            )
+            if positive_counts:
+                midpoint = (positive_counts[0] + positive_counts[-1]) / 2
+                probe_count = min(
+                    positive_counts,
+                    key=lambda count: (abs(count - midpoint), -count),
+                )
+                coarse_chunks = inclusive_range(
+                    min_chunk_rows, max_chunk_rows, chunk_step_fine
+                )
+            else:
+                probe_count = None
+                coarse_chunks = sparse_chunks
+        else:
+            probe_count = None
+            coarse_chunks = sparse_chunks
+    joint_probe_scan = fixed_chunk_rows is None and probe_count is not None
     coarse_results: list[tuple[object, float, int]] = []
 
     def top_results(
@@ -1059,11 +1088,18 @@ def _scan_chunk(
     coarse_started = time.perf_counter()
     coarse_configs = []
     for chunk in coarse_chunks:
+        targets = coarse_targets()
+        if joint_probe_scan:
+            assert probe_count is not None
+            targets = (probe_count,)
+            default_count = backend.get_default_compute_engine_count()
+            if default_count is not None and chunk in sparse_chunks:
+                targets = tuple(dict.fromkeys((default_count, *targets)))
         configs = backend.get_tuning_configs(
             projection_context,
             chunk,
             group_name=group_name,
-            compute_engine_counts=coarse_targets(),
+            compute_engine_counts=targets,
             compute_engine_step=compute_engine_step_coarse,
         )
         if not configs:
@@ -1085,6 +1121,39 @@ def _scan_chunk(
     coarse_ranked_results = tuple(sorted(coarse_results, key=lambda result: result[1]))
     coarse_top = coarse_ranked_results[:_FINALIST_COUNT]
     coarse_candidates = tuple((config, score) for config, score, _ in coarse_top)
+    probe_seed = None
+    default_seed = None
+    if joint_probe_scan:
+        assert probe_count is not None
+        probe_seed = min(
+            (
+                result
+                for result in coarse_results
+                if backend.get_compute_engine_count(result[0]) == probe_count
+            ),
+            key=lambda result: result[1],
+            default=None,
+        )
+        if probe_seed is None:
+            if rank == 0:
+                _LOG.info(
+                    "TPSP midpoint probe unavailable group=%s; "
+                    "using finalist refinement",
+                    group_name,
+                )
+            joint_probe_scan = False
+        else:
+            default_count = backend.get_default_compute_engine_count()
+            if default_count is not None and default_count != probe_count:
+                default_seed = min(
+                    (
+                        result
+                        for result in coarse_results
+                        if backend.get_compute_engine_count(result[0]) == default_count
+                    ),
+                    key=lambda result: result[1],
+                    default=None,
+                )
     available_engine_counts = tuple(
         dict.fromkeys(
             count
@@ -1095,12 +1164,40 @@ def _scan_chunk(
     fine_measurements: dict[
         tuple[int, int | None], tuple[tuple[object, float], ...]
     ] = {}
+    if joint_probe_scan:
+        assert probe_seed is not None
+        probe_config, _, probe_chunk = probe_seed
+        probe_counts = fine_targets(
+            backend.get_compute_engine_count(probe_config), available_engine_counts
+        )
+        fine_total = len(local_chunks(probe_chunk)) * len(
+            probe_counts if probe_counts is not None else (None,)
+        )
+        fine_total += int(default_seed is not None)
+    else:
+        fine_total = sum(
+            len(local_chunks(seed_chunk))
+            + len(
+                fine_targets(
+                    backend.get_compute_engine_count(seed_config),
+                    available_engine_counts,
+                )
+                or (None,)
+            )
+            for seed_config, _, seed_chunk in coarse_top
+        )
     fine_progress = _TPSPProgress(
         group_name or backend.group_name,
         "fine",
-        len(coarse_top),
+        fine_total,
         rank,
     )
+    fine_completed = 0
+
+    def advance_fine_progress() -> None:
+        nonlocal fine_completed
+        fine_completed += 1
+        fine_progress.update(fine_completed, percent_limit=99)
 
     def measure_pair(
         chunk: int, count: int | None, inputs: _ProjectionInputs
@@ -1139,22 +1236,56 @@ def _scan_chunk(
         return fine_measurements[pair]
 
     refined_candidates: list[tuple[int, object, float]] = []
-    for seed_rank, (seed_config, _, seed_chunk) in enumerate(coarse_top, start=1):
+    if joint_probe_scan:
+        assert probe_seed is not None
+        seed_config, _, seed_chunk = probe_seed
         seed_count = backend.get_compute_engine_count(seed_config)
-        chunk_results: list[tuple[int, object, float]] = []
-        for chunk in local_chunks(seed_chunk):
-            measured = measure_pair(chunk, seed_count, screening_inputs)
-            chunk_results.extend((chunk, config, score) for config, score in measured)
-        selected_chunk = min(chunk_results, key=lambda result: result[2])[0]
-
         counts = fine_targets(seed_count, available_engine_counts)
-        count_results: list[tuple[object, float]] = []
-        for count in counts if counts is not None else (None,):
-            measured = measure_pair(selected_chunk, count, screening_inputs)
-            count_results.extend(measured)
-        candidate, candidate_score = min(count_results, key=lambda result: result[1])
-        refined_candidates.append((seed_rank, candidate, candidate_score))
-        fine_progress.update(seed_rank, percent_limit=90)
+        joint_results: list[tuple[int, object, float]] = []
+        for chunk in local_chunks(seed_chunk):
+            for count in counts if counts is not None else (None,):
+                measured = measure_pair(chunk, count, screening_inputs)
+                joint_results.extend(
+                    (chunk, config, score) for config, score in measured
+                )
+                advance_fine_progress()
+        _, candidate, candidate_score = min(joint_results, key=lambda result: result[2])
+        refined_candidates.append((1, candidate, candidate_score))
+
+        if default_seed is not None:
+            default_config, _, default_chunk = default_seed
+            default_count = backend.get_default_compute_engine_count()
+            assert default_count is not None
+            default_results = measure_pair(
+                default_chunk, default_count, screening_inputs
+            )
+            advance_fine_progress()
+            candidate, candidate_score = min(
+                default_results, key=lambda result: result[1]
+            )
+            refined_candidates.append((2, candidate, candidate_score))
+    else:
+        for seed_rank, (seed_config, _, seed_chunk) in enumerate(coarse_top, start=1):
+            seed_count = backend.get_compute_engine_count(seed_config)
+            chunk_results: list[tuple[int, object, float]] = []
+            for chunk in local_chunks(seed_chunk):
+                measured = measure_pair(chunk, seed_count, screening_inputs)
+                chunk_results.extend(
+                    (chunk, config, score) for config, score in measured
+                )
+                advance_fine_progress()
+            selected_chunk = min(chunk_results, key=lambda result: result[2])[0]
+
+            counts = fine_targets(seed_count, available_engine_counts)
+            count_results: list[tuple[object, float]] = []
+            for count in counts if counts is not None else (None,):
+                measured = measure_pair(selected_chunk, count, screening_inputs)
+                count_results.extend(measured)
+                advance_fine_progress()
+            candidate, candidate_score = min(
+                count_results, key=lambda result: result[1]
+            )
+            refined_candidates.append((seed_rank, candidate, candidate_score))
 
     if not refined_candidates:
         raise ValueError("TPSP coarse scan returned no finalist candidates")
