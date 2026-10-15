@@ -39,7 +39,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor a, Tensor b, Tensor weight, Tensor residual, "
       "Tensor? projection_bias, Tensor? norm_bias, float eps, int norm_kind, "
       "int microchunk_rows, int comm_address, int tp_size, int p2p_handle, "
-      "int sm_count_target=0) "
+      "int sm_count_target=0, Tensor? layer_scale=None, "
+      "bool norm_weight_offset=False) "
       "-> (Tensor, Tensor, Tensor)");
 
   // Note about marlin kernel 'workspace' arguments:

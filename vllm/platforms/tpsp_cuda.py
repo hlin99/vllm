@@ -305,6 +305,8 @@ class CudaTPSPBackend(TPSPBackend):
         residual: torch.Tensor,
         norm: torch.nn.Module,
         *,
+        layer_scale: torch.Tensor | None = None,
+        norm_weight_offset: bool = False,
         config: object | None = None,
         norm_type: str = "rms_norm",
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -315,6 +317,14 @@ class CudaTPSPBackend(TPSPBackend):
         rows = (x.size(0) + context.tp_size - 1) // context.tp_size
         if residual.shape != (rows, hidden_size):
             raise RuntimeError("TPSP residual shard has an unexpected shape")
+        if layer_scale is not None:
+            if (
+                layer_scale.numel() != hidden_size
+                or layer_scale.device != context.device
+                or layer_scale.dtype not in (torch.bfloat16, torch.float32)
+            ):
+                raise ValueError("TPSP layer scale must match the BF16 output width")
+            layer_scale = layer_scale.reshape(-1).contiguous()
         local_residual = residual
 
         weight = projection.weight
@@ -381,6 +391,8 @@ class CudaTPSPBackend(TPSPBackend):
                 context.tp_size,
                 p2p_handle,
                 selected.sm_count_target,
+                layer_scale,
+                norm_weight_offset,
             )
         )
         return gathered, reduced

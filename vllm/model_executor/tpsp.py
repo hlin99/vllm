@@ -203,6 +203,8 @@ class TPSPBackend(ABC):
         residual: torch.Tensor,
         norm: nn.Module,
         *,
+        layer_scale: torch.Tensor | None = None,
+        norm_weight_offset: bool = False,
         config: object | None = None,
         norm_type: str = "rms_norm",
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
@@ -280,6 +282,8 @@ class TPSPOpsGroup:
     name: str
     projection: nn.Module
     norm: nn.Module
+    layer_scale: torch.Tensor | None = None
+    norm_weight_offset: bool = False
 
 
 @dataclass(frozen=True)
@@ -481,8 +485,12 @@ def _run_conventional_projection(
     projection: nn.Module,
     norm: nn.Module,
     inputs: _ProjectionInputs,
+    layer_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     full, _ = projection(inputs.hidden_states)
+    if layer_scale is not None:
+        scale = layer_scale.to(dtype=full.dtype).reshape(-1) + 1
+        full = full * scale
     full, _ = norm(full, inputs.residual)
     return full
 
@@ -494,7 +502,15 @@ def _run_fused_projection(
     norm: nn.Module,
     inputs: _ProjectionInputs,
     chunk: object | None = None,
+    *,
+    layer_scale: torch.Tensor | None = None,
+    norm_weight_offset: bool = False,
 ) -> torch.Tensor:
+    fused_kwargs: dict[str, object] = {}
+    if layer_scale is not None:
+        fused_kwargs["layer_scale"] = layer_scale
+    if norm_weight_offset:
+        fused_kwargs["norm_weight_offset"] = True
     return backend.fused_gemm_rs_norm_ag(
         projection_context,
         inputs.hidden_states,
@@ -502,6 +518,7 @@ def _run_fused_projection(
         inputs.local_residual,
         norm,
         config=chunk,
+        **fused_kwargs,
     )[0]
 
 
@@ -521,10 +538,20 @@ def _compile_ops_groups(
             raise ValueError("input_width must be positive")
         if entry.norm.variance_epsilon <= 0:
             raise ValueError("norm_eps must be positive")
+        if entry.layer_scale is not None and (
+            entry.layer_scale.numel() != hidden_size
+            or entry.layer_scale.device != entry.projection.weight.device
+        ):
+            raise ValueError("TPSP layer scale must match the projection output")
     return tuple(
         _CompiledOpsGroup(
             entry,
-            partial(_run_conventional_projection, entry.projection, entry.norm),
+            partial(
+                _run_conventional_projection,
+                entry.projection,
+                entry.norm,
+                layer_scale=entry.layer_scale,
+            ),
         )
         for entry in ops_groups
     )
@@ -581,6 +608,8 @@ def _scan_group_chunks(
             handle,
             projection=entry.projection,
             norm=entry.norm,
+            layer_scale=entry.layer_scale,
+            norm_weight_offset=entry.norm_weight_offset,
             tp_size=tp_group.world_size,
             max_batched_tokens=max_batched_tokens,
             group_name=entry.name,
@@ -669,7 +698,13 @@ def _scan_threshold(
         start = time.perf_counter()
         if fused:
             result = _run_fused_projection(
-                backend, handle, compiled.ops.projection, compiled.ops.norm, inputs
+                backend,
+                handle,
+                compiled.ops.projection,
+                compiled.ops.norm,
+                inputs,
+                layer_scale=compiled.ops.layer_scale,
+                norm_weight_offset=compiled.ops.norm_weight_offset,
             )
         else:
             result = compiled.conventional(inputs)
@@ -812,6 +847,8 @@ def _scan_chunk(
     chunk_min_max: tuple[int, int] | None = None,
     chunk_step_coarse: int = _COARSE_CHUNK_STEP,
     chunk_step_fine: int = _FINE_CHUNK_STEP,
+    layer_scale: torch.Tensor | None = None,
+    norm_weight_offset: bool = False,
 ) -> TPSPScanResult:
     """Probe chunks, jointly refine a local grid, and check candidate parity.
 
@@ -863,7 +900,14 @@ def _scan_chunk(
 
     def run_fused(inputs: _ProjectionInputs, config: object) -> torch.Tensor:
         return _run_fused_projection(
-            backend, projection_context, projection, norm, inputs, config
+            backend,
+            projection_context,
+            projection,
+            norm,
+            inputs,
+            config,
+            layer_scale=layer_scale,
+            norm_weight_offset=norm_weight_offset,
         )
 
     def time_config_ms(inputs: _ProjectionInputs, config: object) -> float:
@@ -1239,7 +1283,9 @@ def _scan_chunk(
     parity_inputs = min(max_batched_tokens, tp_size * 5 + 1)
     for seed_rank, candidate_config, score in ranked_candidates:
         check_inputs = make_inputs(parity_inputs)
-        conventional = _run_conventional_projection(projection, norm, check_inputs)
+        conventional = _run_conventional_projection(
+            projection, norm, check_inputs, layer_scale=layer_scale
+        )
         native = run_fused(check_inputs, candidate_config)
         torch.accelerator.synchronize(device)
         local_failure = False

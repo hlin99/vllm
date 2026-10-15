@@ -15,6 +15,7 @@ from torch import nn
 
 from vllm.model_executor import tpsp as tpsp_utils
 from vllm.model_executor.models import llama
+from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
 from vllm.model_executor.tpsp import (
     TPSPBackend,
     TPSPContext,
@@ -54,6 +55,10 @@ def test_compiled_ops_group_passes_projection_output_to_norm():
     class Projection(nn.Module):
         input_size_per_partition = 2
 
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2, 2))
+
         def forward(self, x):
             return x + 2, None
 
@@ -71,6 +76,136 @@ def test_compiled_ops_group_passes_projection_output_to_norm():
         hidden_states=torch.ones(1, 2), residual=torch.full((1, 2), 4.0)
     )
     torch.testing.assert_close(compiled.conventional(inputs), torch.full((1, 2), 12.0))
+
+
+def test_compiled_ops_group_applies_layer_scale_before_norm():
+    class Projection(nn.Module):
+        input_size_per_partition = 2
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2, 2))
+
+        def forward(self, x):
+            return x + 2, None
+
+    class Norm(nn.Module):
+        def forward(self, x, residual):
+            return x + residual, residual
+
+    norm = Norm()
+    norm.weight = nn.Parameter(torch.ones(2))
+    norm.variance_epsilon = 1e-5
+    scale = torch.tensor([1.0, -0.5])
+    compiled = tpsp_utils._compile_ops_groups(
+        [TPSPOpsGroup("pair", Projection(), norm, scale)]
+    )[0]
+    inputs = SimpleNamespace(
+        hidden_states=torch.ones(1, 2), residual=torch.full((1, 2), 4.0)
+    )
+
+    torch.testing.assert_close(
+        compiled.conventional(inputs), torch.tensor([[10.0, 5.5]])
+    )
+
+
+@pytest.mark.parametrize(
+    ("layer_type", "attention_group"),
+    (
+        ("full_attention", "full_attn_o_proj"),
+        ("linear_attention", "linear_out_proj"),
+    ),
+)
+def test_qwen3_5_tpsp_routes_attention_and_mlp_projections(
+    layer_type: str, attention_group: str
+):
+    class Backend:
+        def __init__(self):
+            self.calls = []
+
+        def fused_gemm_rs_norm_ag(
+            self,
+            projection_context,
+            hidden_states,
+            projection,
+            residual,
+            norm,
+            *,
+            layer_scale=None,
+            config=None,
+            norm_type="rms_norm",
+            norm_weight_offset=False,
+        ):
+            self.calls.append(
+                (projection_context, projection, layer_scale, norm_weight_offset)
+            )
+            return hidden_states, residual
+
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.o_proj = nn.Identity()
+
+        def forward(self, *, hidden_states, positions, tpsp_active=False):
+            assert tpsp_active
+            return hidden_states
+
+    class LinearAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.out_proj = nn.Identity()
+
+        def forward(self, *, hidden_states, tpsp_active=False):
+            assert tpsp_active
+            return hidden_states
+
+    class MLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = nn.Identity()
+            self.down_proj = nn.Identity()
+            self.act_fn = lambda x: x
+
+    layer = object.__new__(Qwen3_5DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.layer_type = layer_type
+    layer.layer_scale = True
+    layer.input_layernorm = nn.Identity()
+    layer.post_attention_layernorm = nn.Identity()
+    layer.mlp = MLP()
+    layer.attn_layer_scale = nn.Parameter(torch.zeros(1, 1, 4))
+    layer.ffn_layer_scale = nn.Parameter(torch.zeros(1, 1, 4))
+    if layer_type == "full_attention":
+        layer.self_attn = Attention()
+    else:
+        layer.linear_attn = LinearAttention()
+
+    backend = Backend()
+    layer.tpsp_context = SimpleNamespace(
+        backend=backend,
+        handles={
+            "full_attn_o_proj": "full",
+            "linear_out_proj": "linear",
+            "down_proj": "down",
+        },
+    )
+    hidden_states = torch.ones(2, 4)
+    residual = torch.zeros_like(hidden_states)
+    layer(
+        hidden_states,
+        residual,
+        torch.arange(2),
+        next_norm=nn.Identity(),
+    )
+
+    assert [call[0] for call in backend.calls] == [
+        "full" if layer_type == "full_attention" else "linear",
+        "down",
+    ]
+    assert backend.calls[0][2] is layer.attn_layer_scale
+    assert backend.calls[1][2] is layer.ffn_layer_scale
+    assert backend.calls[0][3]
+    assert backend.calls[1][3]
 
 
 def _check_tpsp_backend(
@@ -350,6 +485,70 @@ def _check_tpsp_backend(
                 )
                 torch.testing.assert_close(
                     gathered, expected_normalized, rtol=0.02, atol=0.05
+                )
+                layer_scale = torch.linspace(
+                    -0.25,
+                    0.25,
+                    4096,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                scaled_projection = expected_with_bias * (
+                    layer_scale.to(torch.bfloat16) + 1
+                )
+                expected_scaled_residual = residual.clone()
+                expected_scaled_residual += scaled_projection
+                expected_scaled_normalized = torch.nn.functional.layer_norm(
+                    expected_scaled_residual, (4096,), weight, norm_bias, 1e-5
+                )
+                gathered, reduced = backend.fused_gemm_rs_norm_ag(
+                    context,
+                    a,
+                    projection,
+                    local_residual,
+                    norm,
+                    config=64,
+                    norm_type="layer_norm",
+                    layer_scale=layer_scale,
+                )
+                torch.testing.assert_close(
+                    reduced[:count],
+                    expected_scaled_residual[start : start + count],
+                    rtol=0.02,
+                    atol=0.05,
+                )
+                torch.testing.assert_close(
+                    gathered,
+                    expected_scaled_normalized,
+                    rtol=0.02,
+                    atol=0.05,
+                )
+                gemma_norm = nn.Module()
+                gemma_norm.weight = weight
+                gemma_norm.variance_epsilon = 1e-5
+                expected_gemma_normalized = torch.nn.functional.rms_norm(
+                    expected_residual_with_bias,
+                    (4096,),
+                    weight.float() + 1,
+                    1e-5,
+                )
+                gathered, reduced = backend.fused_gemm_rs_norm_ag(
+                    context,
+                    a,
+                    projection,
+                    local_residual,
+                    gemma_norm,
+                    config=64,
+                    norm_weight_offset=True,
+                )
+                torch.testing.assert_close(
+                    reduced[:count],
+                    expected_residual_with_bias[start : start + count],
+                    rtol=0.02,
+                    atol=0.05,
+                )
+                torch.testing.assert_close(
+                    gathered, expected_gemma_normalized, rtol=0.02, atol=0.05
                 )
 
         class Projection(nn.Module):
@@ -729,7 +928,7 @@ def test_tpsp_threshold_scan_coarsely_finds_and_finely_refines_boundary(
             hidden_states, residual, residual, residual.clone()
         )
 
-    def run_fused(backend, handle, projection, norm, inputs):
+    def run_fused(backend, handle, projection, norm, inputs, *, layer_scale=None):
         tokens = inputs.hidden_states.size(0)
         fused_calls[tokens] = fused_calls.get(tokens, 0) + 1
         clock[0] += 0.002 if tokens < 300 else 0.0005

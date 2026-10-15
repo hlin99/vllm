@@ -1041,13 +1041,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        tpsp_active: bool = False,
     ) -> torch.Tensor:
+        if tpsp_active:
+            return self.forward_cuda(hidden_states, tpsp_active=True)
         return self._forward_method(hidden_states)
 
     def _output_projection(
         self,
         core_attn_out: torch.Tensor,
         z: torch.Tensor,
+        tpsp_active: bool = False,
     ) -> torch.Tensor:
         """Part 3: RMSNormGated + output linear projection.
 
@@ -1055,6 +1059,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         by the compilation pass when fuse_norm_quant is enabled.
         """
         core_attn_out = self.norm(core_attn_out, z)
+        if tpsp_active:
+            return core_attn_out.flatten(-2)
         output, _ = self.out_proj(core_attn_out.flatten(-2))
         return output
 
@@ -1097,6 +1103,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
+        tpsp_active: bool = False,
     ) -> torch.Tensor:
         """Forward pass with three parts:
         1. Input projection
@@ -1114,6 +1121,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.enable_fused_gdn_spec_decode
             and hidden_states.dtype == torch.bfloat16
             and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
+            and not tpsp_active
         )
         if use_fused_gdn_spec_decode:
             core_attn_out = torch.zeros(
@@ -1169,7 +1177,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        return self._output_projection(core_attn_out, z)
+        return self._output_projection(core_attn_out, z, tpsp_active=tpsp_active)
 
     def forward_xpu(
         self,

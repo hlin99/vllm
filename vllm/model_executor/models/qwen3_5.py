@@ -25,6 +25,7 @@
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
 from collections.abc import Iterable
+from itertools import islice
 from typing import ClassVar
 
 import torch
@@ -61,8 +62,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.tpsp import TPSPContext, TPSPOpsGroup, tpsp_shard_residual
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 
@@ -209,6 +212,66 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 ),
             )
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        positions: torch.Tensor,
+        *,
+        next_norm: nn.Module | None = None,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if next_norm is None:
+            return super().forward(hidden_states, residual, positions, **kwargs)
+
+        residual_is_full = residual is None
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
+        if residual_is_full:
+            residual = tpsp_shard_residual(residual)
+
+        if self.layer_type == "linear_attention":
+            projection_input = self.linear_attn(
+                hidden_states=hidden_states, tpsp_active=True
+            )
+            projection = self.linear_attn.out_proj
+            attention_group = "linear_out_proj"
+        elif self.layer_type == "full_attention":
+            projection_input = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                tpsp_active=True,
+            )
+            projection = self.self_attn.o_proj
+            attention_group = "full_attn_o_proj"
+        else:
+            raise ValueError(f"Invalid layer_type {self.layer_type}")
+
+        backend = self.tpsp_context.backend
+        hidden_states, residual = backend.fused_gemm_rs_norm_ag(
+            self.tpsp_context.handles[attention_group],
+            projection_input,
+            projection,
+            residual,
+            self.post_attention_layernorm,
+            layer_scale=self.attn_layer_scale if self.layer_scale else None,
+            norm_weight_offset=True,
+        )
+
+        gate_up, _ = self.mlp.gate_up_proj(hidden_states)
+        hidden_states = self.mlp.act_fn(gate_up)
+        return backend.fused_gemm_rs_norm_ag(
+            self.tpsp_context.handles["down_proj"],
+            hidden_states,
+            self.mlp.down_proj,
+            residual,
+            next_norm,
+            layer_scale=self.ffn_layer_scale if self.layer_scale else None,
+            norm_weight_offset=True,
+        )
+
 
 @support_torch_compile(
     dynamic_arg_dims={
@@ -278,6 +341,184 @@ class Qwen3_5Model(Qwen3NextModel):
             self.norm = PPMissingLayer()
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        self.tpsp_requested = False
+        self.tpsp_context: TPSPContext | None = None
+        self.max_tpsp_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+
+    def _maybe_profile_tpsp(self) -> None:
+        if not self.tpsp_requested or self.tpsp_context is not None:
+            return
+
+        backend_cls = current_platform.get_tpsp_backend_cls()
+        if backend_cls is None:
+            logger.warning("TPSP using regular forward: no fused backend")
+            self.tpsp_requested = False
+            return
+
+        local_layers = tuple(islice(self.layers, self.start_layer, self.end_layer))
+        full_attention_layer = next(
+            (
+                layer
+                for layer in local_layers
+                if isinstance(layer, Qwen3_5DecoderLayer)
+                and layer.layer_type == "full_attention"
+            ),
+            None,
+        )
+        linear_attention_layer = next(
+            (
+                layer
+                for layer in local_layers
+                if isinstance(layer, Qwen3_5DecoderLayer)
+                and layer.layer_type == "linear_attention"
+            ),
+            None,
+        )
+        dense_layer_index = next(
+            (
+                index
+                for index, layer in enumerate(
+                    islice(self.layers, self.start_layer, self.end_layer),
+                    start=self.start_layer,
+                )
+                if isinstance(layer, Qwen3_5DecoderLayer)
+                and hasattr(layer.mlp, "down_proj")
+            ),
+            None,
+        )
+        if dense_layer_index is None:
+            logger.warning("TPSP using regular forward: no dense MLP layer found")
+            self.tpsp_requested = False
+            return
+
+        down_layer = self.layers[dense_layer_index]
+        next_norm = (
+            self.layers[dense_layer_index + 1].input_layernorm
+            if dense_layer_index + 1 < self.end_layer
+            else self.norm
+        )
+        if not hasattr(next_norm, "weight"):
+            logger.warning(
+                "TPSP using regular forward: pipeline-parallel boundary has no "
+                "local next-layer norm"
+            )
+            self.tpsp_requested = False
+            return
+
+        ops_groups = []
+        if full_attention_layer is not None:
+            ops_groups.append(
+                TPSPOpsGroup(
+                    "full_attn_o_proj",
+                    full_attention_layer.self_attn.o_proj,
+                    full_attention_layer.post_attention_layernorm,
+                    full_attention_layer.attn_layer_scale
+                    if full_attention_layer.layer_scale
+                    else None,
+                    norm_weight_offset=True,
+                )
+            )
+        if linear_attention_layer is not None:
+            ops_groups.append(
+                TPSPOpsGroup(
+                    "linear_out_proj",
+                    linear_attention_layer.linear_attn.out_proj,
+                    linear_attention_layer.post_attention_layernorm,
+                    linear_attention_layer.attn_layer_scale
+                    if linear_attention_layer.layer_scale
+                    else None,
+                    norm_weight_offset=True,
+                )
+            )
+        ops_groups.append(
+            TPSPOpsGroup(
+                "down_proj",
+                down_layer.mlp.down_proj,
+                next_norm,
+                down_layer.ffn_layer_scale if down_layer.layer_scale else None,
+                norm_weight_offset=True,
+            )
+        )
+
+        from vllm.distributed.parallel_state import get_tp_group
+
+        group = get_tp_group()
+        first_projection = ops_groups[0].projection
+        backend = backend_cls(
+            group.device_group.group_name, first_projection.weight.device
+        )
+        context = backend.profile(ops_groups, self.max_tpsp_batched_tokens)
+        if context is None:
+            self.tpsp_requested = False
+        else:
+            for layer in local_layers:
+                if isinstance(layer, Qwen3_5DecoderLayer):
+                    layer.tpsp_context = context
+        self.tpsp_context = context
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        self._maybe_profile_tpsp()
+        if self.tpsp_context is None:
+            return super().forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds
+            )
+
+        if self.use_sequence_parallel:
+            raise ValueError("Qwen3.5 TPSP does not support sequence parallel")
+
+        if get_pp_group().is_first_rank:
+            hidden_states = (
+                inputs_embeds
+                if inputs_embeds is not None
+                else self.embed_input_ids(input_ids)
+            )
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+
+        tpsp_active = self.tpsp_context.profile.is_active(hidden_states.size(0))
+        if not tpsp_active:
+            return super().forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds
+            )
+
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        for index, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            next_norm = (
+                self.layers[index + 1].input_layernorm
+                if index + 1 < self.end_layer
+                else self.norm
+            )
+            hidden_states, residual = layer(
+                hidden_states,
+                residual,
+                positions,
+                next_norm=next_norm,
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states, index + 1, hidden_states, residual
+            )
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # FSE must match construction (Qwen3NextSparseMoeBlock): reroute the
@@ -359,6 +600,18 @@ class Qwen3_5ForCausalLMBase(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        if vllm_config.model_config.enable_tpsp:
+            if not type(self).__dict__.get("tpsp_capable", False):
+                raise ValueError(f"TPSP is not supported by {type(self).__name__}")
+            if (
+                vllm_config.quant_config is not None
+                or vllm_config.lora_config is not None
+            ):
+                raise ValueError("TPSP does not support quantization or LoRA")
+            if vllm_config.parallel_config.pipeline_parallel_size != 1:
+                raise ValueError("Qwen3.5 TPSP requires pipeline parallel size 1")
+            self.model.tpsp_requested = True
+            self.model.do_not_compile = True
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -449,7 +702,7 @@ class Qwen3_5ForCausalLMBase(
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
-    pass
+    tpsp_capable = True
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):

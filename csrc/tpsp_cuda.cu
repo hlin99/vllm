@@ -113,13 +113,26 @@ __global__ void unpack_tpsp_chunk_vector(const TpspBf16Vec* packed,
 }
 
 // Fused reduction, residual, and normalization kernels
+__device__ __forceinline__ bf16
+tpsp_apply_layer_scale(bf16 value, int col, const bf16* layer_scale,
+                       const float* layer_scale_float) {
+  if (layer_scale == nullptr && layer_scale_float == nullptr) {
+    return value;
+  }
+  bf16 offset = layer_scale != nullptr
+                    ? layer_scale[col]
+                    : __float2bfloat16_rn(layer_scale_float[col]);
+  bf16 factor = __float2bfloat16_rn(float(offset) + 1.0f);
+  return __float2bfloat16_rn(float(value) * float(factor));
+}
+
 template <bool LayerNorm>
-__global__ void tpsp_add_norm(const bf16* reduced, const bf16* remote,
-                              int64_t remote_stride, int rank, int tp_size,
-                              const bf16* residual, const bf16* projection_bias,
-                              const bf16* weight, const bf16* norm_bias,
-                              bf16* new_residual, bf16* normalized,
-                              int hidden_size, float eps) {
+__global__ void tpsp_add_norm(
+    const bf16* reduced, const bf16* remote, int64_t remote_stride, int rank,
+    int tp_size, const bf16* residual, const bf16* projection_bias,
+    const bf16* layer_scale, const float* layer_scale_float, const bf16* weight,
+    const bf16* norm_bias, bf16* new_residual, bf16* normalized,
+    int hidden_size, float eps, bool norm_weight_offset) {
   int row = blockIdx.x;
   float sum = 0.0f;
   for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
@@ -137,6 +150,8 @@ __global__ void tpsp_add_norm(const bf16* reduced, const bf16* remote,
     if (projection_bias) {
       projected = bf16(float(projected) + float(projection_bias[col]));
     }
+    projected =
+        tpsp_apply_layer_scale(projected, col, layer_scale, layer_scale_float);
     bf16 value = bf16(float(projected) + float(residual[index]));
     new_residual[index] = value;
     float x = float(value);
@@ -170,7 +185,7 @@ __global__ void tpsp_add_norm(const bf16* reduced, const bf16* remote,
       value -= mean;
     }
     value *= inverse_std;
-    value *= float(weight[col]);
+    value *= float(weight[col]) + (norm_weight_offset ? 1.0f : 0.0f);
     if constexpr (LayerNorm) {
       if (norm_bias) {
         value += float(norm_bias[col]);
@@ -181,13 +196,12 @@ __global__ void tpsp_add_norm(const bf16* reduced, const bf16* remote,
 }
 
 template <bool LayerNorm>
-__global__ void tpsp_add_norm_vector(const bf16* reduced, const bf16* remote,
-                                     int64_t remote_stride, int rank,
-                                     int tp_size, const bf16* residual,
-                                     const bf16* projection_bias,
-                                     const bf16* weight, const bf16* norm_bias,
-                                     bf16* new_residual, bf16* normalized,
-                                     int hidden_size, float eps) {
+__global__ void tpsp_add_norm_vector(
+    const bf16* reduced, const bf16* remote, int64_t remote_stride, int rank,
+    int tp_size, const bf16* residual, const bf16* projection_bias,
+    const bf16* layer_scale, const float* layer_scale_float, const bf16* weight,
+    const bf16* norm_bias, bf16* new_residual, bf16* normalized,
+    int hidden_size, float eps, bool norm_weight_offset) {
   using Vec = TpspBf16Vec;
   const int row = blockIdx.x;
   const int vec_hidden = hidden_size / 8;
@@ -232,6 +246,11 @@ __global__ void tpsp_add_norm_vector(const bf16* reduced, const bf16* remote,
       if (projection_bias) {
         pair += __nv_bfloat162{bias.data[j], bias.data[j + 1]};
       }
+      pair = __floats2bfloat162_rn(
+          float(tpsp_apply_layer_scale(pair.x, idx * 8 + j, layer_scale,
+                                       layer_scale_float)),
+          float(tpsp_apply_layer_scale(pair.y, idx * 8 + j + 1, layer_scale,
+                                       layer_scale_float)));
       pair += __nv_bfloat162{other.data[j], other.data[j + 1]};
       value.data[j] = pair.x;
       value.data[j + 1] = pair.y;
@@ -292,7 +311,8 @@ __global__ void tpsp_add_norm_vector(const bf16* reduced, const bf16* remote,
       if constexpr (LayerNorm) {
         x -= mean;
       }
-      float w = __bfloat162float(weights.data[j]);
+      float w = __bfloat162float(weights.data[j]) +
+                (norm_weight_offset ? 1.0f : 0.0f);
       float y = x * inverse_std * w;
       if constexpr (LayerNorm) {
         if (norm_bias) {
@@ -668,7 +688,9 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
     const std::optional<torch::stable::Tensor>& projection_bias,
     const std::optional<torch::stable::Tensor>& norm_bias, double eps,
     int64_t norm_kind, int64_t microchunk_rows, int64_t comm_address,
-    int64_t tp_size, int64_t p2p_handle, int64_t sm_count_target) {
+    int64_t tp_size, int64_t p2p_handle, int64_t sm_count_target,
+    const std::optional<torch::stable::Tensor>& layer_scale,
+    bool norm_weight_offset) {
   using torch::headeronly::ScalarType;
   STD_TORCH_CHECK(
       a.is_cuda() && b.is_cuda() && weight.is_cuda() && residual.is_cuda(),
@@ -700,6 +722,16 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
               bias->value().size(0) == b.size(1),
           "TPSP bias must be a contiguous CUDA BF16 hidden-size vector");
     }
+  }
+  if (layer_scale) {
+    const auto& scale = layer_scale.value();
+    STD_TORCH_CHECK(scale.is_cuda() && scale.device() == a.device() &&
+                        (scale.scalar_type() == ScalarType::BFloat16 ||
+                         scale.scalar_type() == ScalarType::Float) &&
+                        scale.is_contiguous() && scale.dim() == 1 &&
+                        scale.size(0) == b.size(1),
+                    "TPSP layer scale must be a contiguous CUDA BF16 or FP32 "
+                    "hidden-size vector");
   }
   STD_TORCH_CHECK(a.size(1) == b.size(0) && b.size(1) == weight.size(0) &&
                       tp_size >= 2 && microchunk_rows > 0 &&
@@ -806,6 +838,14 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
   auto* norm_bias_ptr =
       norm_bias ? reinterpret_cast<const bf16*>(norm_bias->const_data_ptr())
                 : nullptr;
+  auto* layer_scale_ptr =
+      layer_scale && layer_scale->scalar_type() == ScalarType::BFloat16
+          ? reinterpret_cast<const bf16*>(layer_scale->const_data_ptr())
+          : nullptr;
+  auto* layer_scale_float_ptr =
+      layer_scale && layer_scale->scalar_type() == ScalarType::Float
+          ? reinterpret_cast<const float*>(layer_scale->const_data_ptr())
+          : nullptr;
   constexpr int threads = 256;
   const float alpha = 1.0f;
   const float beta = 0.0f;
@@ -933,29 +973,33 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
         if (norm_kind == 0) {
           tpsp_add_norm_vector<false><<<norm_rows, threads, 0, comm_stream>>>(
               reduced_ptr, remote_ptr, remote_stride, rank, tp_size,
-              residual_chunk, projection_bias_ptr, weight_ptr, norm_bias_ptr,
+              residual_chunk, projection_bias_ptr, layer_scale_ptr,
+              layer_scale_float_ptr, weight_ptr, norm_bias_ptr,
               new_residual_chunk, normalized_chunk, hidden,
-              static_cast<float>(eps));
+              static_cast<float>(eps), norm_weight_offset);
         } else {
           tpsp_add_norm_vector<true><<<norm_rows, threads, 0, comm_stream>>>(
               reduced_ptr, remote_ptr, remote_stride, rank, tp_size,
-              residual_chunk, projection_bias_ptr, weight_ptr, norm_bias_ptr,
+              residual_chunk, projection_bias_ptr, layer_scale_ptr,
+              layer_scale_float_ptr, weight_ptr, norm_bias_ptr,
               new_residual_chunk, normalized_chunk, hidden,
-              static_cast<float>(eps));
+              static_cast<float>(eps), norm_weight_offset);
         }
       } else {
         if (norm_kind == 0) {
           tpsp_add_norm<false><<<norm_rows, threads, 0, comm_stream>>>(
               reduced_ptr, remote_ptr, remote_stride, rank, tp_size,
-              residual_chunk, projection_bias_ptr, weight_ptr, norm_bias_ptr,
+              residual_chunk, projection_bias_ptr, layer_scale_ptr,
+              layer_scale_float_ptr, weight_ptr, norm_bias_ptr,
               new_residual_chunk, normalized_chunk, hidden,
-              static_cast<float>(eps));
+              static_cast<float>(eps), norm_weight_offset);
         } else {
           tpsp_add_norm<true><<<norm_rows, threads, 0, comm_stream>>>(
               reduced_ptr, remote_ptr, remote_stride, rank, tp_size,
-              residual_chunk, projection_bias_ptr, weight_ptr, norm_bias_ptr,
+              residual_chunk, projection_bias_ptr, layer_scale_ptr,
+              layer_scale_float_ptr, weight_ptr, norm_bias_ptr,
               new_residual_chunk, normalized_chunk, hidden,
-              static_cast<float>(eps));
+              static_cast<float>(eps), norm_weight_offset);
         }
       }
       STD_CUDA_CHECK(cudaGetLastError());

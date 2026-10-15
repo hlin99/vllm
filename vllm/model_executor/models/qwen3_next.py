@@ -459,12 +459,15 @@ class Qwen3NextAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        tpsp_active: bool = False,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         attn_output = self.attn(q, k, v)
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)
+        if tpsp_active:
+            return attn_output
         output, _ = self.o_proj(attn_output)
         return output
 
