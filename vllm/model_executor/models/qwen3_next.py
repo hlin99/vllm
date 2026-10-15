@@ -721,16 +721,33 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             hidden_states = sequence_parallel_chunk(hidden_states)
             assert residual is None
 
+        tpsp_context = getattr(self, "tpsp_context", None)
+        tpsp_active = tpsp_context is not None and tpsp_context.profile.is_active(
+            hidden_states.size(0)
+        )
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            hidden_states, residual = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-            )
+            if tpsp_active:
+                next_norm = (
+                    self.layers[layer_idx + 1].input_layernorm
+                    if layer_idx + 1 < self.end_layer
+                    else self.norm
+                )
+                hidden_states, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    next_norm=next_norm,
+                )
+            else:
+                hidden_states, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
             self._maybe_add_hidden_state(
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
@@ -739,7 +756,8 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not tpsp_active:
+            hidden_states, _ = self.norm(hidden_states, residual)
         if self.use_sequence_parallel:
             if aux_hidden_states:
                 hidden_size = hidden_states.shape[-1]

@@ -16,6 +16,7 @@ from torch import nn
 from vllm.model_executor import tpsp as tpsp_utils
 from vllm.model_executor.models import llama
 from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
+from vllm.model_executor.models.qwen3_next import Qwen3NextModel
 from vllm.model_executor.tpsp import (
     TPSPBackend,
     TPSPContext,
@@ -206,6 +207,75 @@ def test_qwen3_5_tpsp_routes_attention_and_mlp_projections(
     assert backend.calls[1][2] is layer.ffn_layer_scale
     assert backend.calls[0][3]
     assert backend.calls[1][3]
+
+
+@pytest.mark.parametrize("tpsp_active", [False, True])
+def test_qwen3_next_model_passes_next_norm_only_when_tpsp_active(
+    monkeypatch, tpsp_active: bool
+):
+    import vllm.model_executor.models.qwen3_next as qwen3_next
+
+    monkeypatch.setattr(
+        qwen3_next,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.use_attn_reduce_scatter_for_moe = False
+            self.input_layernorm = nn.Identity()
+            self.next_norms = []
+
+        def forward(self, *, hidden_states, residual, positions, next_norm=None):
+            self.next_norms.append(next_norm)
+            return hidden_states, residual
+
+    class Norm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, hidden_states, residual):
+            self.calls += 1
+            return hidden_states, residual
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([Layer(), Layer()])
+            self.start_layer = 0
+            self.end_layer = len(self.layers)
+            self.norm = Norm()
+            self.tpsp_context = SimpleNamespace(
+                profile=SimpleNamespace(is_active=lambda tokens: tpsp_active)
+            )
+
+        @property
+        def use_sequence_parallel(self):
+            return False
+
+        def _maybe_add_hidden_state(self, aux, *_args):
+            return aux
+
+    model = Model()
+    hidden_states = torch.ones(4, 2)
+    Qwen3NextModel.forward(
+        model,
+        input_ids=None,
+        positions=torch.arange(4),
+        inputs_embeds=hidden_states,
+    )
+
+    if tpsp_active:
+        assert model.layers[0].next_norms == [model.layers[1].input_layernorm]
+        assert model.layers[1].next_norms == [model.norm]
+        assert model.norm.calls == 0
+    else:
+        assert model.layers[0].next_norms == [None]
+        assert model.layers[1].next_norms == [None]
+        assert model.norm.calls == 1
 
 
 def _check_tpsp_backend(

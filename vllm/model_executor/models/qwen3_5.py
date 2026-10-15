@@ -466,59 +466,11 @@ class Qwen3_5Model(Qwen3NextModel):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         self._maybe_profile_tpsp()
-        if self.tpsp_context is None:
-            return super().forward(
-                input_ids, positions, intermediate_tensors, inputs_embeds
-            )
-
-        if self.use_sequence_parallel:
+        if self.tpsp_context is not None and self.use_sequence_parallel:
             raise ValueError("Qwen3.5 TPSP does not support sequence parallel")
-
-        if get_pp_group().is_first_rank:
-            hidden_states = (
-                inputs_embeds
-                if inputs_embeds is not None
-                else self.embed_input_ids(input_ids)
-            )
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-
-        tpsp_active = self.tpsp_context.profile.is_active(hidden_states.size(0))
-        if not tpsp_active:
-            return super().forward(
-                input_ids, positions, intermediate_tensors, inputs_embeds
-            )
-
-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for index, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
-            next_norm = (
-                self.layers[index + 1].input_layernorm
-                if index + 1 < self.end_layer
-                else self.norm
-            )
-            hidden_states, residual = layer(
-                hidden_states,
-                residual,
-                positions,
-                next_norm=next_norm,
-            )
-            self._maybe_add_hidden_state(
-                aux_hidden_states, index + 1, hidden_states, residual
-            )
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
-        if aux_hidden_states:
-            return hidden_states, aux_hidden_states
-        return hidden_states
+        return super().forward(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # FSE must match construction (Qwen3NextSparseMoeBlock): reroute the
