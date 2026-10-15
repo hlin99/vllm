@@ -212,6 +212,69 @@ def test_mla(vllm_runner: type[VllmRunner], example_prompts: list[str]) -> None:
     )
 
 
+def test_transformers_llama_tpsp_layer_path(monkeypatch) -> None:
+    """The HF layer adapter fuses both projections and preserves Llama outputs."""
+    import copy
+    from types import SimpleNamespace
+
+    import torch.nn.functional as F
+    from transformers import LlamaConfig
+
+    from vllm.model_executor.models.transformers.tpsp import (
+        TransformersLlamaTPSP,
+    )
+    from vllm.model_executor.tpsp import TPSPProfile
+
+    class Backend:
+        def fused_gemm_rs_norm_ag(
+            self, handle, x, projection, residual, norm, **kwargs
+        ):
+            projected = F.linear(x, projection.weight, projection.bias)
+            residual = projected + residual
+            norm_forward = getattr(norm, "_tpsp_original_forward", norm.forward)
+            return norm_forward(residual), residual
+
+    config = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=32,
+    )
+    config._attn_implementation = "eager"
+    model = AutoModel.from_config(config).eval()
+    reference = copy.deepcopy(model).eval()
+
+    adapter = TransformersLlamaTPSP(
+        model,
+        SimpleNamespace(
+            quant_config=None,
+            lora_config=None,
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        ),
+    )
+    adapter.profile_attempted = True
+    adapter.context = SimpleNamespace(
+        profile=TPSPProfile(True, 1, 16),
+        backend=Backend(),
+        handles={"o_proj": object(), "down_proj": object()},
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.transformers.tpsp.tpsp_shard_residual",
+        lambda residual: residual,
+    )
+
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    with torch.inference_mode():
+        expected = reference(input_ids, use_cache=False).last_hidden_state
+        with adapter.forward_context(input_ids.shape[1]):
+            actual = model(input_ids, use_cache=False).last_hidden_state
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+
+
 @multi_gpu_test(num_gpus=2)
 def test_distributed(
     hf_runner: type[HfRunner],

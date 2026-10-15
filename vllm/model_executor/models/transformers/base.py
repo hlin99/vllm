@@ -18,7 +18,7 @@
 
 import os
 from collections.abc import Callable, Iterable
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from functools import cached_property
 from itertools import chain
 from operator import attrgetter
@@ -189,6 +189,14 @@ class Base(
         self.recursive_replace()
         # Create attention instances for KV cache allocation
         self._create_attention_instances(prefix)
+
+        self.tpsp_adapter = None
+        if self.model_config.enable_tpsp:
+            from vllm.model_executor.models.transformers.tpsp import (
+                TransformersLlamaTPSP,
+            )
+
+            self.tpsp_adapter = TransformersLlamaTPSP(self.model, vllm_config)
 
         # Initialize any parameters that have not had their modules replaced
         self.init_parameters(self.model)
@@ -789,15 +797,24 @@ class Base(
         if input_ids is not None and inputs_embeds is not None:
             input_ids = None
 
-        outputs = self.model(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            use_cache=False,
-            position_ids=positions,
-            return_dict=False,
-            **self._output_aux_hidden_states_kwargs,
-            **kwargs,
-        )
+        with ExitStack() as stack:
+            if self.tpsp_adapter is not None:
+                if inputs_embeds is not None:
+                    num_tokens = inputs_embeds.shape[-2]
+                elif input_ids is not None:
+                    num_tokens = input_ids.numel()
+                else:
+                    num_tokens = positions.numel()
+                stack.enter_context(self.tpsp_adapter.forward_context(num_tokens))
+            outputs = self.model(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                use_cache=False,
+                position_ids=positions,
+                return_dict=False,
+                **self._output_aux_hidden_states_kwargs,
+                **kwargs,
+            )
 
         # Remove batch dimension after exiting Transformers model
         hidden_states = outputs[0][0, ...]
