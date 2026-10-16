@@ -37,7 +37,7 @@ _FORWARD_STATE: ContextVar[_ForwardState | None] = ContextVar(
     "transformers_decoder_tpsp_state", default=None
 )
 
-_SUPPORTED_MODEL_TYPES = frozenset({"llama"})
+_SUPPORTED_MODEL_TYPES = frozenset({"llama", "qwen3"})
 
 
 def _projection_forward(projection: nn.Module, x: torch.Tensor) -> torch.Tensor:

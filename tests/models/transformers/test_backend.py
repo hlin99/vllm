@@ -212,18 +212,21 @@ def test_mla(vllm_runner: type[VllmRunner], example_prompts: list[str]) -> None:
     )
 
 
-def test_transformers_decoder_tpsp_layer_path(monkeypatch) -> None:
+@pytest.mark.parametrize("model_type", ["llama", "qwen3"])
+def test_transformers_decoder_tpsp_layer_path(monkeypatch, model_type: str) -> None:
     """The HF layer adapter fuses both projections and preserves decoder outputs."""
     import copy
     from types import SimpleNamespace
 
     import torch.nn.functional as F
-    from transformers import LlamaConfig
+    from transformers import LlamaConfig, Qwen3Config
 
     from vllm.model_executor.models.transformers.tpsp import (
         TransformersDecoderTPSP,
     )
     from vllm.model_executor.tpsp import TPSPProfile
+
+    config_cls = {"llama": LlamaConfig, "qwen3": Qwen3Config}[model_type]
 
     class Backend:
         def fused_gemm_rs_norm_ag(
@@ -234,13 +237,14 @@ def test_transformers_decoder_tpsp_layer_path(monkeypatch) -> None:
             norm_forward = getattr(norm, "_tpsp_original_forward", norm.forward)
             return norm_forward(residual), residual
 
-    config = LlamaConfig(
+    config = config_cls(
         vocab_size=64,
         hidden_size=32,
         intermediate_size=64,
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=4,
+        head_dim=8 if model_type == "qwen3" else None,
         max_position_embeddings=32,
     )
     config._attn_implementation = "eager"
