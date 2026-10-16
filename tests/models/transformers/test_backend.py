@@ -212,8 +212,8 @@ def test_mla(vllm_runner: type[VllmRunner], example_prompts: list[str]) -> None:
     )
 
 
-def test_transformers_llama_tpsp_layer_path(monkeypatch) -> None:
-    """The HF layer adapter fuses both projections and preserves Llama outputs."""
+def test_transformers_decoder_tpsp_layer_path(monkeypatch) -> None:
+    """The HF layer adapter fuses both projections and preserves decoder outputs."""
     import copy
     from types import SimpleNamespace
 
@@ -221,7 +221,7 @@ def test_transformers_llama_tpsp_layer_path(monkeypatch) -> None:
     from transformers import LlamaConfig
 
     from vllm.model_executor.models.transformers.tpsp import (
-        TransformersLlamaTPSP,
+        TransformersDecoderTPSP,
     )
     from vllm.model_executor.tpsp import TPSPProfile
 
@@ -247,7 +247,7 @@ def test_transformers_llama_tpsp_layer_path(monkeypatch) -> None:
     model = AutoModel.from_config(config).eval()
     reference = copy.deepcopy(model).eval()
 
-    adapter = TransformersLlamaTPSP(
+    adapter = TransformersDecoderTPSP(
         model,
         SimpleNamespace(
             quant_config=None,

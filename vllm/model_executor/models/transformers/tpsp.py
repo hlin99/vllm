@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TPSP adapter for Hugging Face Llama decoder layers."""
+"""TPSP adapter for supported Hugging Face decoder architectures."""
 
 import inspect
 from contextlib import contextmanager
@@ -34,8 +34,10 @@ class _ForwardState:
 
 
 _FORWARD_STATE: ContextVar[_ForwardState | None] = ContextVar(
-    "transformers_llama_tpsp_state", default=None
+    "transformers_decoder_tpsp_state", default=None
 )
+
+_SUPPORTED_MODEL_TYPES = frozenset({"llama"})
 
 
 def _projection_forward(projection: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -88,16 +90,14 @@ def _bind_layer_forward(layer: nn.Module, next_norm: nn.Module) -> None:
         arguments = bound.arguments
         hidden_states = arguments["hidden_states"]
         if arguments.get("output_attentions", False):
-            raise ValueError(
-                "Transformers Llama TPSP does not support output_attentions"
-            )
+            raise ValueError("Transformers TPSP does not support output_attentions")
         if arguments.get("use_cache", False):
-            raise ValueError("Transformers Llama TPSP does not support use_cache")
+            raise ValueError("Transformers TPSP does not support use_cache")
         if any(
             arguments.get(name) is not None
             for name in ("past_key_value", "past_key_values")
         ):
-            raise ValueError("Transformers Llama TPSP does not support HF KV caches")
+            raise ValueError("Transformers TPSP does not support HF KV caches")
 
         hidden_size = hidden_states.shape[-1]
         if state.residual is None:
@@ -172,13 +172,14 @@ def _bind_layer_forward(layer: nn.Module, next_norm: nn.Module) -> None:
     layer.forward = MethodType(forward, layer)
 
 
-class TransformersLlamaTPSP:
-    """Install the Llama TPSP path into a Transformers decoder model."""
+class TransformersDecoderTPSP:
+    """Install the TPSP path into a supported Transformers decoder model."""
 
     def __init__(self, model: nn.Module, vllm_config: "VllmConfig") -> None:
-        if getattr(model.config, "model_type", None) != "llama":
+        model_type = getattr(model.config, "model_type", None)
+        if model_type not in _SUPPORTED_MODEL_TYPES:
             raise ValueError(
-                "Transformers TPSP currently supports only Llama architectures"
+                f"Transformers TPSP does not support model type {model_type!r}"
             )
         if vllm_config.quant_config is not None or vllm_config.lora_config is not None:
             raise ValueError("TPSP does not support quantization or LoRA")
@@ -186,7 +187,7 @@ class TransformersLlamaTPSP:
         layers = getattr(model, "layers", None)
         final_norm = getattr(model, "norm", None)
         if not isinstance(layers, nn.ModuleList) or not layers or final_norm is None:
-            raise ValueError("Transformers Llama model has an unsupported layer layout")
+            raise ValueError("Transformers model has an unsupported layer layout")
 
         self.model = model
         self.model.do_not_compile = True
@@ -197,9 +198,7 @@ class TransformersLlamaTPSP:
         for layer in layers:
             for projection in (layer.self_attn.o_proj, layer.mlp.down_proj):
                 if not hasattr(projection, "weight"):
-                    raise ValueError(
-                        "Transformers Llama TPSP requires linear projections"
-                    )
+                    raise ValueError("Transformers TPSP requires linear projections")
                 projection._tpsp_original_forward = projection.forward
                 projection.forward = MethodType(_projection_forward, projection)
 
@@ -223,7 +222,7 @@ class TransformersLlamaTPSP:
 
         backend_cls = current_platform.get_tpsp_backend_cls()
         if backend_cls is None:
-            logger.warning("Transformers Llama TPSP using regular forward: no backend")
+            logger.warning("Transformers TPSP using regular forward: no backend")
             return
 
         first_layer = self.model.layers[0]

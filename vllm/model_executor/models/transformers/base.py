@@ -193,10 +193,10 @@ class Base(
         self.tpsp_adapter = None
         if self.model_config.enable_tpsp:
             from vllm.model_executor.models.transformers.tpsp import (
-                TransformersLlamaTPSP,
+                TransformersDecoderTPSP,
             )
 
-            self.tpsp_adapter = TransformersLlamaTPSP(self.model, vllm_config)
+            self.tpsp_adapter = TransformersDecoderTPSP(self.model, vllm_config)
 
         # Initialize any parameters that have not had their modules replaced
         self.init_parameters(self.model)
