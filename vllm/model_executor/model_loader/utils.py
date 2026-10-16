@@ -83,6 +83,11 @@ def initialize_model(
         model_config = vllm_config.model_config
     if model_class is None:
         model_class, _ = get_model_architecture(model_config)
+    if model_config.enable_tpsp and not model_config.using_transformers_backend():
+        raise ValueError(
+            "--enable-tpsp requires the Transformers modeling backend. "
+            "Set --model-impl transformers."
+        )
 
     from vllm.model_executor.models.expert_substitution import (
         as_expert_substitution_model,
