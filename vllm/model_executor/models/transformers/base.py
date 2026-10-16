@@ -851,6 +851,10 @@ class Base(
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
+    def process_weights_after_loading(self) -> None:
+        if self.tpsp_adapter is not None:
+            self.tpsp_adapter.profile()
+
     @staticmethod
     def check_version(min_version: str, feature: str):
         installed = Version(transformers.__version__)

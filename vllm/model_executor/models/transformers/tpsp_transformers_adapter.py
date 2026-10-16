@@ -355,7 +355,6 @@ class TransformersDenseTPSP:
         self.decoder = decoder
         self.layers = layer_ops
         self.final_norm = final_norm
-        self.model.do_not_compile = True
         self.max_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.context: TPSPContext | None = None
         self.profile_attempted = False
@@ -375,10 +374,12 @@ class TransformersDenseTPSP:
             )
             _bind_layer_forward(ops, next_norm)
 
-    def _maybe_profile(self) -> None:
+    @torch.inference_mode()
+    def profile(self) -> None:
         if self.profile_attempted:
             return
         self.profile_attempted = True
+        self.model.eval()
 
         from vllm.distributed.parallel_state import get_tp_group
         from vllm.platforms import current_platform
@@ -414,7 +415,6 @@ class TransformersDenseTPSP:
 
     @contextmanager
     def forward_context(self, num_tokens: int) -> "Iterator[None]":
-        self._maybe_profile()
         context = self.context
         active = context is not None and context.profile.is_active(num_tokens)
         state = _ForwardState(
