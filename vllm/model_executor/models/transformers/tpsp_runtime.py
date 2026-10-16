@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""BF16 Transformers TPSP backends, contexts, and profiling utilities."""
+"""Transformers TPSP backends, contexts, and profiling utilities."""
 
 from __future__ import annotations
 

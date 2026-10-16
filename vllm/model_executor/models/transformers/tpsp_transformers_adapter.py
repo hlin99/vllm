@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TPSP adapter for supported Hugging Face decoder architectures."""
+"""Dense TPSP adapter for supported Hugging Face decoder architectures."""
 
 import inspect
 from contextlib import contextmanager
@@ -13,7 +13,7 @@ import torch
 from torch import nn
 
 from vllm.logger import init_logger
-from vllm.model_executor.models.transformers.tsps_transformers_adapter import (
+from vllm.model_executor.models.transformers.tpsp_runtime import (
     TPSPContext,
     TPSPOpsGroup,
     get_tpsp_norm_type,

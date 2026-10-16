@@ -13,7 +13,7 @@ import torch.distributed as dist
 from torch.distributed import distributed_c10d as c10d
 
 from vllm.logger import init_logger
-from vllm.model_executor.models.transformers.tsps_transformers_adapter import (
+from vllm.model_executor.models.transformers.tpsp_runtime import (
     TPSPBackend,
     TPSPContext,
     TPSPOpsGroup,

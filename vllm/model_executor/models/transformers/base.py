@@ -205,11 +205,8 @@ class Base(
 
         self.tpsp_adapter = None
         if self.model_config.enable_tpsp:
-            from vllm.model_executor.models.transformers.tpsp_adapter import (
-                TransformersDenseTPSP,
-            )
-
-            from .tsps_transformers_adapter import UnsupportedTPSPNormError
+            from .tpsp_runtime import UnsupportedTPSPNormError
+            from .tpsp_transformers_adapter import TransformersDenseTPSP
 
             try:
                 self.tpsp_adapter = TransformersDenseTPSP(self.model, vllm_config)
