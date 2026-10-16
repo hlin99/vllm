@@ -583,6 +583,8 @@ bool map_tpsp_p2p(int64_t handle, const torch::stable::Tensor& peer_handles) {
   unsigned int one = 1;
   STD_CUDA_CHECK(cudaMemcpyAsync(context->signal_one, &one, sizeof(one),
                                  cudaMemcpyHostToDevice, stream));
+  // The CPU rank handshake must not finish before peer-visible flags are ready.
+  STD_CUDA_CHECK(cudaStreamSynchronize(stream));
   context->mapped = true;
   return true;
 }
