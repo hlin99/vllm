@@ -52,6 +52,26 @@ def test_projection_profile_restores_residual_between_baseline_trials():
     torch.testing.assert_close(inputs.residual, original_residual + first)
 
 
+def test_projection_profile_supports_transformers_linear_and_norm():
+    class Projection(nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states + 2
+
+    class Norm(nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states * 2
+
+    inputs = SimpleNamespace(
+        hidden_states=torch.ones(1, 2),
+        residual=torch.full((1, 2), 4.0),
+    )
+
+    output = tpsp_utils._run_conventional_projection(Projection(), Norm(), inputs)
+
+    torch.testing.assert_close(output, torch.full((1, 2), 14.0))
+    torch.testing.assert_close(inputs.residual, torch.full((1, 2), 7.0))
+
+
 def test_compiled_ops_group_passes_projection_output_to_norm():
     class Projection(nn.Module):
         input_size_per_partition = 2

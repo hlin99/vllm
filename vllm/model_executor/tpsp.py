@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import statistics
@@ -487,12 +488,19 @@ def _run_conventional_projection(
     inputs: _ProjectionInputs,
     layer_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    full, _ = projection(inputs.hidden_states)
+    projected = projection(inputs.hidden_states)
+    full = projected[0] if isinstance(projected, tuple) else projected
     if layer_scale is not None:
         scale = layer_scale.to(dtype=full.dtype).reshape(-1) + 1
         full = full * scale
-    full, _ = norm(full, inputs.residual)
-    return full
+    try:
+        inspect.signature(norm.forward).bind(full, inputs.residual)
+    except TypeError:
+        inputs.residual.add_(full)
+        normalized = norm(inputs.residual)
+    else:
+        normalized = norm(full, inputs.residual)
+    return normalized[0] if isinstance(normalized, tuple) else normalized
 
 
 def _run_fused_projection(
