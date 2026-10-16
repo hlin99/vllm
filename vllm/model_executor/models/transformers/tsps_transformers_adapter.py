@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""BF16 TPSP backends, execution contexts, and profiling utilities."""
+"""BF16 Transformers TPSP backends, contexts, and profiling utilities."""
 
 from __future__ import annotations
 
@@ -298,15 +298,21 @@ class TPSPContext:
     handles: dict[str, object]
 
 
+class UnsupportedTPSPNormError(ValueError):
+    """Normalization not supported by the Transformers TPSP path."""
+
+
 def get_tpsp_norm_type(norm: nn.Module) -> str:
     """Return the fused normalization type after validating its parameters."""
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
     if isinstance(norm, GemmaRMSNorm):
-        raise ValueError("TPSP does not support offset-weight RMSNorm")
+        raise UnsupportedTPSPNormError("TPSP does not support offset-weight RMSNorm")
     weight = getattr(norm, "weight", None)
     if not isinstance(weight, torch.Tensor) or weight.ndim != 1:
-        raise ValueError(f"Unsupported TPSP normalization {type(norm).__name__}")
+        raise UnsupportedTPSPNormError(
+            f"Unsupported TPSP normalization {type(norm).__name__}"
+        )
     if isinstance(norm, nn.LayerNorm) or hasattr(norm, "eps"):
         norm_type = "layer_norm"
         eps = getattr(norm, "eps", None)
@@ -314,9 +320,13 @@ def get_tpsp_norm_type(norm: nn.Module) -> str:
         norm_type = "rms_norm"
         eps = norm.variance_epsilon
     else:
-        raise ValueError(f"Unsupported TPSP normalization {type(norm).__name__}")
+        raise UnsupportedTPSPNormError(
+            f"Unsupported TPSP normalization {type(norm).__name__}"
+        )
     if not isinstance(eps, (float, int)):
-        raise ValueError(f"Unsupported TPSP normalization {type(norm).__name__}")
+        raise UnsupportedTPSPNormError(
+            f"Unsupported TPSP normalization {type(norm).__name__}"
+        )
     if eps <= 0:
         raise ValueError("TPSP norm_eps must be positive")
     return norm_type

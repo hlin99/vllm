@@ -13,7 +13,7 @@ import torch
 from torch import nn
 
 from vllm.logger import init_logger
-from vllm.model_executor.tpsp_runtime import (
+from vllm.model_executor.models.transformers.tsps_transformers_adapter import (
     TPSPContext,
     TPSPOpsGroup,
     get_tpsp_norm_type,
@@ -333,7 +333,7 @@ def _bind_layer_forward(ops: _DecoderLayerOps, next_norm: nn.Module) -> None:
     layer.forward = MethodType(forward, layer)
 
 
-class TransformersDecoderTPSP:
+class TransformersDenseTPSP:
     """Install TPSP for Transformers decoders with supported dense layer paths."""
 
     def __init__(self, model: nn.Module, vllm_config: "VllmConfig") -> None:

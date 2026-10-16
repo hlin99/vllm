@@ -22,7 +22,9 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.kernel import IrOpPriorityConfig
     from vllm.inputs import EngineInput
-    from vllm.model_executor.tpsp_runtime import TPSPBackend
+    from vllm.model_executor.models.transformers.tsps_transformers_adapter import (
+        TPSPBackend,
+    )
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser

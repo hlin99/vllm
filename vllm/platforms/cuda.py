@@ -36,7 +36,9 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.cache import CacheDType
     from vllm.config.kernel import IrOpPriorityConfig
-    from vllm.model_executor.tpsp_runtime import TPSPBackend
+    from vllm.model_executor.models.transformers.tsps_transformers_adapter import (
+        TPSPBackend,
+    )
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.selector import AttentionSelectorConfig
 else:

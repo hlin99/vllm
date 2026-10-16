@@ -13,7 +13,7 @@ import torch.distributed as dist
 from torch.distributed import distributed_c10d as c10d
 
 from vllm.logger import init_logger
-from vllm.model_executor.tpsp_runtime import (
+from vllm.model_executor.models.transformers.tsps_transformers_adapter import (
     TPSPBackend,
     TPSPContext,
     TPSPOpsGroup,
@@ -151,11 +151,6 @@ class CudaTPSPBackend(TPSPBackend):
                 tp_size,
                 hidden_size,
             )
-            return None
-        if not torch._C._dispatch_has_kernel_for_dispatch_key(
-            "_C::fused_add_rms_norm", device.type.upper()
-        ):
-            logger.warning("TPSP unavailable: %s fused_add_rms_norm is missing", device)
             return None
         if (
             device.index is not None

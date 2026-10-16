@@ -136,6 +136,19 @@ class Base(
         self.pp_group = get_pp_group()
         self.tp_group = get_tp_group()
 
+        if self.model_config.enable_tpsp:
+            if self.parallel_config.pipeline_parallel_size > 1:
+                raise ValueError("--enable-tpsp requires pipeline_parallel_size=1.")
+            speculative_config = vllm_config.speculative_config
+            if speculative_config is not None and (
+                speculative_config.use_eagle()
+                or speculative_config.uses_extract_hidden_states()
+            ):
+                raise ValueError(
+                    "--enable-tpsp is incompatible with speculative decoding "
+                    "methods requiring target hidden states."
+                )
+
         # Attrs for weight loading (see self.load_weights)
         self.ignore_unexpected_prefixes: list[str] = []
         """Ignore unexpected weights whose qualname starts with these prefixes."""
@@ -193,10 +206,15 @@ class Base(
         self.tpsp_adapter = None
         if self.model_config.enable_tpsp:
             from vllm.model_executor.models.transformers.tpsp_adapter import (
-                TransformersDecoderTPSP,
+                TransformersDenseTPSP,
             )
 
-            self.tpsp_adapter = TransformersDecoderTPSP(self.model, vllm_config)
+            from .tsps_transformers_adapter import UnsupportedTPSPNormError
+
+            try:
+                self.tpsp_adapter = TransformersDenseTPSP(self.model, vllm_config)
+            except UnsupportedTPSPNormError as exc:
+                logger.warning("Transformers TPSP using regular forward: %s", exc)
 
         # Initialize any parameters that have not had their modules replaced
         self.init_parameters(self.model)
