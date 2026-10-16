@@ -212,6 +212,230 @@ def test_mla(vllm_runner: type[VllmRunner], example_prompts: list[str]) -> None:
     )
 
 
+@pytest.mark.parametrize("model_type", ["llama", "qwen3"])
+@pytest.mark.parametrize("num_tokens", [2, 4])
+def test_transformers_decoder_tpsp_layer_path(
+    monkeypatch, model_type: str, num_tokens: int
+) -> None:
+    """The structure-based layer adapter preserves active and inactive outputs."""
+    import copy
+    from types import SimpleNamespace
+
+    import torch.nn.functional as F
+    from transformers import LlamaConfig, Qwen3Config
+
+    from vllm.model_executor.models.transformers.tpsp_adapter import (
+        TransformersDecoderTPSP,
+    )
+    from vllm.model_executor.tpsp_runtime import TPSPProfile
+
+    config_cls = {"llama": LlamaConfig, "qwen3": Qwen3Config}[model_type]
+
+    class Backend:
+        def __init__(self):
+            self.calls = 0
+
+        def fused_gemm_rs_norm_ag(
+            self, handle, x, projection, residual, norm, **kwargs
+        ):
+            self.calls += 1
+            projected = F.linear(x, projection.weight, projection.bias)
+            residual = projected + residual
+            norm_forward = getattr(norm, "_tpsp_original_forward", norm.forward)
+            return norm_forward(residual), residual
+
+    config = config_cls(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=8 if model_type == "qwen3" else None,
+        max_position_embeddings=32,
+    )
+    config._attn_implementation = "eager"
+    model = AutoModel.from_config(config).eval()
+    model.config.model_type = "custom_dense"
+    reference = copy.deepcopy(model).eval()
+
+    adapter = TransformersDecoderTPSP(
+        model,
+        SimpleNamespace(
+            quant_config=None,
+            lora_config=None,
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        ),
+    )
+    adapter.profile_attempted = True
+    backend = Backend()
+    adapter.context = SimpleNamespace(
+        profile=TPSPProfile(True, 3, 16),
+        backend=backend,
+        handles={"o_proj": object(), "down_proj": object()},
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.transformers.tpsp_adapter.tpsp_shard_residual",
+        lambda residual: residual,
+    )
+
+    input_ids = torch.arange(1, num_tokens + 1).unsqueeze(0)
+    with torch.inference_mode():
+        expected = reference(input_ids, use_cache=False).last_hidden_state
+        with adapter.forward_context(num_tokens):
+            actual = model(input_ids, use_cache=False).last_hidden_state
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+    assert backend.calls == (4 if num_tokens >= 3 else 0)
+
+    if num_tokens >= 3:
+        attention = model.get_decoder().layers[0].self_attn
+        original_forward = attention.forward
+
+        def fail_attention(*args, **kwargs):
+            raise RuntimeError("injected attention failure")
+
+        with (
+            monkeypatch.context() as patcher,
+            pytest.raises(RuntimeError, match="injected attention failure"),
+            adapter.forward_context(num_tokens),
+        ):
+            patcher.setattr(attention, "forward", fail_attention)
+            model(input_ids, use_cache=False)
+
+        with torch.inference_mode():
+            recovered = model(input_ids, use_cache=False).last_hidden_state
+        torch.testing.assert_close(recovered, expected, rtol=1e-4, atol=1e-5)
+        assert attention.forward == original_forward
+
+
+def test_transformers_decoder_tpsp_supports_layer_norm() -> None:
+    """Dense, non-allowlisted decoders can use LayerNorm with TPSP."""
+    import copy
+    from types import SimpleNamespace
+
+    import torch.nn.functional as F
+
+    from vllm.model_executor.models.transformers.tpsp_adapter import (
+        TransformersDecoderTPSP,
+    )
+    from vllm.model_executor.tpsp_runtime import TPSPProfile
+
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.o_proj = nn.Linear(4, 4)
+
+        def forward(self, hidden_states, **kwargs):
+            return self.o_proj(hidden_states)
+
+    class MLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.down_proj = nn.Linear(4, 4)
+
+        def forward(self, hidden_states):
+            return self.down_proj(hidden_states)
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = nn.LayerNorm(4)
+            self.self_attn = Attention()
+            self.post_attention_layernorm = nn.LayerNorm(4)
+            self.mlp = MLP()
+
+        def forward(self, hidden_states, **kwargs):
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.self_attn(hidden_states)
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            return residual + hidden_states
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(model_type="custom_dense")
+            self.layers = nn.ModuleList([Layer(), Layer()])
+            self.norm = nn.LayerNorm(4)
+
+        def get_decoder(self):
+            return self
+
+        def forward(self, hidden_states):
+            for layer in self.layers:
+                hidden_states = layer(hidden_states)
+            return self.norm(hidden_states)
+
+    class Backend:
+        def fused_gemm_rs_norm_ag(
+            self, handle, x, projection, residual, norm, *, norm_type, **kwargs
+        ):
+            assert norm_type == "layer_norm"
+            projected = F.linear(x, projection.weight, projection.bias)
+            residual = projected + residual
+            norm_forward = getattr(norm, "_tpsp_original_forward", norm.forward)
+            return norm_forward(residual), residual
+
+    torch.manual_seed(0)
+    model = Model().eval()
+    reference = copy.deepcopy(model).eval()
+    adapter = TransformersDecoderTPSP(
+        model,
+        SimpleNamespace(
+            quant_config=None,
+            lora_config=None,
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        ),
+    )
+    adapter.profile_attempted = True
+    adapter.context = SimpleNamespace(
+        profile=TPSPProfile(True, 1, 8),
+        backend=Backend(),
+        handles={"o_proj": object(), "down_proj": object()},
+    )
+    hidden_states = torch.randn(1, 4, 4)
+    with torch.inference_mode():
+        expected = reference(hidden_states)
+        with adapter.forward_context(4):
+            actual = model(hidden_states)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_transformers_decoder_tpsp_rejects_unsupported_layout() -> None:
+    from types import SimpleNamespace
+
+    from transformers import LlamaConfig
+
+    config = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=32,
+    )
+    model = AutoModel.from_config(config)
+    del model.get_decoder().layers[0].mlp
+    from vllm.model_executor.models.transformers.tpsp_adapter import (
+        TransformersDecoderTPSP,
+    )
+
+    with pytest.raises(ValueError, match="down_proj"):
+        TransformersDecoderTPSP(
+            model,
+            SimpleNamespace(
+                quant_config=None,
+                lora_config=None,
+                scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+            ),
+        )
+
+
 @multi_gpu_test(num_gpus=2)
 def test_distributed(
     hf_runner: type[HfRunner],
