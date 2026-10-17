@@ -55,6 +55,8 @@ the next layer's input norm (or final norm). The adapter derives its local
 changes from the installed Transformers forward; it does not maintain a
 separate decoder implementation. Attention and MLP computations outside these
 regions continue to use their existing implementations.
+Row-parallel projections that receive unsharded inputs retain their input
+splitting before the fused operation.
 
 Fusion requires unchanged projection outputs and a direct path between each
 residual add and its norm, including across decoder layers. Changes inside these
