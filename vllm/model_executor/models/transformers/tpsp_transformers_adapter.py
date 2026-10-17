@@ -5,6 +5,7 @@
 The current HF source supplies every forward. Only the two fused residual adds
 are removed; projection and norm calls retain their original call sites.
 Unsupported changes inside a fusion region reject installation atomically.
+Module structure and normalization configuration must stay fixed after installation.
 """
 
 import ast
@@ -27,6 +28,7 @@ from vllm.model_executor.models.transformers.fx_utils import (
 )
 from vllm.model_executor.models.transformers.tpsp_runtime import (
     TPSPContext,
+    TPSPNormType,
     TPSPOpsGroup,
     UnsupportedTPSPModelError,
     get_tpsp_norm_type,
@@ -53,6 +55,26 @@ _FORWARD_STATE: ContextVar[_ForwardState | None] = ContextVar(
 
 def _matches(node: ast.AST, source: str) -> bool:
     return ast.dump(node) == ast.dump(ast.parse(source).body[0])
+
+
+def _assignment(statement: ast.stmt) -> tuple[ast.expr, ast.expr]:
+    match statement:
+        case ast.Assign(targets=[target], value=value):
+            return target, value
+    raise ValueError("TPSP requires a single-target assignment")
+
+
+def _name_count(node: ast.AST, *names: str) -> int:
+    return sum(
+        isinstance(child, ast.Name) and child.id in names for child in ast.walk(node)
+    )
+
+
+def _top_level_index(body: list[ast.stmt], node: ast.AST) -> int:
+    chain = block_chain(body, node)
+    if len(chain) != 1:
+        raise ValueError("TPSP requires an unconditional top-level call")
+    return chain[0][1]
 
 
 def _module_name(module: nn.Module, names: tuple[str, ...]) -> str:
@@ -89,19 +111,13 @@ def _projection_parent(layer: nn.Module, name: str) -> str:
             raise ValueError(f"{name} return must not run additional computations")
         output = output.elts[0]
     if output is not call:
-        assignment = body.body[-2]
+        target, value = _assignment(body.body[-2])
         if not (
-            isinstance(assignment, ast.Assign)
-            and len(assignment.targets) == 1
-            and isinstance(assignment.targets[0], ast.Name)
-            and assignment.value is call
+            isinstance(target, ast.Name)
+            and value is call
             and isinstance(output, ast.Name)
-            and assignment.targets[0].id == output.id
-            and sum(
-                isinstance(node, ast.Name) and node.id == output.id
-                for node in ast.walk(tail)
-            )
-            == 1
+            and target.id == output.id
+            and _name_count(tail, output.id) == 1
         ):
             raise ValueError(f"{name} output must be returned unchanged")
     return parents[0]
@@ -114,24 +130,18 @@ def _rewrite_layer(
     body = funcdef.body
     previous_add = -1
     for norm, block in zip(norms, blocks, strict=True):
-        norm_call = single_self_call(funcdef, norm)
-        chain = block_chain(body, norm_call)
-        if len(chain) != 1:
-            raise ValueError("TPSP norms must be unconditional")
-        norm_index = chain[0][1]
-        setup = body[norm_index - 1]
+        norm_index = _top_level_index(body, single_self_call(funcdef, norm))
+        target, value = _assignment(body[norm_index - 1])
         if not (
             norm_index > 0
-            and isinstance(setup, ast.Assign)
-            and len(setup.targets) == 1
-            and isinstance(setup.targets[0], ast.Name)
-            and _matches(setup, f"{setup.targets[0].id} = hidden_states")
+            and isinstance(target, ast.Name)
+            and _matches(ast.Expr(value), "hidden_states")
             and _matches(
                 body[norm_index], f"hidden_states = self.{norm}(hidden_states)"
             )
         ):
             raise ValueError("TPSP requires a residual saved immediately before norm")
-        residual = setup.targets[0].id
+        residual = target.id
         if residual == "hidden_states":
             raise ValueError("TPSP requires a separate residual")
         calls = [
@@ -144,19 +154,10 @@ def _rewrite_layer(
         if len(calls) != 1:
             raise ValueError(f"TPSP requires one {block} call")
         call = calls[0]
-        chain = block_chain(body, call)
-        if len(chain) != 1:
-            raise ValueError(f"TPSP requires an unconditional {block} call")
-        index = chain[0][1]
-        statement = body[index]
-        if not (
-            index > norm_index
-            and isinstance(statement, ast.Assign)
-            and len(statement.targets) == 1
-            and statement.value is call
-        ):
+        index = _top_level_index(body, call)
+        target, value = _assignment(body[index])
+        if index <= norm_index or value is not call:
             raise ValueError(f"TPSP requires a direct {block} assignment")
-        target = statement.targets[0]
         if isinstance(target, ast.Tuple):
             if (
                 len(target.elts) != 2
@@ -181,14 +182,9 @@ def _rewrite_layer(
         if (
             (previous_add >= 0 and norm_index != previous_add + 2)
             or any(
-                isinstance(node, ast.Name) and node.id in ("hidden_states", residual)
-                for stmt in prefix + middle
-                for node in ast.walk(stmt)
+                _name_count(stmt, "hidden_states", residual) for stmt in prefix + middle
             )
-            or any(
-                isinstance(node, ast.Name) and node.id == residual
-                for node in ast.walk(call)
-            )
+            or _name_count(call, residual)
         ):
             raise ValueError("TPSP cannot move normalization across intermediate uses")
         previous_add = index + 1
@@ -201,13 +197,12 @@ def _rewrite_layer(
 
 def _validate_decoder(decoder: nn.Module, layers_name: str, norm_name: str) -> None:
     funcdef, _ = recover_forward(type(decoder))
-    norm = single_self_call(funcdef, norm_name)
-    chain = block_chain(funcdef.body, norm)
-    if len(chain) != 1 or not _matches(
-        funcdef.body[chain[0][1]], f"hidden_states = self.{norm_name}(hidden_states)"
+    index = _top_level_index(funcdef.body, single_self_call(funcdef, norm_name))
+    if not _matches(
+        funcdef.body[index], f"hidden_states = self.{norm_name}(hidden_states)"
     ):
         raise ValueError("TPSP requires a final hidden_states normalization")
-    loop = funcdef.body[chain[0][1] - 1]
+    loop = funcdef.body[index - 1]
     if not isinstance(loop, ast.For) or len(loop.body) != 1 or loop.orelse:
         raise ValueError("TPSP requires a plain decoder loop immediately before norm")
     iterable, target = loop.iter, loop.target
@@ -229,22 +224,16 @@ def _validate_decoder(decoder: nn.Module, layers_name: str, norm_name: str) -> N
         )
     ):
         raise ValueError("TPSP requires sequential decoder layers")
-    statement = loop.body[0]
+    assigned, call = _assignment(loop.body[0])
     if not (
-        isinstance(statement, ast.Assign)
-        and len(statement.targets) == 1
-        and isinstance(statement.targets[0], ast.Name)
-        and statement.targets[0].id == "hidden_states"
-        and isinstance(statement.value, ast.Call)
-        and isinstance(statement.value.func, ast.Name)
-        and statement.value.func.id == target.id
-        and statement.value.args
-        and _matches(ast.Expr(statement.value.args[0]), "hidden_states")
-        and sum(
-            isinstance(node, ast.Name) and node.id == "hidden_states"
-            for node in ast.walk(statement.value)
-        )
-        == 1
+        isinstance(assigned, ast.Name)
+        and assigned.id == "hidden_states"
+        and isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == target.id
+        and call.args
+        and _matches(ast.Expr(call.args[0]), "hidden_states")
+        and _name_count(call, "hidden_states") == 1
     ):
         raise ValueError("TPSP requires unchanged states between decoder layers")
 
@@ -260,7 +249,7 @@ def _bind(module: nn.Module, active_forward: Callable) -> None:
     module.forward = forward
 
 
-def _bind_projection(group: TPSPOpsGroup) -> None:
+def _bind_projection(group: TPSPOpsGroup, norm_type: TPSPNormType) -> None:
     projection, norm = group.projection, group.norm
 
     def forward(x: torch.Tensor) -> torch.Tensor:
@@ -274,7 +263,7 @@ def _bind_projection(group: TPSPOpsGroup) -> None:
             projection,
             state.residual,
             norm,
-            norm_type=get_tpsp_norm_type(norm),
+            norm_type=norm_type,
         )
         state.expected = norm
         return hidden.reshape(*x.shape[:-1], hidden.shape[-1])
@@ -360,8 +349,17 @@ class TransformersDenseTPSP:
                             name, layer.get_submodule(f"{parent}.{name}"), norm
                         )
                     )
+            modules = [
+                self.input_norm,
+                *(m for g in groups for m in (g.projection, g.norm)),
+            ]
+            if len({id(module) for module in modules}) != len(modules):
+                raise ValueError("TPSP does not support shared projections or norms")
+            norm_types = {
+                id(norm): get_tpsp_norm_type(norm)
+                for norm in (self.input_norm, *(group.norm for group in groups))
+            }
             hidden_size = self.input_norm.weight.numel()
-            get_tpsp_norm_type(self.input_norm)
             for group in groups:
                 first = groups[0 if group.name == "o_proj" else 1]
                 projection = group.projection
@@ -375,17 +373,11 @@ class TransformersDenseTPSP:
                     )
                     != hidden_size
                     or group.norm.weight.numel() != hidden_size
-                    or get_tpsp_norm_type(group.norm) != get_tpsp_norm_type(first.norm)
+                    or norm_types[id(group.norm)] != norm_types[id(first.norm)]
                 ):
                     raise ValueError(
                         f"Incompatible TPSP {group.name} shapes or normalization"
                     )
-            modules = [
-                self.input_norm,
-                *(m for g in groups for m in (g.projection, g.norm)),
-            ]
-            if len({id(module) for module in modules}) != len(modules):
-                raise ValueError("TPSP does not support shared projections or norms")
         except (
             AttributeError,
             IndexError,
@@ -406,7 +398,7 @@ class TransformersDenseTPSP:
         self.profile_attempted = False
         _bind_norm(self.input_norm, groups[0].projection)
         for index, group in enumerate(groups):
-            _bind_projection(group)
+            _bind_projection(group, norm_types[id(group.norm)])
             next_projection = (
                 groups[index + 1].projection if index + 1 < len(groups) else None
             )

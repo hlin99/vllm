@@ -3,6 +3,7 @@
 """Behavioral tests of the local projection/residual/norm adapter."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -198,7 +199,10 @@ class InterLayerComputation(Decoder):
         return hidden_states
 
 
-@pytest.mark.parametrize("region", ["attention", "mlp", "layer", "decoder"])
+@pytest.mark.parametrize(
+    "region",
+    ["attention", "mlp", "layer", "decoder", "norm", "norm_shape", "shared_norm"],
+)
 def test_unsafe_fusion_is_rejected_before_any_forward_is_patched(config, region):
     model = InterLayerComputation() if region == "decoder" else Decoder()
     if region == "attention":
@@ -207,10 +211,35 @@ def test_unsafe_fusion_is_rejected_before_any_forward_is_patched(config, region)
         model.layers[-1].mlp = ScaledMLP()
     elif region == "layer":
         model.layers[-1] = ScaledLayer()
+    elif region == "norm":
+        model.norm = nn.Identity()
+    elif region == "norm_shape":
+        model.norm = nn.LayerNorm(8)
+    elif region == "shared_norm":
+        model.norm = model.layers[-1].post_attention_layernorm
     forwards = [(module, module.forward) for module in model.modules()]
     with pytest.raises(UnsupportedTPSPModelError):
         TransformersDenseTPSP(model, config)
     assert all(module.forward == original for module, original in forwards)
+
+
+def test_norm_validation_runs_once_at_installation_not_during_forward(
+    install, monkeypatch
+):
+    validate = Mock(wraps=tpsp_transformers_adapter.get_tpsp_norm_type)
+    monkeypatch.setattr(tpsp_transformers_adapter, "get_tpsp_norm_type", validate)
+    model = Decoder()
+    norms = {
+        id(module) for module in model.modules() if isinstance(module, nn.LayerNorm)
+    }
+    adapter, _ = install(model)
+    assert validate.call_count == len(norms)
+    assert {id(call.args[0]) for call in validate.call_args_list} == norms
+    validate.reset_mock()
+    for _ in range(2):
+        with adapter.forward_context(7):
+            model(torch.randn(1, 7, 16))
+    validate.assert_not_called()
 
 
 def test_incomplete_forward_raises_and_restores_original_path(install):
