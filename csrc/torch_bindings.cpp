@@ -32,7 +32,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 #ifndef USE_ROCM
   ops.def(
       "init_tpsp_p2p(int device_index, int tp_size, int rank, "
-      "int max_chunk_rows, int hidden_size, int max_tokens) -> int");
+      "int max_microchunk_tokens_per_rank, int hidden_size, int max_tokens) -> "
+      "int");
   ops.def("get_tpsp_p2p_handles(int handle) -> Tensor");
   ops.def("map_tpsp_p2p(int handle, Tensor peer_handles) -> bool");
   ops.def("destroy_tpsp_p2p(int handle) -> ()");
@@ -40,7 +41,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "tpsp_fused_matmul_reduce_scatter_norm_all_gather("
       "Tensor a, Tensor b, Tensor weight, Tensor residual, "
       "Tensor? projection_bias, Tensor? norm_bias, float eps, int norm_kind, "
-      "int microchunk_rows, int tp_size, int p2p_handle, "
+      "int microchunk_tokens_per_rank, int tp_size, int p2p_handle, "
       "int sm_count_target=0) "
       "-> (Tensor, Tensor, Tensor)");
 

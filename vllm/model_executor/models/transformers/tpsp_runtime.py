@@ -16,16 +16,14 @@ from torch import nn
 
 _LOG = logging.getLogger(__name__)
 _STATIC_PROFILE_THRESHOLD_TOKENS = 512
-_STATIC_PROFILE_CHUNK_ROWS = 256
+_STATIC_PROFILE_MICROCHUNK_TOKENS_PER_RANK = 256
 
 # TPSP v1 supports only standard LayerNorm and RMSNorm.
 TPSPNormType = Literal["layer_norm", "rms_norm"]
 
 
 class TPSPBackend(ABC):
-    tpsp_chunk_granularity: int
-    tpsp_max_microchunk_rows: int | None = None
-    tpsp_max_microchunk_tokens: int | None = None
+    tpsp_max_microchunk_tokens_per_rank: int | None = None
     supported_norm_types: frozenset[TPSPNormType] = frozenset()
 
     def __init__(self, group_name: str, device: torch.device) -> None:
@@ -79,16 +77,14 @@ class TPSPBackend(ABC):
     def get_tuning_configs(
         self,
         handle: object,
-        chunk: int,
+        microchunk_tokens_per_rank: int,
         group_name: str | None = None,
     ) -> Sequence[object]:
-        """Return the backend config for a fixed chunk size."""
-        return (chunk,)
+        """Return the backend config for a fixed microchunk size per rank."""
+        return (microchunk_tokens_per_rank,)
 
-    def get_max_microchunk_rows(self, tp_size: int) -> int | None:
-        if self.tpsp_max_microchunk_tokens is not None:
-            return math.ceil(self.tpsp_max_microchunk_tokens / tp_size)
-        return self.tpsp_max_microchunk_rows
+    def get_max_microchunk_tokens_per_rank(self) -> int | None:
+        return self.tpsp_max_microchunk_tokens_per_rank
 
     @abstractmethod
     def fused_gemm_rs_norm_ag(
@@ -286,11 +282,17 @@ def _build_static_tpsp_context(
     if tp_group.world_size < 2 or hidden_size % tp_group.world_size:
         _LOG.warning("TPSP using regular forward: unsupported TP configuration")
         return None
-    chunk_rows = _STATIC_PROFILE_CHUNK_ROWS
+    microchunk_tokens_per_rank = _STATIC_PROFILE_MICROCHUNK_TOKENS_PER_RANK
     if microchunk_tokens is not None:
-        chunk_rows = _microchunk_rows_from_tokens(
+        microchunk_tokens_per_rank = _microchunk_tokens_per_rank(
             backend, microchunk_tokens, tp_group.world_size
         )
+    else:
+        max_microchunk_tokens_per_rank = backend.get_max_microchunk_tokens_per_rank()
+        if max_microchunk_tokens_per_rank is not None:
+            microchunk_tokens_per_rank = min(
+                microchunk_tokens_per_rank, max_microchunk_tokens_per_rank
+            )
 
     handles: dict[str, object] = {}
     enabled = False
@@ -314,7 +316,7 @@ def _build_static_tpsp_context(
             handles[entry.name] = handle
             configs = backend.get_tuning_configs(
                 handle,
-                chunk_rows,
+                microchunk_tokens_per_rank,
                 entry.name,
             )
             if not configs:
@@ -338,20 +340,20 @@ def _build_static_tpsp_context(
             backend.close()
 
 
-def _microchunk_rows_from_tokens(
+def _microchunk_tokens_per_rank(
     backend: TPSPBackend, microchunk_tokens: int, tp_size: int
 ) -> int:
     if type(microchunk_tokens) is not int or microchunk_tokens <= 0:
         raise ValueError("TPSP microchunk tokens must be a positive integer")
-    granularity = backend.tpsp_chunk_granularity
-    if type(granularity) is not int or granularity <= 0:
-        raise ValueError("TPSP chunk granularity must be a positive integer")
-    local_rows = math.ceil(microchunk_tokens / tp_size)
-    rows = max(granularity, math.ceil(local_rows / granularity) * granularity)
-    max_rows = backend.get_max_microchunk_rows(tp_size)
-    if max_rows is not None and max_rows >= granularity:
-        rows = min(rows, max_rows // granularity * granularity)
-    return rows
+    if type(tp_size) is not int or tp_size <= 0:
+        raise ValueError("TPSP TP size must be a positive integer")
+    microchunk_tokens_per_rank = math.ceil(microchunk_tokens / tp_size)
+    max_microchunk_tokens_per_rank = backend.get_max_microchunk_tokens_per_rank()
+    if max_microchunk_tokens_per_rank is not None:
+        microchunk_tokens_per_rank = min(
+            microchunk_tokens_per_rank, max_microchunk_tokens_per_rank
+        )
+    return microchunk_tokens_per_rank
 
 
 def _projection_input_width(projection: nn.Module) -> int:

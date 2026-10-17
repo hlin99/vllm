@@ -22,7 +22,7 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class CudaTPSPConfig:
-    chunk_rows: int
+    microchunk_tokens_per_rank: int
     sm_count_target: int = 0
 
 
@@ -32,14 +32,13 @@ class CudaTPSPContext:
     tp_size: int
     rank: int
     control_group: dist.ProcessGroup
-    max_chunk_rows: int
+    max_microchunk_tokens_per_rank: int
     p2p_handle: int = 0
     config: int | CudaTPSPConfig | None = None
 
 
 class CudaTPSPBackend(TPSPBackend):
-    tpsp_chunk_granularity = 64
-    tpsp_max_microchunk_rows = 4_096
+    tpsp_max_microchunk_tokens_per_rank = 4_096
     supported_norm_types: frozenset[TPSPNormType] = frozenset(
         {"layer_norm", "rms_norm"}
     )
@@ -117,16 +116,24 @@ class CudaTPSPBackend(TPSPBackend):
             logger.warning("CUDA TPSP CPU control group is unavailable")
             return None
         rank = dist.get_rank(group)
-        max_chunk_rows = math.ceil(max_batched_tokens / tp_size)
-        cap_rows = self.get_max_microchunk_rows(tp_size)
-        if cap_rows is not None:
-            max_chunk_rows = min(max_chunk_rows, cap_rows)
-        context = CudaTPSPContext(device, tp_size, rank, control_group, max_chunk_rows)
+        max_microchunk_tokens_per_rank = math.ceil(max_batched_tokens / tp_size)
+        max_microchunk_cap = self.get_max_microchunk_tokens_per_rank()
+        if max_microchunk_cap is not None:
+            max_microchunk_tokens_per_rank = min(
+                max_microchunk_tokens_per_rank, max_microchunk_cap
+            )
+        context = CudaTPSPContext(
+            device,
+            tp_size,
+            rank,
+            control_group,
+            max_microchunk_tokens_per_rank,
+        )
         context.p2p_handle = torch.ops._C.init_tpsp_p2p(
             device.index if device.index is not None else torch.cuda.current_device(),
             tp_size,
             rank,
-            max_chunk_rows,
+            max_microchunk_tokens_per_rank,
             hidden_size,
             max_batched_tokens,
         )
@@ -152,8 +159,8 @@ class CudaTPSPBackend(TPSPBackend):
             return None
         if rank == 0:
             logger.info(
-                "TPSP enabled with direct P2P for %s rows per rank",
-                max_chunk_rows,
+                "TPSP enabled with direct P2P for %s tokens per rank",
+                max_microchunk_tokens_per_rank,
             )
         self._open_context_ids.add(id(context))
         return context
@@ -187,8 +194,8 @@ class CudaTPSPBackend(TPSPBackend):
             config = CudaTPSPConfig(config)
         if (
             not isinstance(config, CudaTPSPConfig)
-            or type(config.chunk_rows) is not int
-            or config.chunk_rows <= 0
+            or type(config.microchunk_tokens_per_rank) is not int
+            or config.microchunk_tokens_per_rank <= 0
             or type(config.sm_count_target) is not int
             or config.sm_count_target < 0
         ):
@@ -198,11 +205,11 @@ class CudaTPSPBackend(TPSPBackend):
     def get_tuning_configs(
         self,
         handle: object,
-        chunk: int,
+        microchunk_tokens_per_rank: int,
         group_name: str | None = None,
     ) -> tuple[CudaTPSPConfig, ...]:
         self._profile_context(handle)
-        return (CudaTPSPConfig(chunk, 0),)
+        return (CudaTPSPConfig(microchunk_tokens_per_rank, 0),)
 
     def fused_gemm_rs_norm_ag(
         self,
@@ -221,8 +228,8 @@ class CudaTPSPBackend(TPSPBackend):
             raise ValueError(f"CUDA TPSP does not support norm type {norm_type}")
         context = self._profile_context(projection_context)
         hidden_size = norm.weight.numel()
-        rows = (x.size(0) + context.tp_size - 1) // context.tp_size
-        if residual.shape != (rows, hidden_size):
+        tokens_per_rank = (x.size(0) + context.tp_size - 1) // context.tp_size
+        if residual.shape != (tokens_per_rank, hidden_size):
             raise RuntimeError("TPSP residual shard has an unexpected shape")
         local_residual = residual
 
@@ -240,11 +247,14 @@ class CudaTPSPBackend(TPSPBackend):
         selected = self._resolve_config(
             context, context.config if config is None else config
         )
-        chunk = selected.chunk_rows
+        microchunk_tokens_per_rank = selected.microchunk_tokens_per_rank
         p2p_handle = context.p2p_handle
         if (
-            min((a.size(0) + context.tp_size - 1) // context.tp_size, chunk)
-            > context.max_chunk_rows
+            min(
+                (a.size(0) + context.tp_size - 1) // context.tp_size,
+                microchunk_tokens_per_rank,
+            )
+            > context.max_microchunk_tokens_per_rank
         ):
             raise ValueError("CUDA TPSP microchunk exceeds P2P workspace capacity")
         if eps <= 0 or (norm_bias is not None and norm_type != "layer_norm"):
@@ -280,7 +290,7 @@ class CudaTPSPBackend(TPSPBackend):
                 norm_bias,
                 eps,
                 1 if norm_type == "layer_norm" else 0,
-                chunk,
+                microchunk_tokens_per_rank,
                 context.tp_size,
                 p2p_handle,
                 selected.sm_count_target,
