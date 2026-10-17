@@ -320,11 +320,10 @@ def test_cuda_tpsp_reuses_prepared_transposed_weights(cuda_tpsp_backend):
     assert transposed.is_contiguous() and not transposed.requires_grad
     native.tpsp_fused_matmul_reduce_scatter_norm_all_gather.return_value = (
         torch.empty(4, 16),
-        None,
         torch.empty(8, 16),
     )
     for _ in range(2):
-        backend.fused_gemm_rs_norm_ag(
+        gathered, reduced = backend.fused_gemm_rs_norm_ag(
             context,
             torch.randn(8, 8),
             projection,
@@ -332,8 +331,134 @@ def test_cuda_tpsp_reuses_prepared_transposed_weights(cuda_tpsp_backend):
             norm,
             norm_type="layer_norm",
         )
+        expected_reduced, expected_gathered = (
+            native.tpsp_fused_matmul_reduce_scatter_norm_all_gather.return_value
+        )
+        assert gathered is expected_gathered
+        assert reduced is expected_reduced
     for call in native.tpsp_fused_matmul_reduce_scatter_norm_all_gather.call_args_list:
         assert call.args[1] is transposed
+
+
+def _tpsp_native_worker(rank, init_method):
+    import torch.distributed as dist
+    import vllm._C_stable_libtorch  # noqa: F401
+
+    torch.accelerator.set_device_index(rank)
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2)
+    native = torch.ops._C
+    try:
+        for hidden, capacity in ((32, 5), (30, 4)):
+            handle = native.init_tpsp_p2p(rank, 2, rank, capacity, hidden, 34)
+            assert handle != 0
+            local = native.get_tpsp_p2p_handles(handle)
+            peers = [torch.empty_like(local) for _ in range(2)]
+            dist.all_gather(peers, local)
+            assert native.map_tpsp_p2p(handle, torch.cat(peers))
+            dist.barrier()
+            try:
+                # Single chunks, empty shards, uneven tokens, merged/unmerged
+                # tails, and more chunks than the three scratch slots.
+                for tokens in (1, 8, 9, 18, 34):
+                    torch.manual_seed(tokens)
+                    # Exact dot products isolate layout/scheduling from GEMM
+                    # algorithm-dependent rounding.
+                    a = torch.randint(-2, 3, (tokens, 32), device="cuda").bfloat16() / 4
+                    b = torch.randint(-2, 3, (32, hidden), device="cuda").bfloat16() / 4
+                    residual = torch.randn(
+                        tokens, hidden, device="cuda", dtype=torch.bfloat16
+                    )
+                    weight = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
+                    bias = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
+                    projected = (
+                        (a[:, :16] @ b[:16]).float() + (a[:, 16:] @ b[16:]).float()
+                    ).bfloat16()
+                    tokens_per_rank = (tokens + 1) // 2
+                    start = rank * tokens_per_rank
+                    own_tokens = min(tokens_per_rank, tokens - start)
+                    shard = F.pad(
+                        residual[start : start + own_tokens],
+                        (0, 0, 0, tokens_per_rank - own_tokens),
+                    )
+                    local_a = a[:, rank * 16 : (rank + 1) * 16].contiguous()
+                    local_b = b[rank * 16 : (rank + 1) * 16].contiguous()
+                    for norm_kind in (0, 1):
+                        projection_bias = bias if norm_kind else None
+                        norm_bias = bias if norm_kind else None
+                        expected_residual = projected
+                        if projection_bias is not None:
+                            expected_residual = expected_residual + projection_bias
+                        expected_residual = expected_residual + residual
+                        if norm_kind:
+                            expected = F.layer_norm(
+                                expected_residual.float(),
+                                (hidden,),
+                                weight.float(),
+                                bias.float(),
+                                1e-5,
+                            )
+                        else:
+                            expected = F.rms_norm(
+                                expected_residual.float(),
+                                (hidden,),
+                                weight.float(),
+                                1e-5,
+                            )
+                        memory = torch.accelerator.memory
+                        allocations_before = memory.memory_stats()[
+                            "allocation.all.allocated"
+                        ]
+                        reduced, gathered = (
+                            native.tpsp_fused_matmul_reduce_scatter_norm_all_gather(
+                                local_a,
+                                local_b,
+                                weight,
+                                shard,
+                                projection_bias,
+                                norm_bias,
+                                1e-5,
+                                norm_kind,
+                                4,
+                                2,
+                                handle,
+                            )
+                        )
+                        if norm_kind == 1:
+                            # The first call warms cuBLAS. Only scratch slots
+                            # and the returned residual should allocate now.
+                            slots = 1 if tokens_per_rank <= capacity else 3
+                            expected_allocations = slots * (1 + tokens % 2) + 1
+                            assert (
+                                memory.memory_stats()["allocation.all.allocated"]
+                                - allocations_before
+                            ) == expected_allocations
+                        torch.testing.assert_close(
+                            gathered, expected.bfloat16(), rtol=0.016, atol=0.016
+                        )
+                        torch.testing.assert_close(
+                            reduced[:own_tokens],
+                            expected_residual[start : start + own_tokens],
+                            rtol=0,
+                            atol=0,
+                        )
+                        dist.barrier()
+            finally:
+                native.destroy_tpsp_p2p(handle)
+                dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.distributed(num_gpus=2)
+def test_cuda_tpsp_native_outputs_match_reference(tmp_path):
+    """Both returned tensors stay correct across chunk and norm dispatch paths."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda() or torch.accelerator.device_count() < 2:
+        pytest.skip("Requires two CUDA GPUs")
+    torch.multiprocessing.spawn(
+        _tpsp_native_worker, args=(f"file://{tmp_path / 'tpsp-init'}",), nprocs=2
+    )
 
 
 def test_cuda_tpsp_requires_open_before_configuring_ops(cuda_tpsp_backend):

@@ -43,7 +43,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor? projection_bias, Tensor? norm_bias, float eps, int norm_kind, "
       "int microchunk_tokens_per_rank, int tp_size, int p2p_handle, "
       "int sm_count_target=0) "
-      "-> (Tensor, Tensor, Tensor)");
+      "-> (Tensor, Tensor)");
 
   // Note about marlin kernel 'workspace' arguments:
   // Technically these should be mutable since they are modified by the kernel.

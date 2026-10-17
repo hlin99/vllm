@@ -287,7 +287,7 @@ class CudaTPSPBackend(TPSPBackend):
         )
         microchunk_tokens_per_rank = selected.microchunk_tokens_per_rank
         p2p_handle = workspace.p2p_handle
-        reduced, _, gathered = (
+        reduced, gathered = (
             torch.ops._C.tpsp_fused_matmul_reduce_scatter_norm_all_gather(
                 a,
                 b,

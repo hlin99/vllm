@@ -35,36 +35,41 @@ struct alignas(16) TpspBf16Vec {
   bf16 data[8];
 };
 
-// Chunk scheduling
-//
-// Small tails are redistributed across chunks to avoid a final short chunk.
-std::vector<int64_t> make_tpsp_microchunk_sizes_per_rank(
-    int64_t tokens_per_rank, int64_t target_microchunk_tokens_per_rank,
-    bool merge_small_tail = true) {
-  const int64_t full_chunks =
-      tokens_per_rank / target_microchunk_tokens_per_rank;
-  const int64_t tail_tokens_per_rank =
-      tokens_per_rank % target_microchunk_tokens_per_rank;
-  if (merge_small_tail && full_chunks > 0 && tail_tokens_per_rank > 0 &&
-      static_cast<double>(tail_tokens_per_rank) /
-              target_microchunk_tokens_per_rank <=
-          kTpspTailMergeThreshold) {
-    const int64_t base_tokens_per_rank = tokens_per_rank / full_chunks;
-    const int64_t larger_chunks = tokens_per_rank % full_chunks;
-    std::vector<int64_t> microchunk_sizes_per_rank(full_chunks,
-                                                   base_tokens_per_rank);
-    for (int64_t i = full_chunks - larger_chunks; i < full_chunks; ++i) {
-      ++microchunk_sizes_per_rank[i];
-    }
-    return microchunk_sizes_per_rank;
-  }
+struct TpspChunk {
+  int64_t offset;
+  int64_t tokens;
+};
 
-  std::vector<int64_t> microchunk_sizes_per_rank(
-      full_chunks, target_microchunk_tokens_per_rank);
-  if (tail_tokens_per_rank > 0) {
-    microchunk_sizes_per_rank.push_back(tail_tokens_per_rank);
+struct TpspChunkPlan {
+  std::vector<TpspChunk> chunks;
+  int64_t max_tokens;
+};
+
+TpspChunkPlan make_tpsp_chunk_plan(int64_t tokens_per_rank, int64_t target,
+                                   int64_t capacity) {
+  target = std::min(tokens_per_rank, target);
+  const int64_t full_chunks = tokens_per_rank / target;
+  const int64_t tail = tokens_per_rank % target;
+  // Redistribute small tails only when the larger chunks fit the workspace.
+  const bool merge_tail =
+      full_chunks > 0 && tail > 0 &&
+      static_cast<double>(tail) / target <= kTpspTailMergeThreshold &&
+      (tokens_per_rank + full_chunks - 1) / full_chunks <= capacity;
+  const int64_t count = full_chunks + (tail > 0 && !merge_tail);
+  const int64_t base = merge_tail ? tokens_per_rank / count : target;
+  const int64_t larger = merge_tail ? tokens_per_rank % count : 0;
+  TpspChunkPlan plan;
+  plan.chunks.reserve(count);
+  plan.max_tokens = 0;
+  for (int64_t i = 0, offset = 0; i < count; ++i) {
+    const int64_t size = merge_tail
+                             ? base + (i >= count - larger)
+                             : std::min(target, tokens_per_rank - offset);
+    plan.chunks.push_back({offset, size});
+    plan.max_tokens = std::max(plan.max_tokens, size);
+    offset += size;
   }
-  return microchunk_sizes_per_rank;
+  return plan;
 }
 
 // Chunk layout conversion kernels
@@ -327,7 +332,7 @@ thread_local std::unordered_map<int, std::unique_ptr<PipelineState>>
 
 // Per-call scratch buffers for projection and optional row packing.
 struct ChunkBuffers {
-  torch::stable::Tensor packed;
+  std::optional<torch::stable::Tensor> packed;
   torch::stable::Tensor partial;
 };
 
@@ -356,52 +361,54 @@ struct TpspP2pContext {
   std::vector<void*> peers;
   std::vector<void*> output_peers;
 
+  bf16* peer_inbox(int peer, int slot, int source) const {
+    return reinterpret_cast<bf16*>(static_cast<char*>(peers[peer]) +
+                                   slot * pipeline_slot_bytes +
+                                   source * slot_bytes);
+  }
+
+  unsigned int* flags(int peer, int slot, int phase) const {
+    return reinterpret_cast<unsigned int*>(static_cast<char*>(peers[peer]) +
+                                           flag_offset +
+                                           slot * flag_slot_bytes) +
+           phase * tp_size;
+  }
+
+  bf16* output(int peer, int64_t token_offset) const {
+    return static_cast<bf16*>(output_peers[peer]) + token_offset * hidden_size;
+  }
+
+  template <bool CheckErrors = true>
   void close_peer_mappings() {
-    for (int source = 0; source < tp_size; ++source) {
-      if (source != rank && peers[source]) {
-        STD_CUDA_CHECK(cudaIpcCloseMemHandle(peers[source]));
-        peers[source] = nullptr;
-      }
-      if (source != rank && output_peers[source]) {
-        STD_CUDA_CHECK(cudaIpcCloseMemHandle(output_peers[source]));
-        output_peers[source] = nullptr;
+    for (auto* mappings : {&peers, &output_peers}) {
+      for (int source = 0; source < tp_size; ++source) {
+        if (source != rank && (*mappings)[source]) {
+          auto status = cudaIpcCloseMemHandle((*mappings)[source]);
+          if constexpr (CheckErrors) {
+            STD_CUDA_CHECK(status);
+          }
+          (*mappings)[source] = nullptr;
+        }
       }
     }
   }
 
+  template <bool CheckErrors = true>
   void free_local() {
-    if (signal_one) {
-      STD_CUDA_CHECK(cudaFree(signal_one));
-      signal_one = nullptr;
-    }
-    if (workspace) {
-      STD_CUDA_CHECK(cudaFree(workspace));
-      workspace = nullptr;
-    }
-    if (output_workspace) {
-      STD_CUDA_CHECK(cudaFree(output_workspace));
-      output_workspace = nullptr;
+    for (auto* allocation : {&signal_one, &workspace, &output_workspace}) {
+      if (*allocation) {
+        auto status = cudaFree(*allocation);
+        if constexpr (CheckErrors) {
+          STD_CUDA_CHECK(status);
+        }
+        *allocation = nullptr;
+      }
     }
   }
 
   ~TpspP2pContext() {
-    for (int source = 0; source < tp_size; ++source) {
-      if (source != rank && peers[source]) {
-        cudaIpcCloseMemHandle(peers[source]);
-      }
-      if (source != rank && output_peers[source]) {
-        cudaIpcCloseMemHandle(output_peers[source]);
-      }
-    }
-    if (signal_one) {
-      cudaFree(signal_one);
-    }
-    if (workspace) {
-      cudaFree(workspace);
-    }
-    if (output_workspace) {
-      cudaFree(output_workspace);
-    }
+    close_peer_mappings<false>();
+    free_local<false>();
   }
 };
 
@@ -409,11 +416,15 @@ std::mutex tpsp_context_mutex;
 std::unordered_map<int64_t, std::shared_ptr<TpspP2pContext>> tpsp_contexts;
 int64_t next_tpsp_handle = 1;
 
+std::shared_ptr<TpspP2pContext> get_tpsp_context(int64_t handle) {
+  std::lock_guard<std::mutex> lock(tpsp_context_mutex);
+  auto it = tpsp_contexts.find(handle);
+  STD_TORCH_CHECK(it != tpsp_contexts.end(), "Invalid TPSP P2P context");
+  return it->second;
+}
+
 void notify_tpsp_peers_and_wait(TpspP2pContext& context, int slot, int phase,
                                 cudaStream_t stream) {
-  auto* local_base = reinterpret_cast<char*>(context.workspace);
-  auto* local_flags = reinterpret_cast<unsigned int*>(
-      local_base + context.flag_offset + slot * context.flag_slot_bytes);
   auto* one = reinterpret_cast<const unsigned int*>(context.signal_one);
   tpsp_system_fence<<<1, 1, 0, stream>>>();
   STD_CUDA_CHECK(cudaGetLastError());
@@ -421,16 +432,13 @@ void notify_tpsp_peers_and_wait(TpspP2pContext& context, int slot, int phase,
     if (dest == context.rank) {
       continue;
     }
-    auto* peer_base = reinterpret_cast<char*>(context.peers[dest]);
-    auto* peer_flag = reinterpret_cast<unsigned int*>(
-        peer_base + context.flag_offset + slot * context.flag_slot_bytes +
-        (phase * context.tp_size + context.rank) * sizeof(unsigned int));
+    auto* peer_flag = context.flags(dest, slot, phase) + context.rank;
     STD_CUDA_CHECK(cudaMemcpyAsync(peer_flag, one, sizeof(unsigned int),
                                    cudaMemcpyDeviceToDevice, stream));
   }
   wait_and_clear_tpsp_signals<<<(context.tp_size + 255) / 256, 256, 0,
-                                stream>>>(local_flags + phase * context.tp_size,
-                                          context.rank, context.tp_size);
+                                stream>>>(
+      context.flags(context.rank, slot, phase), context.rank, context.tp_size);
   STD_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -465,6 +473,160 @@ cublasStatus_t tpsp_gemm(cublasHandle_t blas, int sm_count_target, Gemm gemm) {
       cublasSetSmCountTarget(blas, original) == CUBLAS_STATUS_SUCCESS,
       "TPSP failed to restore cuBLAS SM target");
   return result;
+}
+
+void project_tpsp_chunk(cublasHandle_t blas, cudaStream_t stream,
+                        int sm_count_target, const bf16* a, const bf16* b,
+                        bf16* packed, bf16* partial, int64_t tokens,
+                        int64_t width, int64_t hidden, int64_t tokens_per_rank,
+                        int tp_size, const TpspChunk& chunk) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  if (tokens % tp_size != 0) {
+    const int64_t pack_elems = chunk.tokens * tp_size * width;
+    pack_tpsp_chunk<<<(pack_elems + 255) / 256, 256, 0, stream>>>(
+        a, packed, tokens, width, tokens_per_rank, chunk.tokens, chunk.offset,
+        tp_size);
+    STD_CUDA_CHECK(cudaGetLastError());
+  }
+  const auto status = tpsp_gemm(blas, sm_count_target, [&] {
+    if (tokens % tp_size == 0) {
+      return cublasGemmStridedBatchedEx(
+          blas, CUBLAS_OP_N, CUBLAS_OP_N, hidden, chunk.tokens, width, &alpha,
+          b, CUDA_R_16BF, hidden, 0, a + chunk.offset * width, CUDA_R_16BF,
+          width, tokens_per_rank * width, &beta, partial, CUDA_R_16BF, hidden,
+          chunk.tokens * hidden, tp_size, CUBLAS_COMPUTE_32F,
+          CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
+    return cublasGemmEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, hidden,
+                        chunk.tokens * tp_size, width, &alpha, b, CUDA_R_16BF,
+                        hidden, packed, CUDA_R_16BF, width, &beta, partial,
+                        CUDA_R_16BF, hidden, CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  });
+  STD_TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "TPSP BF16 GEMM failed");
+}
+
+void exchange_tpsp_shards(TpspP2pContext& context, int slot,
+                          const bf16* partial, int64_t shard_elems,
+                          cudaStream_t stream) {
+  for (int dest = 0; dest < context.tp_size; ++dest) {
+    if (dest != context.rank) {
+      STD_CUDA_CHECK(cudaMemcpyAsync(
+          context.peer_inbox(dest, slot, context.rank),
+          partial + dest * shard_elems, shard_elems * sizeof(bf16),
+          cudaMemcpyDeviceToDevice, stream));
+    }
+  }
+  notify_tpsp_peers_and_wait(context, slot, kTpspInboxReady, stream);
+}
+
+void gather_tpsp_shards(TpspP2pContext& context, int slot, int64_t token_offset,
+                        int own_tokens, cudaStream_t stream) {
+  const size_t bytes = int64_t(own_tokens) * context.hidden_size * sizeof(bf16);
+  for (int dest = 0; dest < context.tp_size; ++dest) {
+    if (dest != context.rank && bytes > 0) {
+      STD_CUDA_CHECK(cudaMemcpyAsync(context.output(dest, token_offset),
+                                     context.output(context.rank, token_offset),
+                                     bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+  }
+  notify_tpsp_peers_and_wait(context, slot, kTpspGatherReady, stream);
+}
+
+void launch_tpsp_add_norm(int norm_kind, int rows, cudaStream_t stream,
+                          const bf16* reduced, const bf16* remote,
+                          int64_t remote_stride, int rank, int tp_size,
+                          const bf16* residual, const bf16* projection_bias,
+                          const bf16* weight, const bf16* norm_bias,
+                          bf16* new_residual, bf16* normalized, int hidden,
+                          float eps) {
+  if (rows == 0) {
+    return;
+  }
+  const bool aligned =
+      hidden % 8 == 0 && ((reinterpret_cast<uintptr_t>(reduced) |
+                           reinterpret_cast<uintptr_t>(remote) |
+                           reinterpret_cast<uintptr_t>(residual) |
+                           reinterpret_cast<uintptr_t>(projection_bias) |
+                           reinterpret_cast<uintptr_t>(weight) |
+                           reinterpret_cast<uintptr_t>(norm_bias) |
+                           reinterpret_cast<uintptr_t>(new_residual) |
+                           reinterpret_cast<uintptr_t>(normalized)) &
+                          15) == 0;
+  auto kernel =
+      norm_kind == 0
+          ? (aligned ? tpsp_add_norm_vector<false> : tpsp_add_norm<false>)
+          : (aligned ? tpsp_add_norm_vector<true> : tpsp_add_norm<true>);
+  kernel<<<rows, 256, 0, stream>>>(
+      reduced, remote, remote_stride, rank, tp_size, residual, projection_bias,
+      weight, norm_bias, new_residual, normalized, hidden, eps);
+  STD_CUDA_CHECK(cudaGetLastError());
+}
+
+struct TpspShape {
+  int64_t tokens;
+  int64_t width;
+  int64_t hidden;
+  int64_t tokens_per_rank;
+};
+
+TpspShape validate_tpsp_inputs(
+    const torch::stable::Tensor& a, const torch::stable::Tensor& b,
+    const torch::stable::Tensor& weight, const torch::stable::Tensor& residual,
+    const std::optional<torch::stable::Tensor>& projection_bias,
+    const std::optional<torch::stable::Tensor>& norm_bias, double eps,
+    int64_t norm_kind, int64_t microchunk_tokens_per_rank, int64_t tp_size,
+    int64_t p2p_handle) {
+  using torch::headeronly::ScalarType;
+  STD_TORCH_CHECK(
+      a.is_cuda() && b.is_cuda() && weight.is_cuda() && residual.is_cuda(),
+      "TPSP requires CUDA tensors");
+  STD_TORCH_CHECK(a.scalar_type() == ScalarType::BFloat16 &&
+                      b.scalar_type() == ScalarType::BFloat16 &&
+                      weight.scalar_type() == ScalarType::BFloat16 &&
+                      residual.scalar_type() == ScalarType::BFloat16,
+                  "TPSP requires BF16 tensors");
+  STD_TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && weight.dim() == 1 &&
+                      residual.dim() == 2 && a.is_contiguous() &&
+                      b.is_contiguous() && weight.is_contiguous() &&
+                      residual.is_contiguous(),
+                  "TPSP requires contiguous matrices and vectors");
+  STD_TORCH_CHECK(a.device() == b.device() && a.device() == weight.device() &&
+                      a.device() == residual.device(),
+                  "TPSP tensors must reside on the same CUDA device");
+  STD_TORCH_CHECK(norm_kind == 0 || norm_kind == 1,
+                  "TPSP norm must be RMSNorm or LayerNorm");
+  STD_TORCH_CHECK(!norm_bias || norm_kind == 1,
+                  "TPSP norm bias requires LayerNorm");
+  for (const auto* bias : {&projection_bias, &norm_bias}) {
+    if (*bias) {
+      STD_TORCH_CHECK(
+          bias->value().is_cuda() &&
+              bias->value().scalar_type() == ScalarType::BFloat16 &&
+              bias->value().device() == a.device() &&
+              bias->value().is_contiguous() && bias->value().dim() == 1 &&
+              bias->value().size(0) == b.size(1),
+          "TPSP bias must be a contiguous CUDA BF16 hidden-size vector");
+    }
+  }
+  STD_TORCH_CHECK(a.size(1) == b.size(0) && b.size(1) == weight.size(0) &&
+                      tp_size >= 2 && microchunk_tokens_per_rank > 0 &&
+                      p2p_handle != 0 && eps > 0,
+                  "TPSP requires a ready P2P context and valid configuration");
+  const int64_t tokens = a.size(0);
+  const int64_t width = a.size(1);
+  const int64_t hidden = b.size(1);
+  const int64_t tokens_per_rank = (tokens + tp_size - 1) / tp_size;
+  STD_TORCH_CHECK(tokens > 0 && residual.size(0) == tokens_per_rank &&
+                      residual.size(1) == hidden,
+                  "TPSP residual shard has an unexpected shape");
+  STD_TORCH_CHECK(tokens <= INT32_MAX && width <= INT32_MAX &&
+                      hidden <= INT32_MAX && tokens_per_rank <= INT32_MAX &&
+                      microchunk_tokens_per_rank <= INT32_MAX &&
+                      tp_size <= INT32_MAX,
+                  "TPSP dimensions exceed CUDA kernel limits");
+  return {tokens, width, hidden, tokens_per_rank};
 }
 
 }  // namespace
@@ -531,26 +693,18 @@ int64_t init_tpsp_p2p(int64_t device_index, int64_t tp_size, int64_t rank,
 }
 
 torch::stable::Tensor get_tpsp_p2p_handles(int64_t handle) {
-  std::lock_guard<std::mutex> lock(tpsp_context_mutex);
-  auto it = tpsp_contexts.find(handle);
-  STD_TORCH_CHECK(it != tpsp_contexts.end(), "Invalid TPSP P2P context");
+  auto context = get_tpsp_context(handle);
   auto result = torch::stable::empty(
       {static_cast<int64_t>(sizeof(TpspIpcHandles))},
       torch::headeronly::ScalarType::Byte, std::nullopt,
       torch::stable::Device(torch::stable::DeviceType::CPU));
-  std::memcpy(result.mutable_data_ptr(), &it->second->ipc_handles,
+  std::memcpy(result.mutable_data_ptr(), &context->ipc_handles,
               sizeof(TpspIpcHandles));
   return result;
 }
 
 bool map_tpsp_p2p(int64_t handle, const torch::stable::Tensor& peer_handles) {
-  std::shared_ptr<TpspP2pContext> context;
-  {
-    std::lock_guard<std::mutex> lock(tpsp_context_mutex);
-    auto it = tpsp_contexts.find(handle);
-    STD_TORCH_CHECK(it != tpsp_contexts.end(), "Invalid TPSP P2P context");
-    context = it->second;
-  }
+  auto context = get_tpsp_context(handle);
   STD_TORCH_CHECK(
       peer_handles.device().is_cpu() &&
           peer_handles.scalar_type() == torch::headeronly::ScalarType::Byte &&
@@ -600,13 +754,7 @@ bool map_tpsp_p2p(int64_t handle, const torch::stable::Tensor& peer_handles) {
 
 // Python synchronizes the control group before and after destruction.
 void destroy_tpsp_p2p(int64_t handle) {
-  std::shared_ptr<TpspP2pContext> context;
-  {
-    std::lock_guard<std::mutex> lock(tpsp_context_mutex);
-    auto it = tpsp_contexts.find(handle);
-    STD_TORCH_CHECK(it != tpsp_contexts.end(), "Invalid TPSP P2P context");
-    context = it->second;
-  }
+  auto context = get_tpsp_context(handle);
   const torch::stable::accelerator::DeviceGuard guard(context->device_index);
   STD_CUDA_CHECK(cudaDeviceSynchronize());
   context->close_peer_mappings();
@@ -618,9 +766,9 @@ void destroy_tpsp_p2p(int64_t handle) {
 // Fused TPSP execution
 //
 // Processes each chunk through projection, reduction, residual addition,
-// normalization, and gather. Returns updated residual, local normalized
-// shards, and the gathered normalized output.
-std::tuple<torch::stable::Tensor, torch::stable::Tensor, torch::stable::Tensor>
+// normalization, and gather. Returns the updated residual shard and gathered
+// normalized output. The gathered output is borrowed until the next TPSP call.
+std::tuple<torch::stable::Tensor, torch::stable::Tensor>
 tpsp_fused_matmul_reduce_scatter_norm_all_gather(
     const torch::stable::Tensor& a, const torch::stable::Tensor& b,
     const torch::stable::Tensor& weight, const torch::stable::Tensor& residual,
@@ -628,55 +776,9 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
     const std::optional<torch::stable::Tensor>& norm_bias, double eps,
     int64_t norm_kind, int64_t microchunk_tokens_per_rank, int64_t tp_size,
     int64_t p2p_handle, int64_t sm_count_target) {
-  using torch::headeronly::ScalarType;
-  STD_TORCH_CHECK(
-      a.is_cuda() && b.is_cuda() && weight.is_cuda() && residual.is_cuda(),
-      "TPSP requires CUDA tensors");
-  STD_TORCH_CHECK(a.scalar_type() == ScalarType::BFloat16 &&
-                      b.scalar_type() == ScalarType::BFloat16 &&
-                      weight.scalar_type() == ScalarType::BFloat16 &&
-                      residual.scalar_type() == ScalarType::BFloat16,
-                  "TPSP requires BF16 tensors");
-  STD_TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && weight.dim() == 1 &&
-                      residual.dim() == 2 && a.is_contiguous() &&
-                      b.is_contiguous() && weight.is_contiguous() &&
-                      residual.is_contiguous(),
-                  "TPSP requires contiguous matrices and vectors");
-  STD_TORCH_CHECK(a.device() == b.device() && a.device() == weight.device() &&
-                      a.device() == residual.device(),
-                  "TPSP tensors must reside on the same CUDA device");
-  STD_TORCH_CHECK(norm_kind == 0 || norm_kind == 1,
-                  "TPSP norm must be RMSNorm or LayerNorm");
-  STD_TORCH_CHECK(!norm_bias || norm_kind == 1,
-                  "TPSP norm bias requires LayerNorm");
-  for (const auto* bias : {&projection_bias, &norm_bias}) {
-    if (*bias) {
-      STD_TORCH_CHECK(
-          bias->value().is_cuda() &&
-              bias->value().scalar_type() == ScalarType::BFloat16 &&
-              bias->value().device() == a.device() &&
-              bias->value().is_contiguous() && bias->value().dim() == 1 &&
-              bias->value().size(0) == b.size(1),
-          "TPSP bias must be a contiguous CUDA BF16 hidden-size vector");
-    }
-  }
-  STD_TORCH_CHECK(a.size(1) == b.size(0) && b.size(1) == weight.size(0) &&
-                      tp_size >= 2 && microchunk_tokens_per_rank > 0 &&
-                      p2p_handle != 0 && eps > 0,
-                  "TPSP requires a ready P2P context and valid configuration");
-  int64_t tokens = a.size(0);
-  int64_t width = a.size(1);
-  int64_t hidden = b.size(1);
-  int64_t tokens_per_rank = (tokens + tp_size - 1) / tp_size;
-  STD_TORCH_CHECK(tokens > 0 && residual.size(0) == tokens_per_rank &&
-                      residual.size(1) == hidden,
-                  "TPSP residual shard has an unexpected shape");
-  STD_TORCH_CHECK(tokens <= INT32_MAX && width <= INT32_MAX &&
-                      hidden <= INT32_MAX && tokens_per_rank <= INT32_MAX &&
-                      microchunk_tokens_per_rank <= INT32_MAX &&
-                      tp_size <= INT32_MAX,
-                  "TPSP dimensions exceed CUDA kernel limits");
-
+  const auto [tokens, width, hidden, tokens_per_rank] = validate_tpsp_inputs(
+      a, b, weight, residual, projection_bias, norm_bias, eps, norm_kind,
+      microchunk_tokens_per_rank, tp_size, p2p_handle);
   const torch::stable::accelerator::DeviceGuard guard(a.get_device_index());
   int sm_count;
   STD_CUDA_CHECK(cudaDeviceGetAttribute(
@@ -685,38 +787,18 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
                   "TPSP cuBLAS SM target exceeds device capacity");
   cudaStream_t stream = get_current_cuda_stream();
   cublasHandle_t blas = get_current_cuda_blas_handle();
-  const int64_t target_microchunk_tokens_per_rank =
-      std::min(tokens_per_rank, microchunk_tokens_per_rank);
-  auto microchunk_sizes_per_rank = make_tpsp_microchunk_sizes_per_rank(
-      tokens_per_rank, target_microchunk_tokens_per_rank);
-  int64_t max_microchunk_tokens_per_rank = *std::max_element(
-      microchunk_sizes_per_rank.begin(), microchunk_sizes_per_rank.end());
-  int64_t num_chunks = microchunk_sizes_per_rank.size();
-  std::shared_ptr<TpspP2pContext> p2p_context;
-  {
-    std::lock_guard<std::mutex> lock(tpsp_context_mutex);
-    auto it = tpsp_contexts.find(p2p_handle);
-    STD_TORCH_CHECK(it != tpsp_contexts.end(), "Invalid TPSP P2P context");
-    p2p_context = it->second;
-  }
-  if (max_microchunk_tokens_per_rank >
-      p2p_context->max_microchunk_tokens_per_rank) {
-    microchunk_sizes_per_rank = make_tpsp_microchunk_sizes_per_rank(
-        tokens_per_rank, target_microchunk_tokens_per_rank, false);
-    max_microchunk_tokens_per_rank = *std::max_element(
-        microchunk_sizes_per_rank.begin(), microchunk_sizes_per_rank.end());
-    num_chunks = microchunk_sizes_per_rank.size();
-  }
-  STD_TORCH_CHECK(p2p_context->device_index == a.get_device_index() &&
-                      p2p_context->tp_size == tp_size &&
-                      p2p_context->hidden_size == hidden &&
-                      max_microchunk_tokens_per_rank <=
-                          p2p_context->max_microchunk_tokens_per_rank &&
-                      p2p_context->mapped,
-                  "TPSP P2P context does not match the request");
-  char* local_base = reinterpret_cast<char*>(p2p_context->workspace);
-  int64_t slot_bytes = p2p_context->slot_bytes;
-  int64_t pipeline_slot_bytes = p2p_context->pipeline_slot_bytes;
+  auto p2p_context = get_tpsp_context(p2p_handle);
+  const auto plan =
+      make_tpsp_chunk_plan(tokens_per_rank, microchunk_tokens_per_rank,
+                           p2p_context->max_microchunk_tokens_per_rank);
+  const int64_t num_chunks = plan.chunks.size();
+  STD_TORCH_CHECK(
+      p2p_context->device_index == a.get_device_index() &&
+          p2p_context->tp_size == tp_size &&
+          p2p_context->hidden_size == hidden &&
+          plan.max_tokens <= p2p_context->max_microchunk_tokens_per_rank &&
+          p2p_context->mapped,
+      "TPSP P2P context does not match the request");
   int rank = p2p_context->rank;
   PipelineState* pipeline = nullptr;
   if (num_chunks > 1) {
@@ -731,28 +813,23 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
       "TPSP direct P2P output exceeds workspace capacity");
   std::vector<ChunkBuffers> buffers;
   int buffer_slots = pipeline ? kTpspDirectPipelineSlots : 1;
+  const bool needs_packing = tokens % tp_size != 0;
   for (int slot = 0; slot < buffer_slots; ++slot) {
     buffers.push_back({
-        make_bf16(a, max_microchunk_tokens_per_rank * tp_size, width),
-        make_bf16(a, max_microchunk_tokens_per_rank * tp_size, hidden),
+        needs_packing
+            ? std::make_optional(make_bf16(a, plan.max_tokens * tp_size, width))
+            : std::nullopt,
+        make_bf16(a, plan.max_tokens * tp_size, hidden),
     });
   }
   auto new_residual = make_bf16(a, tokens_per_rank, hidden);
   auto gathered =
       make_p2p_output(a, p2p_context->output_workspace, tokens, hidden);
-  bool direct_output_alias = tokens % tp_size == 0;
-  auto normalized =
-      direct_output_alias
-          ? torch::stable::narrow(gathered, 0, rank * tokens_per_rank,
-                                  tokens_per_rank)
-          : make_bf16(a, tokens_per_rank, hidden);
-
   auto* a_ptr = reinterpret_cast<const bf16*>(a.const_data_ptr());
   auto* b_ptr = reinterpret_cast<const bf16*>(b.const_data_ptr());
   auto* residual_ptr = reinterpret_cast<const bf16*>(residual.const_data_ptr());
   auto* new_residual_ptr =
       reinterpret_cast<bf16*>(new_residual.mutable_data_ptr());
-  auto* output_ptr = reinterpret_cast<bf16*>(gathered.mutable_data_ptr());
   auto* weight_ptr = reinterpret_cast<const bf16*>(weight.const_data_ptr());
   auto* projection_bias_ptr =
       projection_bias
@@ -761,21 +838,9 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
   auto* norm_bias_ptr =
       norm_bias ? reinterpret_cast<const bf16*>(norm_bias->const_data_ptr())
                 : nullptr;
-  constexpr int threads = 256;
-  const float alpha = 1.0f;
-  const float beta = 0.0f;
-  std::vector<int64_t> microchunk_offsets_per_rank;
-  microchunk_offsets_per_rank.reserve(num_chunks);
-  int64_t next_token_offset_per_rank = 0;
-  for (int64_t microchunk_tokens_per_rank : microchunk_sizes_per_rank) {
-    microchunk_offsets_per_rank.push_back(next_token_offset_per_rank);
-    next_token_offset_per_rank += microchunk_tokens_per_rank;
-  }
-  STD_TORCH_CHECK(next_token_offset_per_rank == tokens_per_rank,
-                  "TPSP chunk schedule is incomplete");
-
   for (int64_t chunk_index = 0; chunk_index < num_chunks; ++chunk_index) {
-    int64_t offset = microchunk_offsets_per_rank[chunk_index];
+    const auto& chunk = plan.chunks[chunk_index];
+    int64_t offset = chunk.offset;
     int slot = static_cast<int>(chunk_index % buffers.size());
     if (pipeline && chunk_index >= int64_t(buffers.size())) {
       STD_CUDA_CHECK(
@@ -783,49 +848,15 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
     }
     auto& scratch = buffers[slot];
     auto* packed_ptr =
-        reinterpret_cast<bf16*>(scratch.packed.mutable_data_ptr());
+        scratch.packed
+            ? reinterpret_cast<bf16*>(scratch.packed->mutable_data_ptr())
+            : nullptr;
     auto* partial_ptr =
         reinterpret_cast<bf16*>(scratch.partial.mutable_data_ptr());
-    int current_microchunk_tokens_per_rank =
-        static_cast<int>(microchunk_sizes_per_rank[chunk_index]);
-    auto* p2p_slot_base = local_base + slot * pipeline_slot_bytes;
-    auto* local_inbox = reinterpret_cast<bf16*>(p2p_slot_base);
     // Stage 1: Project each rank's input tokens; pack only for uneven shards.
-    if (tokens % tp_size == 0) {
-      STD_TORCH_CHECK(
-          tpsp_gemm(blas, sm_count_target,
-                    [&] {
-                      return cublasGemmStridedBatchedEx(
-                          blas, CUBLAS_OP_N, CUBLAS_OP_N, hidden,
-                          current_microchunk_tokens_per_rank, width, &alpha,
-                          b_ptr, CUDA_R_16BF, hidden, 0, a_ptr + offset * width,
-                          CUDA_R_16BF, width, tokens_per_rank * width, &beta,
-                          partial_ptr, CUDA_R_16BF, hidden,
-                          int64_t(current_microchunk_tokens_per_rank) * hidden,
-                          tp_size, CUBLAS_COMPUTE_32F,
-                          CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-                    }) == CUBLAS_STATUS_SUCCESS,
-          "TPSP BF16 batched GEMM failed");
-    } else {
-      int64_t pack_elems = current_microchunk_tokens_per_rank * tp_size * width;
-      pack_tpsp_chunk<<<(pack_elems + threads - 1) / threads, threads, 0,
-                        stream>>>(
-          a_ptr, packed_ptr, tokens, width, tokens_per_rank,
-          current_microchunk_tokens_per_rank, offset, tp_size);
-      STD_CUDA_CHECK(cudaGetLastError());
-      STD_TORCH_CHECK(
-          tpsp_gemm(blas, sm_count_target,
-                    [&] {
-                      return cublasGemmEx(
-                          blas, CUBLAS_OP_N, CUBLAS_OP_N, hidden,
-                          current_microchunk_tokens_per_rank * tp_size, width,
-                          &alpha, b_ptr, CUDA_R_16BF, hidden, packed_ptr,
-                          CUDA_R_16BF, width, &beta, partial_ptr, CUDA_R_16BF,
-                          hidden, CUBLAS_COMPUTE_32F,
-                          CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-                    }) == CUBLAS_STATUS_SUCCESS,
-          "TPSP BF16 GEMM failed");
-    }
+    project_tpsp_chunk(blas, stream, sm_count_target, a_ptr, b_ptr, packed_ptr,
+                       partial_ptr, tokens, width, hidden, tokens_per_rank,
+                       tp_size, chunk);
     cudaStream_t comm_stream = pipeline ? pipeline->comm_stream : stream;
     if (pipeline) {
       STD_CUDA_CHECK(
@@ -833,98 +864,28 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
       STD_CUDA_CHECK(cudaStreamWaitEvent(comm_stream,
                                          pipeline->gemm_ready[slot].handle, 0));
     }
-    int64_t shard_elems = int64_t(current_microchunk_tokens_per_rank) * hidden;
-    size_t shard_bytes = shard_elems * sizeof(bf16);
+    int64_t shard_elems = chunk.tokens * hidden;
     // Stage 2: Exchange projected shards through peer workspaces.
-    for (int dest = 0; dest < tp_size; ++dest) {
-      if (dest == rank) {
-        continue;
-      }
-      auto* peer_base = reinterpret_cast<char*>(p2p_context->peers[dest]);
-      STD_CUDA_CHECK(cudaMemcpyAsync(
-          peer_base + slot * pipeline_slot_bytes + rank * slot_bytes,
-          partial_ptr + dest * shard_elems, shard_bytes,
-          cudaMemcpyDeviceToDevice, comm_stream));
-    }
-    notify_tpsp_peers_and_wait(*p2p_context, slot, kTpspInboxReady,
-                               comm_stream);
+    exchange_tpsp_shards(*p2p_context, slot, partial_ptr, shard_elems,
+                         comm_stream);
 
     auto* residual_chunk = residual_ptr + offset * hidden;
     auto* new_residual_chunk = new_residual_ptr + offset * hidden;
-    int own_tokens_per_rank = std::max(
-        0,
-        std::min(current_microchunk_tokens_per_rank,
-                 static_cast<int>(tokens - rank * tokens_per_rank - offset)));
-    auto* normalized_chunk =
-        output_ptr + (int64_t(rank) * tokens_per_rank + offset) * hidden;
+    int own_tokens_per_rank = std::max<int64_t>(
+        0, std::min(chunk.tokens, tokens - rank * tokens_per_rank - offset));
+    const int64_t token_offset = int64_t(rank) * tokens_per_rank + offset;
+    auto* normalized_chunk = p2p_context->output(rank, token_offset);
     auto* reduced_ptr = partial_ptr + rank * shard_elems;
-    auto* remote_ptr = local_inbox;
-    int64_t remote_stride = slot_bytes / sizeof(bf16);
     // Stage 3: Fuse the P2P sum, biases, residual add, and normalization.
-    bool aligned =
-        hidden % 8 == 0 && ((reinterpret_cast<uintptr_t>(reduced_ptr) |
-                             reinterpret_cast<uintptr_t>(remote_ptr) |
-                             reinterpret_cast<uintptr_t>(residual_chunk) |
-                             reinterpret_cast<uintptr_t>(weight_ptr) |
-                             reinterpret_cast<uintptr_t>(projection_bias_ptr) |
-                             reinterpret_cast<uintptr_t>(norm_bias_ptr) |
-                             reinterpret_cast<uintptr_t>(new_residual_chunk) |
-                             reinterpret_cast<uintptr_t>(normalized_chunk)) &
-                            15) == 0;
-    if (own_tokens_per_rank != 0) {
-      if (aligned) {
-        if (norm_kind == 0) {
-          tpsp_add_norm_vector<false>
-              <<<own_tokens_per_rank, threads, 0, comm_stream>>>(
-                  reduced_ptr, remote_ptr, remote_stride, rank, tp_size,
-                  residual_chunk, projection_bias_ptr, weight_ptr,
-                  norm_bias_ptr, new_residual_chunk, normalized_chunk, hidden,
-                  static_cast<float>(eps));
-        } else {
-          tpsp_add_norm_vector<true>
-              <<<own_tokens_per_rank, threads, 0, comm_stream>>>(
-                  reduced_ptr, remote_ptr, remote_stride, rank, tp_size,
-                  residual_chunk, projection_bias_ptr, weight_ptr,
-                  norm_bias_ptr, new_residual_chunk, normalized_chunk, hidden,
-                  static_cast<float>(eps));
-        }
-      } else {
-        if (norm_kind == 0) {
-          tpsp_add_norm<false>
-              <<<own_tokens_per_rank, threads, 0, comm_stream>>>(
-                  reduced_ptr, remote_ptr, remote_stride, rank, tp_size,
-                  residual_chunk, projection_bias_ptr, weight_ptr,
-                  norm_bias_ptr, new_residual_chunk, normalized_chunk, hidden,
-                  static_cast<float>(eps));
-        } else {
-          tpsp_add_norm<true><<<own_tokens_per_rank, threads, 0, comm_stream>>>(
-              reduced_ptr, remote_ptr, remote_stride, rank, tp_size,
-              residual_chunk, projection_bias_ptr, weight_ptr, norm_bias_ptr,
-              new_residual_chunk, normalized_chunk, hidden,
-              static_cast<float>(eps));
-        }
-      }
-      STD_CUDA_CHECK(cudaGetLastError());
-    }
+    launch_tpsp_add_norm(norm_kind, own_tokens_per_rank, comm_stream,
+                         reduced_ptr, p2p_context->peer_inbox(rank, slot, 0),
+                         p2p_context->slot_bytes / sizeof(bf16), rank, tp_size,
+                         residual_chunk, projection_bias_ptr, weight_ptr,
+                         norm_bias_ptr, new_residual_chunk, normalized_chunk,
+                         hidden, static_cast<float>(eps));
     // Stage 4: All-gather normalized shards.
-    for (int dest = 0; dest < tp_size; ++dest) {
-      if (dest == rank) {
-        continue;
-      }
-      size_t gather_bytes =
-          int64_t(own_tokens_per_rank) * hidden * sizeof(bf16);
-      if (gather_bytes == 0) {
-        continue;
-      }
-      auto* gather_destination =
-          reinterpret_cast<bf16*>(p2p_context->output_peers[dest]) +
-          (int64_t(rank) * tokens_per_rank + offset) * hidden;
-      STD_CUDA_CHECK(cudaMemcpyAsync(gather_destination, normalized_chunk,
-                                     gather_bytes, cudaMemcpyDeviceToDevice,
-                                     comm_stream));
-    }
-    notify_tpsp_peers_and_wait(*p2p_context, slot, kTpspGatherReady,
-                               comm_stream);
+    gather_tpsp_shards(*p2p_context, slot, token_offset, own_tokens_per_rank,
+                       comm_stream);
     if (pipeline) {
       STD_CUDA_CHECK(
           cudaEventRecord(pipeline->comm_done[slot].handle, comm_stream));
@@ -935,5 +896,5 @@ tpsp_fused_matmul_reduce_scatter_norm_all_gather(
         stream, pipeline->comm_done[(num_chunks - 1) % buffers.size()].handle,
         0));
   }
-  return {new_residual, normalized, gathered};
+  return {new_residual, gathered};
 }
