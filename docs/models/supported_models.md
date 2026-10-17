@@ -67,6 +67,8 @@ Transformers backend.
 During model construction, the CUDA backend opens one shared P2P workspace for
 both projection groups. Configuration runs after weight loading and does not
 allocate another P2P workspace.
+This stage also prepares contiguous transposed weights for every fused projection.
+Forward calls reuse these copies without checking for weight changes.
 
 The CUDA backend profiles per-projection microchunk sizes and SM counts, then
 selects a shared activation threshold. Profiling includes coarse screening,

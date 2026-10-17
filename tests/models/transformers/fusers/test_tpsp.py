@@ -86,6 +86,7 @@ class ReferenceBackend:
         self.output = None
         self.open = Mock(return_value=True)
         self.close = Mock()
+        self.prepare_weights = Mock()
         self.profile = Mock(
             return_value=TPSPContext(
                 TPSPProfile(True, 4, 32), self, {"o_proj": "o", "down_proj": "down"}
@@ -172,10 +173,18 @@ def test_adapter_opens_before_weights_and_profiles_only_once(install):
         device=torch.device("cpu"),
     )
     backend.profile.assert_not_called()
+    backend.prepare_weights.assert_not_called()
     model.to_empty(device="cpu")
     adapter.profile()
     adapter.profile()
     backend.profile.assert_called_once()
+    backend.prepare_weights.assert_called_once_with(
+        [
+            projection
+            for layer in model.layers
+            for projection in (layer.attention.o_proj, layer.mlp.down_proj)
+        ]
+    )
     backend.open.assert_called_once()
 
 
@@ -296,6 +305,35 @@ def test_cuda_tpsp_configures_context_without_fetching_workspace(
     backend.set_config(context, 4)
     assert context.config.microchunk_tokens_per_rank == 4
     fetch.assert_not_called()
+
+
+def test_cuda_tpsp_reuses_prepared_transposed_weights(cuda_tpsp_backend):
+    backend, settings, native = cuda_tpsp_backend
+    backend.open(**settings)
+    context = backend._create_context()
+    backend.set_config(context, 4)
+    projection = nn.Linear(8, 16)
+    norm = nn.LayerNorm(16)
+    backend.prepare_weights([projection])
+    transposed = projection._tpsp_transposed_weight
+    torch.testing.assert_close(transposed, projection.weight.T)
+    assert transposed.is_contiguous() and not transposed.requires_grad
+    native.tpsp_fused_matmul_reduce_scatter_norm_all_gather.return_value = (
+        torch.empty(4, 16),
+        None,
+        torch.empty(8, 16),
+    )
+    for _ in range(2):
+        backend.fused_gemm_rs_norm_ag(
+            context,
+            torch.randn(8, 8),
+            projection,
+            torch.randn(4, 16),
+            norm,
+            norm_type="layer_norm",
+        )
+    for call in native.tpsp_fused_matmul_reduce_scatter_norm_all_gather.call_args_list:
+        assert call.args[1] is transposed
 
 
 def test_cuda_tpsp_requires_open_before_configuring_ops(cuda_tpsp_backend):
