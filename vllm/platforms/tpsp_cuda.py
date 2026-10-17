@@ -274,17 +274,8 @@ class CudaTPSPBackend(TPSPBackend):
         norm_type: TPSPNormType = "rms_norm",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run sequentially; consume gathered output before the next TPSP call."""
-        if self._closed:
-            raise RuntimeError("TPSP backend is closed")
-        if norm_type not in self.supported_norm_types:
-            raise ValueError(f"CUDA TPSP does not support norm type {norm_type}")
         context = self._profile_context(projection_context)
         workspace = self._get_workspace()
-        hidden_size = norm.weight.numel()
-        tokens_per_rank = (x.size(0) + workspace.tp_size - 1) // workspace.tp_size
-        if residual.shape != (tokens_per_rank, hidden_size):
-            raise RuntimeError("TPSP residual shard has an unexpected shape")
-        local_residual = residual
 
         weight = projection.weight
         key = (weight.data_ptr(), weight._version)
@@ -302,43 +293,12 @@ class CudaTPSPBackend(TPSPBackend):
         )
         microchunk_tokens_per_rank = selected.microchunk_tokens_per_rank
         p2p_handle = workspace.p2p_handle
-        if (
-            min(
-                (a.size(0) + workspace.tp_size - 1) // workspace.tp_size,
-                microchunk_tokens_per_rank,
-            )
-            > workspace.max_microchunk_tokens_per_rank
-        ):
-            raise ValueError("CUDA TPSP microchunk exceeds P2P workspace capacity")
-        if eps <= 0 or (norm_bias is not None and norm_type != "layer_norm"):
-            raise ValueError("Invalid CUDA TPSP normalization or chunk configuration")
-        if (
-            any(
-                t.dtype != torch.bfloat16 or t.device != self.device
-                for t in (a, b, norm_weight, local_residual)
-            )
-            or a.ndim != 2
-            or b.ndim != 2
-            or norm_weight.ndim != 1
-            or local_residual.ndim != 2
-            or a.shape[1] != b.shape[0]
-            or b.shape[1] != norm_weight.numel()
-        ):
-            raise ValueError("CUDA TPSP requires compatible CUDA BF16 inputs")
-        for bias in (projection_bias, norm_bias):
-            if bias is not None and (
-                bias.dtype != torch.bfloat16
-                or bias.device != self.device
-                or bias.shape != norm_weight.shape
-                or not bias.is_contiguous()
-            ):
-                raise ValueError("CUDA TPSP bias must match the BF16 norm weight")
         reduced, _, gathered = (
             torch.ops._C.tpsp_fused_matmul_reduce_scatter_norm_all_gather(
                 a,
                 b,
                 norm_weight,
-                local_residual,
+                residual,
                 projection_bias,
                 norm_bias,
                 eps,
