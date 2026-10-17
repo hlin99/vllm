@@ -126,8 +126,7 @@ class TPSPBackend(ABC):
         """Initialize backend resources once, before configuring ops groups."""
 
     @abstractmethod
-    def create_context(self) -> object:
-        """Create independent ops configuration using an already-open backend."""
+    def close(self, context: Any | None = None) -> None: ...
 
     @abstractmethod
     def profile(
@@ -152,6 +151,23 @@ class TPSPBackend(ABC):
         """
 
     @abstractmethod
+    def fused_gemm_rs_norm_ag(
+        self,
+        projection_context: object,
+        x: torch.Tensor,
+        projection: nn.Module,
+        residual: torch.Tensor,
+        norm: nn.Module,
+        *,
+        config: object | None = None,
+        norm_type: TPSPNormType = "rms_norm",
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    @abstractmethod
+    def create_context(self) -> object:
+        """Create independent ops configuration using an already-open backend."""
+
+    @abstractmethod
     def set_config(self, handle: object, config: object) -> None: ...
 
     def get_tuning_configs(
@@ -174,25 +190,6 @@ class TPSPBackend(ABC):
     def get_default_compute_engine_count(self) -> int | None:
         """Return the backend's default-selection sentinel, if it has one."""
         return None
-
-    def get_max_microchunk_tokens_per_rank(self) -> int | None:
-        return self.tpsp_max_microchunk_tokens_per_rank
-
-    @abstractmethod
-    def fused_gemm_rs_norm_ag(
-        self,
-        projection_context: object,
-        x: torch.Tensor,
-        projection: nn.Module,
-        residual: torch.Tensor,
-        norm: nn.Module,
-        *,
-        config: object | None = None,
-        norm_type: TPSPNormType = "rms_norm",
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-    @abstractmethod
-    def close(self, context: Any | None = None) -> None: ...
 
 
 @dataclass
@@ -759,7 +756,7 @@ def _microchunk_tokens_per_rank(
     if type(tp_size) is not int or tp_size <= 0:
         raise ValueError("TPSP TP size must be a positive integer")
     tokens_per_rank = math.ceil(microchunk_tokens / tp_size)
-    max_tokens_per_rank = backend.get_max_microchunk_tokens_per_rank()
+    max_tokens_per_rank = backend.tpsp_max_microchunk_tokens_per_rank
     if max_tokens_per_rank is not None:
         tokens_per_rank = min(tokens_per_rank, max_tokens_per_rank)
     return tokens_per_rank
@@ -1042,7 +1039,7 @@ def _scan_microchunk(
     # Stage 1 screens the selected chunk/count candidates at full load.
     screening_inputs = make_inputs(max_batched_tokens)
     supported_max_microchunk_tokens_per_rank = math.ceil(max_batched_tokens / tp_size)
-    cap_tokens_per_rank = backend.get_max_microchunk_tokens_per_rank()
+    cap_tokens_per_rank = backend.tpsp_max_microchunk_tokens_per_rank
     if cap_tokens_per_rank is not None:
         supported_max_microchunk_tokens_per_rank = min(
             supported_max_microchunk_tokens_per_rank, cap_tokens_per_rank

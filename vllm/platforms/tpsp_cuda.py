@@ -71,81 +71,6 @@ class CudaTPSPBackend(TPSPBackend):
         self._open_contexts: dict[int, CudaTPSPContext] = {}
         self._workspace: CudaTPSPWorkspace | None = None
 
-    def profile(
-        self,
-        ops_groups: Sequence[TPSPOpsGroup],
-        max_batched_tokens: int,
-        *,
-        microchunk_tokens: int | None = None,
-        threshold_tokens: int | None = None,
-        compute_engine_count_min: int | Mapping[str, int] | None = None,
-        compute_engine_count_max: int | Mapping[str, int] | None = None,
-        compute_engine_step_coarse: int = 6,
-        compute_engine_step_fine: int = 1,
-        microchunk_tokens_per_rank_min_max: (
-            tuple[int, int] | Mapping[str, tuple[int, int]] | None
-        ) = None,
-        microchunk_step_coarse_per_rank: int = 256,
-        microchunk_step_fine_per_rank: int = 64,
-    ) -> TPSPContext | None:
-        """Profile chunk/SM configurations and threshold, honoring token overrides."""
-        from vllm.distributed.parallel_state import get_tp_group
-
-        tp_size = get_tp_group().world_size
-        if (
-            (microchunk_tokens is None or threshold_tokens is None)
-            and compute_engine_count_min is None
-            and compute_engine_count_max is None
-        ):
-            sm_count = torch.cuda.get_device_properties(
-                self.device
-            ).multi_processor_count
-            compute_engine_count_min = {
-                entry.name: _compute_engine_count_min(entry.name, sm_count)
-                for entry in ops_groups
-            }
-            compute_engine_count_max = {entry.name: sm_count for entry in ops_groups}
-        if (
-            microchunk_tokens_per_rank_min_max is None
-            and microchunk_tokens is None
-            and type(max_batched_tokens) is int
-            and max_batched_tokens > 0
-        ):
-            microchunk_tokens_per_rank_min_max = self._microchunk_tokens_per_rank_range(
-                max_batched_tokens, tp_size
-            )
-        return profile_tpsp(
-            self,
-            ops_groups,
-            max_batched_tokens,
-            microchunk_tokens=microchunk_tokens,
-            threshold_tokens=threshold_tokens,
-            compute_engine_count_min=compute_engine_count_min,
-            compute_engine_count_max=compute_engine_count_max,
-            compute_engine_step_coarse=compute_engine_step_coarse,
-            compute_engine_step_fine=compute_engine_step_fine,
-            microchunk_tokens_per_rank_min_max=microchunk_tokens_per_rank_min_max,
-            microchunk_step_coarse_per_rank=microchunk_step_coarse_per_rank,
-            microchunk_step_fine_per_rank=microchunk_step_fine_per_rank,
-        )
-
-    def _microchunk_tokens_per_rank_range(
-        self, max_batched_tokens: int, tp_size: int
-    ) -> tuple[int, int]:
-        max_tokens_per_rank = math.ceil(max_batched_tokens / tp_size)
-        cap_tokens_per_rank = self.get_max_microchunk_tokens_per_rank()
-        if cap_tokens_per_rank is not None:
-            max_tokens_per_rank = min(max_tokens_per_rank, cap_tokens_per_rank)
-        return min(64, max_tokens_per_rank), max_tokens_per_rank
-
-    def get_compute_engine_count(self, config: object) -> int | None:
-        if isinstance(config, CudaTPSPConfig):
-            return config.sm_count_target
-        return None
-
-    def get_default_compute_engine_count(self) -> int:
-        return 0
-
     def open(
         self,
         *,
@@ -218,7 +143,7 @@ class CudaTPSPBackend(TPSPBackend):
             return False
         rank = dist.get_rank(group)
         max_microchunk_tokens_per_rank = math.ceil(max_batched_tokens / tp_size)
-        max_microchunk_cap = self.get_max_microchunk_tokens_per_rank()
+        max_microchunk_cap = self.tpsp_max_microchunk_tokens_per_rank
         if max_microchunk_cap is not None:
             max_microchunk_tokens_per_rank = min(
                 max_microchunk_tokens_per_rank, max_microchunk_cap
@@ -266,82 +191,77 @@ class CudaTPSPBackend(TPSPBackend):
         self._workspace = context
         return True
 
-    def _get_workspace(self) -> CudaTPSPWorkspace:
-        if self._closed:
-            raise RuntimeError("TPSP backend is closed")
-        if self._workspace is None:
-            raise RuntimeError("TPSP backend must be opened before use")
-        return self._workspace
-
-    def create_context(self) -> CudaTPSPContext:
-        self._get_workspace()
-        context = CudaTPSPContext()
-        self._open_contexts[id(context)] = context
-        return context
-
-    @staticmethod
-    def _all_ranks_ready(ready: bool, group: dist.ProcessGroup) -> bool:
-        supported = torch.tensor(int(ready), device="cpu")
-        dist.all_reduce(supported, op=dist.ReduceOp.MIN, group=group)
-        return bool(supported.item())
-
-    def _profile_context(self, context: object) -> CudaTPSPContext:
-        self._get_workspace()
-        if context is None:
-            raise ValueError("CUDA TPSP requires a projection context")
-        if (
-            not isinstance(context, CudaTPSPContext)
-            or self._open_contexts.get(id(context)) is not context
-        ):
-            raise ValueError("CUDA TPSP context belongs to another backend")
-        return context
-
-    def set_config(self, handle: object, config: object) -> None:
-        context = self._profile_context(handle)
-        context.config = self._resolve_config(context, config)
-
-    def _resolve_config(
-        self, context: CudaTPSPContext, config: object
-    ) -> CudaTPSPConfig:
-        if type(config) is int:
-            config = CudaTPSPConfig(config)
-        if (
-            not isinstance(config, CudaTPSPConfig)
-            or type(config.microchunk_tokens_per_rank) is not int
-            or config.microchunk_tokens_per_rank <= 0
-            or type(config.sm_count_target) is not int
-            or config.sm_count_target < 0
-        ):
-            raise ValueError("Invalid CUDA TPSP tuning configuration")
-        return config
-
-    def get_tuning_configs(
-        self,
-        handle: object,
-        microchunk_tokens_per_rank: int,
-        group_name: str | None = None,
-        *,
-        compute_engine_counts: Sequence[int] | None = None,
-        compute_engine_step: int = 6,
-    ) -> tuple[CudaTPSPConfig, ...]:
-        self._profile_context(handle)
-        if type(compute_engine_step) is not int or compute_engine_step <= 0:
-            raise ValueError("Compute-engine scan step must be positive")
-        sm_count = torch.cuda.get_device_properties(self.device).multi_processor_count
-        if compute_engine_counts is not None:
-            targets = tuple(dict.fromkeys(compute_engine_counts))
+    def close(self, context: object | None = None) -> None:
+        if context is not None:
+            context = self._profile_context(context)
+            del self._open_contexts[id(context)]
         else:
-            start = _compute_engine_count_min(group_name, sm_count)
-            values = list(range(start, sm_count + 1, compute_engine_step))
-            if values[-1] != sm_count:
-                values.append(sm_count)
-            targets = tuple(dict.fromkeys((0, *values)))
-        if not targets or any(
-            type(target) is not int or not 0 <= target <= sm_count for target in targets
+            workspace = self._workspace
+            if workspace is not None:
+                torch.cuda.synchronize(workspace.device)
+                dist.barrier(group=workspace.control_group)
+                torch.ops._C.destroy_tpsp_p2p(workspace.p2p_handle)
+                dist.barrier(group=workspace.control_group)
+                self._workspace = None
+            self._open_contexts.clear()
+            self._closed = True
+
+    def profile(
+        self,
+        ops_groups: Sequence[TPSPOpsGroup],
+        max_batched_tokens: int,
+        *,
+        microchunk_tokens: int | None = None,
+        threshold_tokens: int | None = None,
+        compute_engine_count_min: int | Mapping[str, int] | None = None,
+        compute_engine_count_max: int | Mapping[str, int] | None = None,
+        compute_engine_step_coarse: int = 6,
+        compute_engine_step_fine: int = 1,
+        microchunk_tokens_per_rank_min_max: (
+            tuple[int, int] | Mapping[str, tuple[int, int]] | None
+        ) = None,
+        microchunk_step_coarse_per_rank: int = 256,
+        microchunk_step_fine_per_rank: int = 64,
+    ) -> TPSPContext | None:
+        """Profile chunk/SM configurations and threshold, honoring token overrides."""
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_size = get_tp_group().world_size
+        if (
+            (microchunk_tokens is None or threshold_tokens is None)
+            and compute_engine_count_min is None
+            and compute_engine_count_max is None
         ):
-            raise ValueError("Invalid TPSP SM count targets")
-        return tuple(
-            CudaTPSPConfig(microchunk_tokens_per_rank, target) for target in targets
+            sm_count = torch.cuda.get_device_properties(
+                self.device
+            ).multi_processor_count
+            compute_engine_count_min = {
+                entry.name: _compute_engine_count_min(entry.name, sm_count)
+                for entry in ops_groups
+            }
+            compute_engine_count_max = {entry.name: sm_count for entry in ops_groups}
+        if (
+            microchunk_tokens_per_rank_min_max is None
+            and microchunk_tokens is None
+            and type(max_batched_tokens) is int
+            and max_batched_tokens > 0
+        ):
+            microchunk_tokens_per_rank_min_max = self._microchunk_tokens_per_rank_range(
+                max_batched_tokens, tp_size
+            )
+        return profile_tpsp(
+            self,
+            ops_groups,
+            max_batched_tokens,
+            microchunk_tokens=microchunk_tokens,
+            threshold_tokens=threshold_tokens,
+            compute_engine_count_min=compute_engine_count_min,
+            compute_engine_count_max=compute_engine_count_max,
+            compute_engine_step_coarse=compute_engine_step_coarse,
+            compute_engine_step_fine=compute_engine_step_fine,
+            microchunk_tokens_per_rank_min_max=microchunk_tokens_per_rank_min_max,
+            microchunk_step_coarse_per_rank=microchunk_step_coarse_per_rank,
+            microchunk_step_fine_per_rank=microchunk_step_fine_per_rank,
         )
 
     def fused_gemm_rs_norm_ag(
@@ -433,17 +353,97 @@ class CudaTPSPBackend(TPSPBackend):
         )
         return gathered, reduced
 
-    def close(self, context: object | None = None) -> None:
-        if context is not None:
-            context = self._profile_context(context)
-            del self._open_contexts[id(context)]
+    def get_compute_engine_count(self, config: object) -> int | None:
+        if isinstance(config, CudaTPSPConfig):
+            return config.sm_count_target
+        return None
+
+    def get_default_compute_engine_count(self) -> int:
+        return 0
+
+    def create_context(self) -> CudaTPSPContext:
+        self._get_workspace()
+        context = CudaTPSPContext()
+        self._open_contexts[id(context)] = context
+        return context
+
+    def set_config(self, handle: object, config: object) -> None:
+        context = self._profile_context(handle)
+        context.config = self._resolve_config(context, config)
+
+    def get_tuning_configs(
+        self,
+        handle: object,
+        microchunk_tokens_per_rank: int,
+        group_name: str | None = None,
+        *,
+        compute_engine_counts: Sequence[int] | None = None,
+        compute_engine_step: int = 6,
+    ) -> tuple[CudaTPSPConfig, ...]:
+        self._profile_context(handle)
+        if type(compute_engine_step) is not int or compute_engine_step <= 0:
+            raise ValueError("Compute-engine scan step must be positive")
+        sm_count = torch.cuda.get_device_properties(self.device).multi_processor_count
+        if compute_engine_counts is not None:
+            targets = tuple(dict.fromkeys(compute_engine_counts))
         else:
-            workspace = self._workspace
-            if workspace is not None:
-                torch.cuda.synchronize(workspace.device)
-                dist.barrier(group=workspace.control_group)
-                torch.ops._C.destroy_tpsp_p2p(workspace.p2p_handle)
-                dist.barrier(group=workspace.control_group)
-                self._workspace = None
-            self._open_contexts.clear()
-            self._closed = True
+            start = _compute_engine_count_min(group_name, sm_count)
+            values = list(range(start, sm_count + 1, compute_engine_step))
+            if values[-1] != sm_count:
+                values.append(sm_count)
+            targets = tuple(dict.fromkeys((0, *values)))
+        if not targets or any(
+            type(target) is not int or not 0 <= target <= sm_count for target in targets
+        ):
+            raise ValueError("Invalid TPSP SM count targets")
+        return tuple(
+            CudaTPSPConfig(microchunk_tokens_per_rank, target) for target in targets
+        )
+
+    def _microchunk_tokens_per_rank_range(
+        self, max_batched_tokens: int, tp_size: int
+    ) -> tuple[int, int]:
+        max_tokens_per_rank = math.ceil(max_batched_tokens / tp_size)
+        cap_tokens_per_rank = self.tpsp_max_microchunk_tokens_per_rank
+        if cap_tokens_per_rank is not None:
+            max_tokens_per_rank = min(max_tokens_per_rank, cap_tokens_per_rank)
+        return min(64, max_tokens_per_rank), max_tokens_per_rank
+
+    def _get_workspace(self) -> CudaTPSPWorkspace:
+        if self._closed:
+            raise RuntimeError("TPSP backend is closed")
+        if self._workspace is None:
+            raise RuntimeError("TPSP backend must be opened before use")
+        return self._workspace
+
+    @staticmethod
+    def _all_ranks_ready(ready: bool, group: dist.ProcessGroup) -> bool:
+        supported = torch.tensor(int(ready), device="cpu")
+        dist.all_reduce(supported, op=dist.ReduceOp.MIN, group=group)
+        return bool(supported.item())
+
+    def _profile_context(self, context: object) -> CudaTPSPContext:
+        self._get_workspace()
+        if context is None:
+            raise ValueError("CUDA TPSP requires a projection context")
+        if (
+            not isinstance(context, CudaTPSPContext)
+            or self._open_contexts.get(id(context)) is not context
+        ):
+            raise ValueError("CUDA TPSP context belongs to another backend")
+        return context
+
+    def _resolve_config(
+        self, context: CudaTPSPContext, config: object
+    ) -> CudaTPSPConfig:
+        if type(config) is int:
+            config = CudaTPSPConfig(config)
+        if (
+            not isinstance(config, CudaTPSPConfig)
+            or type(config.microchunk_tokens_per_rank) is not int
+            or config.microchunk_tokens_per_rank <= 0
+            or type(config.sm_count_target) is not int
+            or config.sm_count_target < 0
+        ):
+            raise ValueError("Invalid CUDA TPSP tuning configuration")
+        return config
