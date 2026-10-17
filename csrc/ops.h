@@ -52,7 +52,7 @@ torch::stable::Tensor get_tpsp_p2p_handles(int64_t handle);
 bool map_tpsp_p2p(int64_t handle, const torch::stable::Tensor& peer_handles);
 void destroy_tpsp_p2p(int64_t handle);
 
-std::tuple<torch::stable::Tensor, torch::stable::Tensor, torch::stable::Tensor>
+std::tuple<torch::stable::Tensor, torch::stable::Tensor>
 tpsp_fused_matmul_reduce_scatter_norm_all_gather(
     const torch::stable::Tensor& a, const torch::stable::Tensor& b,
     const torch::stable::Tensor& weight, const torch::stable::Tensor& residual,
