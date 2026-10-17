@@ -47,6 +47,34 @@ If a model has a vLLM implementation but you would prefer to use the Transformer
 !!! note
     For vision-language models, if you are loading with `dtype="auto"`, vLLM loads the whole model with config's `dtype` if it exists. In contrast the native Transformers will respect the `dtype` attribute of each backbone in the model. That might cause a slight difference in performance.
 
+#### Dense TPSP fusion
+
+With `--enable-tpsp`, supported dense decoders can fuse `o_proj` with the
+residual add and post-attention norm, and `down_proj` with the residual add and
+the next layer's input norm (or final norm). The adapter derives its local
+changes from the installed Transformers forward; it does not maintain a
+separate decoder implementation. Attention and MLP computations outside these
+regions continue to use their existing implementations.
+
+Fusion requires unchanged projection outputs and a direct path between each
+residual add and its norm, including across decoder layers. Changes inside these
+regions that cannot be matched disable TPSP with a warning before any hooks are
+installed. Unsupported backends and batches below the TPSP threshold use the
+original forward. Intermediate hidden-state/attention outputs are not supported
+on the active TPSP path. Cache handling remains the responsibility of the
+Transformers backend.
+
+The CUDA backend profiles per-projection microchunk sizes and SM counts, then
+selects a shared activation threshold. Profiling includes coarse screening,
+joint local refinement, output parity checks, and fallback to the original
+forward when no beneficial configuration is found.
+`--tpsp-microchunk-tokens` fixes the global microchunk size while leaving SM
+selection and threshold profiling enabled. `--tpsp-threshold-tokens` fixes the
+activation threshold while leaving microchunk and SM profiling enabled. Both
+are capped at the maximum batched token count; the microchunk is converted to
+per-rank rows, rounded up and capped at the CUDA workspace capacity. Specifying
+both options bypasses scanning and uses SM target 0 (the backend default).
+
 #### Custom models
 
 If a model is neither supported natively by vLLM nor Transformers, it can still be used in vLLM!

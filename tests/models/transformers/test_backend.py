@@ -7,6 +7,7 @@ import contextlib
 import os
 import tempfile
 from functools import partial
+from operator import attrgetter
 from types import SimpleNamespace
 from typing import Any
 
@@ -106,6 +107,97 @@ def check_implementation(
         name_0="ref",
         name_1="test",
     )
+
+
+def _record_tpsp_fusions(model):
+    adapter = model.tpsp_adapter
+    assert adapter is not None and adapter.context is not None
+    assert adapter.context.profile.enabled
+    original = adapter.context.backend.fused_gemm_rs_norm_ag
+    adapter.test_fusion_calls = 0
+
+    def counted(*args, **kwargs):
+        adapter.test_fusion_calls += 1
+        return original(*args, **kwargs)
+
+    adapter.context.backend.fused_gemm_rs_norm_ag = counted
+
+
+@multi_gpu_test(num_gpus=2)
+def test_tpsp_local_fusion_end_to_end(vllm_runner, tmp_path, monkeypatch):
+    """Exercise real TPSP prefill, padding, chunking, and original decode."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from vllm import SamplingParams
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        pytest.skip("TPSP currently requires CUDA")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    config = LlamaConfig(
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=64,
+    )
+    torch.manual_seed(0)
+    LlamaForCausalLM(config).save_pretrained(tmp_path)
+
+    outputs = []
+    for enabled in (False, True):
+        with vllm_runner(
+            str(tmp_path),
+            model_impl="transformers",
+            dtype="bfloat16",
+            tensor_parallel_size=2,
+            max_model_len=64,
+            max_num_batched_tokens=32,
+            max_num_seqs=1,
+            max_logprobs=64,
+            enforce_eager=True,
+            enable_chunked_prefill=True,
+            gpu_memory_utilization=0.1,
+            kv_cache_memory_bytes=32 * 1024 * 1024,
+            skip_tokenizer_init=True,
+            enable_tpsp=enabled,
+            tpsp_microchunk_tokens=8,
+            tpsp_threshold_tokens=4,
+        ) as runner:
+            if enabled:
+                runner.apply_model(_record_tpsp_fusions)
+            results = runner.llm.generate(
+                [{"prompt_token_ids": list(range(5, end))} for end in (12, 13, 44)],
+                SamplingParams(
+                    temperature=0, max_tokens=4, logprobs=64, ignore_eos=True
+                ),
+            )
+            outputs.append(
+                [
+                    (list(result.outputs[0].token_ids), "", result.outputs[0].logprobs)
+                    for result in results
+                ]
+            )
+            if enabled:
+                calls = runner.apply_model(attrgetter("tpsp_adapter.test_fusion_calls"))
+                assert all(count >= 16 for count in calls)
+    check_logprobs_close(
+        outputs_0_lst=outputs[0],
+        outputs_1_lst=outputs[1],
+        name_0="original",
+        name_1="TPSP",
+        always_check_logprobs=True,
+    )
+    for baseline, fused in zip(outputs[0], outputs[1]):
+        # The first generated distribution has identical inputs in both runs.
+        torch.testing.assert_close(
+            torch.tensor([baseline[2][0][i].logprob for i in range(64)]),
+            torch.tensor([fused[2][0][i].logprob for i in range(64)]),
+            atol=0.03,
+            rtol=0.01,
+        )
 
 
 @pytest.mark.parametrize(

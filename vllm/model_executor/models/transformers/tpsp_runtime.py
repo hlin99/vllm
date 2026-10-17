@@ -124,6 +124,7 @@ class TPSPBackend(ABC):
         device: torch.device,
     ) -> Any | None: ...
 
+    @abstractmethod
     def profile(
         self,
         ops_groups: Sequence[TPSPOpsGroup],
@@ -132,7 +133,7 @@ class TPSPBackend(ABC):
         microchunk_tokens: int | None = None,
         threshold_tokens: int | None = None,
     ) -> TPSPContext | None:
-        """Create a static context, filling unset settings from the backend.
+        """Create a backend-specific context for named ops groups.
 
         Args:
             ops_groups: Named projection and normalization pairs to profile.
@@ -141,23 +142,12 @@ class TPSPBackend(ABC):
             threshold_tokens: Optional global threshold override.
 
         Returns:
-            The static TPSP context, or None when unsupported.
+            The TPSP context, or None when unsupported.
 
         """
-        return _build_static_tpsp_context(
-            self,
-            ops_groups,
-            max_batched_tokens,
-            microchunk_tokens=microchunk_tokens,
-            threshold_tokens=threshold_tokens,
-        )
 
     @abstractmethod
     def set_config(self, handle: object, config: object) -> None: ...
-
-    @abstractmethod
-    def get_default_profile_settings(self) -> tuple[int, int]:
-        """Return global microchunk and threshold defaults when unset."""
 
     def get_tuning_configs(
         self,
@@ -357,117 +347,6 @@ def _unsupported_tpsp_norm_types(
     return frozenset(norm_types - backend.supported_norm_types)
 
 
-def _build_static_tpsp_context(
-    backend: TPSPBackend,
-    ops_groups: Sequence[TPSPOpsGroup],
-    max_batched_tokens: int,
-    *,
-    microchunk_tokens: int | None = None,
-    threshold_tokens: int | None = None,
-) -> TPSPContext | None:
-    """Build a static context, using backend defaults only for missing values."""
-    if type(max_batched_tokens) is not int or max_batched_tokens <= 0:
-        raise ValueError("TPSP max_batched_tokens must be a positive integer")
-    for name, value in (
-        ("microchunk_tokens", microchunk_tokens),
-        ("threshold_tokens", threshold_tokens),
-    ):
-        if value is not None and (type(value) is not int or value <= 0):
-            raise ValueError(f"TPSP {name} must be a positive integer")
-    if not ops_groups or any(not entry.name for entry in ops_groups):
-        raise ValueError("TPSP requires named ops groups")
-    if len({entry.name for entry in ops_groups}) != len(ops_groups):
-        raise ValueError("TPSP ops group names must be unique")
-
-    effective_microchunk_tokens = microchunk_tokens
-    effective_threshold_tokens = threshold_tokens
-    if effective_microchunk_tokens is None or effective_threshold_tokens is None:
-        default_microchunk_tokens, default_threshold_tokens = (
-            backend.get_default_profile_settings()
-        )
-        if effective_microchunk_tokens is None:
-            effective_microchunk_tokens = default_microchunk_tokens
-        if effective_threshold_tokens is None:
-            effective_threshold_tokens = default_threshold_tokens
-    assert effective_microchunk_tokens is not None
-    assert effective_threshold_tokens is not None
-    if (
-        type(effective_microchunk_tokens) is not int
-        or effective_microchunk_tokens <= 0
-        or type(effective_threshold_tokens) is not int
-        or effective_threshold_tokens <= 0
-    ):
-        raise ValueError("TPSP backend returned invalid default profile settings")
-    effective_microchunk_tokens = min(effective_microchunk_tokens, max_batched_tokens)
-    effective_threshold_tokens = min(effective_threshold_tokens, max_batched_tokens)
-
-    norm_weight = getattr(ops_groups[0].norm, "weight", None)
-    if not isinstance(norm_weight, torch.Tensor):
-        raise ValueError("TPSP normalizations require a weight tensor")
-    hidden_size = norm_weight.numel()
-    for entry in ops_groups:
-        _projection_input_width(entry.projection)
-        weight = getattr(entry.norm, "weight", None)
-        if not isinstance(weight, torch.Tensor) or weight.numel() != hidden_size:
-            raise ValueError("TPSP ops groups require matching norm hidden sizes")
-    if unsupported := _unsupported_tpsp_norm_types(backend, ops_groups):
-        _LOG.warning(
-            "TPSP using regular forward: runtime or backend does not support "
-            "norm types %s",
-            ", ".join(sorted(unsupported)),
-        )
-        return None
-
-    from vllm.distributed.parallel_state import get_tp_group
-
-    tp_group = get_tp_group()
-    if tp_group.world_size < 2 or hidden_size % tp_group.world_size:
-        _LOG.warning("TPSP using regular forward: unsupported TP configuration")
-        return None
-    microchunk_tokens_per_rank = math.ceil(
-        effective_microchunk_tokens / tp_group.world_size
-    )
-    max_microchunk_tokens_per_rank = backend.get_max_microchunk_tokens_per_rank()
-    if max_microchunk_tokens_per_rank is not None:
-        microchunk_tokens_per_rank = min(
-            microchunk_tokens_per_rank, max_microchunk_tokens_per_rank
-        )
-
-    handles: dict[str, object] = {}
-    enabled = False
-    try:
-        for entry in ops_groups:
-            parameter = entry.projection.weight
-            handle = backend.open(
-                dtype=parameter.dtype,
-                tp_size=tp_group.world_size,
-                hidden_size=hidden_size,
-                max_batched_tokens=max_batched_tokens,
-                group_name=tp_group.device_group.group_name,
-                device=parameter.device,
-            )
-            if handle is None:
-                _LOG.warning(
-                    "TPSP using regular forward: fused backend unavailable for %s",
-                    entry.name,
-                )
-                return None
-            handles[entry.name] = handle
-            backend.set_config(handle, microchunk_tokens_per_rank)
-
-        enabled = True
-        return TPSPContext(
-            TPSPProfile(True, effective_threshold_tokens, max_batched_tokens),
-            backend,
-            handles,
-        )
-    finally:
-        if not enabled:
-            for handle in handles.values():
-                backend.close(handle)
-            backend.close()
-
-
 def tpsp_shard_residual(residual: torch.Tensor) -> torch.Tensor:
     """Return the current TP rank's padded shard of a full residual."""
     from vllm.distributed.parallel_state import get_tp_group
@@ -507,13 +386,17 @@ def profile_tpsp(
     *,
     microchunk_tokens: int | None = None,
     threshold_tokens: int | None = None,
+    compute_engine_count_min: int | Mapping[str, int] | None = None,
+    compute_engine_count_max: int | Mapping[str, int] | None = None,
+    compute_engine_step_coarse: int = _COARSE_COMPUTE_ENGINE_STEP,
+    compute_engine_step_fine: int = _FINE_COMPUTE_ENGINE_STEP,
     microchunk_tokens_per_rank_min_max: (
         tuple[int, int] | Mapping[str, tuple[int, int]] | None
     ) = None,
     microchunk_step_coarse_per_rank: int = _COARSE_MICROCHUNK_STEP_PER_RANK,
     microchunk_step_fine_per_rank: int = _FINE_MICROCHUNK_STEP_PER_RANK,
 ) -> TPSPContext | None:
-    """Profile microchunk sizes and threshold, honoring provided token values.
+    """Profile chunk/SM configurations and threshold, honoring token overrides.
 
     1. Connect each group's projection and norm into a runnable path.
     2. Open a handle, probe chunks, and jointly refine each group's best region.
@@ -527,6 +410,10 @@ def profile_tpsp(
         max_batched_tokens: Maximum scheduler token count to profile.
         microchunk_tokens: Fixed global token size, or None to scan.
         threshold_tokens: Fixed global threshold, or None to scan.
+        compute_engine_count_min: Per-group minimum SM count, or a shared minimum.
+        compute_engine_count_max: Per-group maximum SM count, or a shared maximum.
+        compute_engine_step_coarse: Step for coarse SM candidates.
+        compute_engine_step_fine: Step around finalist SM counts.
         microchunk_tokens_per_rank_min_max: Per-group per-rank microchunk bounds.
         microchunk_step_coarse_per_rank: Step for coarse candidates.
         microchunk_step_fine_per_rank: Step for local refinement.
@@ -539,14 +426,12 @@ def profile_tpsp(
         raise ValueError("TPSP profiling requires a backend")
     if type(max_batched_tokens) is not int or max_batched_tokens <= 0:
         raise ValueError("TPSP max_batched_tokens must be a positive integer")
-    if microchunk_tokens is not None and (
-        type(microchunk_tokens) is not int or microchunk_tokens <= 0
+    for name, value in (
+        ("microchunk_tokens", microchunk_tokens),
+        ("threshold_tokens", threshold_tokens),
     ):
-        raise ValueError("TPSP microchunk tokens must be a positive integer")
-    if threshold_tokens is not None and (
-        type(threshold_tokens) is not int or threshold_tokens <= 0
-    ):
-        raise ValueError("TPSP threshold tokens must be a positive integer")
+        if value is not None and (type(value) is not int or value <= 0):
+            raise ValueError(f"TPSP {name} must be a positive integer")
     if microchunk_tokens is not None:
         microchunk_tokens = min(microchunk_tokens, max_batched_tokens)
     if threshold_tokens is not None:
@@ -586,6 +471,11 @@ def profile_tpsp(
             max_batched_tokens,
             handles,
             microchunk_tokens=microchunk_tokens,
+            scan_configs=microchunk_tokens is None or threshold_tokens is None,
+            compute_engine_count_min=compute_engine_count_min,
+            compute_engine_count_max=compute_engine_count_max,
+            compute_engine_step_coarse=compute_engine_step_coarse,
+            compute_engine_step_fine=compute_engine_step_fine,
             microchunk_tokens_per_rank_min_max=microchunk_tokens_per_rank_min_max,
             microchunk_step_coarse_per_rank=microchunk_step_coarse_per_rank,
             microchunk_step_fine_per_rank=microchunk_step_fine_per_rank,
@@ -696,8 +586,10 @@ def _run_conventional_projection(
     if layer_scale is not None:
         scale = layer_scale.to(dtype=full.dtype).reshape(-1) + 1
         full = full * scale
+    # Instance wrappers hide whether the norm accepts a residual.
+    forward = getattr(type(norm), "forward_native", type(norm).forward)
     try:
-        inspect.signature(norm.forward).bind(full, inputs.residual)
+        inspect.signature(forward).bind(norm, full, inputs.residual)
     except TypeError:
         inputs.residual.add_(full)
         normalized = norm(inputs.residual)
@@ -768,13 +660,18 @@ def _scan_group_chunks(
     handles: dict[str, object],
     *,
     microchunk_tokens: int | None,
+    scan_configs: bool,
+    compute_engine_count_min: int | Mapping[str, int] | None,
+    compute_engine_count_max: int | Mapping[str, int] | None,
+    compute_engine_step_coarse: int,
+    compute_engine_step_fine: int,
     microchunk_tokens_per_rank_min_max: (
         tuple[int, int] | Mapping[str, tuple[int, int]] | None
     ),
     microchunk_step_coarse_per_rank: int,
     microchunk_step_fine_per_rank: int,
 ) -> str | None:
-    """Select an independent microchunk size per group."""
+    """Select independent chunk/SM configurations per group."""
     if backend._closed:
         raise RuntimeError("TPSP backend is closed")
     parameter = groups[0].ops.projection.weight
@@ -802,13 +699,21 @@ def _scan_group_chunks(
         if handle is None:
             return f"fused backend unavailable for {entry.name}"
         handles[entry.name] = handle
+        bounds = _group_parameter(
+            microchunk_tokens_per_rank_min_max,
+            entry.name,
+            "microchunk_tokens_per_rank_min_max",
+        )
         if microchunk_tokens is not None:
-            microchunk_tokens_per_rank = _microchunk_tokens_per_rank(
+            fixed_chunk = _microchunk_tokens_per_rank(
                 backend, microchunk_tokens, tp_group.world_size
             )
+            bounds = (fixed_chunk, fixed_chunk)
+        if not scan_configs:
+            assert microchunk_tokens is not None
             configs = backend.get_tuning_configs(
                 handle,
-                microchunk_tokens_per_rank,
+                fixed_chunk,
                 group_name=entry.name,
                 compute_engine_counts=(0,),
             )
@@ -824,13 +729,19 @@ def _scan_group_chunks(
                 tp_size=tp_group.world_size,
                 max_batched_tokens=max_batched_tokens,
                 group_name=entry.name,
-                compute_engine_count_min=0,
-                compute_engine_count_max=0,
-                microchunk_tokens_per_rank_min_max=_group_parameter(
-                    microchunk_tokens_per_rank_min_max,
+                compute_engine_count_min=_group_parameter(
+                    compute_engine_count_min,
                     entry.name,
-                    "microchunk_tokens_per_rank_min_max",
+                    "compute_engine_count_min",
                 ),
+                compute_engine_count_max=_group_parameter(
+                    compute_engine_count_max,
+                    entry.name,
+                    "compute_engine_count_max",
+                ),
+                compute_engine_step_coarse=compute_engine_step_coarse,
+                compute_engine_step_fine=compute_engine_step_fine,
+                microchunk_tokens_per_rank_min_max=bounds,
                 microchunk_step_coarse_per_rank=microchunk_step_coarse_per_rank,
                 microchunk_step_fine_per_rank=microchunk_step_fine_per_rank,
             )
