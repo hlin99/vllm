@@ -419,8 +419,8 @@ class TransformersDenseTPSP:
             return
         tp_group = get_tp_group()
         device = torch.device(vllm_config.device_config.device)
-        if device.type == "cuda" and device.index is None:
-            device = torch.device("cuda", torch.accelerator.current_device_index())
+        if device.type != "cpu" and device.index is None:
+            device = torch.device(device.type, torch.accelerator.current_device_index())
         backend = backend_cls(
             tp_group.device_group.group_name,
             device,
