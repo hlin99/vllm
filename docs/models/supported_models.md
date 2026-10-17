@@ -47,6 +47,22 @@ If a model has a vLLM implementation but you would prefer to use the Transformer
 !!! note
     For vision-language models, if you are loading with `dtype="auto"`, vLLM loads the whole model with config's `dtype` if it exists. In contrast the native Transformers will respect the `dtype` attribute of each backbone in the model. That might cause a slight difference in performance.
 
+#### Dense TPSP fusion
+
+With `--enable-tpsp`, supported dense decoders can fuse `o_proj` with the
+residual add and post-attention norm, and `down_proj` with the residual add and
+the next layer's input norm (or final norm). The adapter derives its local
+changes from the installed Transformers forward; it does not maintain a
+separate decoder implementation. Attention and MLP computations outside these
+regions continue to use their existing implementations.
+
+Fusion requires unchanged projection outputs and a direct path between each
+residual add and its norm, including across decoder layers. Changes inside these
+regions that cannot be matched disable TPSP with a warning before any hooks are
+installed. Unsupported backends and batches below the TPSP threshold use the
+original forward. HF caches and intermediate hidden-state/attention outputs are
+not supported on the active TPSP path.
+
 #### Custom models
 
 If a model is neither supported natively by vLLM nor Transformers, it can still be used in vLLM!
