@@ -450,6 +450,8 @@ class TransformersDenseTPSP:
             return
         self.model.eval()
         try:
+            # Weights are now loaded: prepare every layer's backend-specific layout
+            # outside forward; profiling below only uses two representative groups.
             backend.prepare_weights(self._projections)
             self.context = backend.profile(
                 self.groups,
