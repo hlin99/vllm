@@ -9,7 +9,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, get_args
+from typing import Any, Literal
 
 import torch
 from torch import nn
@@ -18,26 +18,8 @@ _LOG = logging.getLogger(__name__)
 _STATIC_PROFILE_THRESHOLD_TOKENS = 512
 _STATIC_PROFILE_CHUNK_ROWS = 256
 
-TPSPNormType = Literal[
-    "layer_norm",
-    "layer_norm_offset_weight",
-    "rms_norm",
-    "rms_norm_offset_weight",
-    "group_rms_norm",
-]
-# Dense decoder hidden-state norm types; gated and multimodal-only norms are
-# outside the current TPSP fusion contract.
-TPSP_KNOWN_NORM_TYPES: frozenset[TPSPNormType] = frozenset(get_args(TPSPNormType))
-_MODEL_NORM_TYPES: dict[str, TPSPNormType] = {
-    "vllm.model_executor.models.nemotron.NemotronLayerNorm1P": (
-        "layer_norm_offset_weight"
-    ),
-    "vllm.model_executor.models.k2_horizon.K2HorizonRMSNorm": "group_rms_norm",
-}
-# Types without TPSP-specific validation stay on the regular forward path.
-_TPSP_VALIDATED_NORM_TYPES: frozenset[TPSPNormType] = frozenset(
-    {"layer_norm", "rms_norm", "rms_norm_offset_weight"}
-)
+# TPSP v1 supports only standard LayerNorm and RMSNorm.
+TPSPNormType = Literal["layer_norm", "rms_norm"]
 
 
 class TPSPBackend(ABC):
@@ -169,28 +151,16 @@ class UnsupportedTPSPNormError(ValueError):
 def get_tpsp_norm_type(norm: nn.Module) -> TPSPNormType:
     """Identify known normalization implementations without guessing by attributes."""
     from vllm.model_executor.layers.layernorm import (
-        GemmaRMSNorm,
         LayerNorm,
         RMSNorm,
     )
     from vllm.model_executor.models.transformers.fusers.rms_norm import (
-        TPAwareGemmaRMSNorm,
         TPAwareRMSNorm,
     )
 
     norm_cls = type(norm)
-    norm_class_name = f"{norm_cls.__module__}.{norm_cls.__name__}"
-    if norm_class_name in _MODEL_NORM_TYPES:
-        norm_type = _MODEL_NORM_TYPES[norm_class_name]
-        if (
-            norm_class_name == "vllm.model_executor.models.k2_horizon.K2HorizonRMSNorm"
-            and norm.n_groups == 1
-        ):
-            norm_type = "rms_norm"
-    elif norm_cls in (GemmaRMSNorm, TPAwareGemmaRMSNorm):
-        norm_type = "rms_norm_offset_weight"
-    elif norm_cls in (nn.LayerNorm, LayerNorm):
-        norm_type = "layer_norm"
+    if norm_cls in (nn.LayerNorm, LayerNorm):
+        norm_type: TPSPNormType = "layer_norm"
     elif norm_cls in (RMSNorm, TPAwareRMSNorm):
         norm_type = "rms_norm"
         if norm.variance_size_override is not None:
@@ -204,7 +174,7 @@ def get_tpsp_norm_type(norm: nn.Module) -> TPSPNormType:
 
     eps = (
         getattr(norm, "eps", None)
-        if norm_type in ("layer_norm", "layer_norm_offset_weight")
+        if norm_type == "layer_norm"
         else getattr(norm, "variance_epsilon", None)
     )
     weight = getattr(norm, "weight", None)
@@ -221,7 +191,7 @@ def get_tpsp_norm_type(norm: nn.Module) -> TPSPNormType:
         raise UnsupportedTPSPNormError(
             f"Unsupported TPSP normalization {type(norm).__name__}"
         )
-    if norm_type not in ("layer_norm", "layer_norm_offset_weight") and bias is not None:
+    if norm_type != "layer_norm" and bias is not None:
         raise UnsupportedTPSPNormError(
             f"Unsupported TPSP normalization {type(norm).__name__}"
         )
@@ -237,16 +207,8 @@ def get_tpsp_norm_type(norm: nn.Module) -> TPSPNormType:
 def _unsupported_tpsp_norm_types(
     backend: TPSPBackend, ops_groups: Sequence[TPSPOpsGroup]
 ) -> frozenset[TPSPNormType]:
-    unknown_types = backend.supported_norm_types - TPSP_KNOWN_NORM_TYPES
-    if unknown_types:
-        raise ValueError(
-            f"TPSP backend declares unknown norm types: {sorted(unknown_types)}"
-        )
     norm_types = {get_tpsp_norm_type(entry.norm) for entry in ops_groups}
-    return frozenset(
-        (norm_types - backend.supported_norm_types)
-        | (norm_types - _TPSP_VALIDATED_NORM_TYPES)
-    )
+    return frozenset(norm_types - backend.supported_norm_types)
 
 
 def tpsp_shard_residual(residual: torch.Tensor) -> torch.Tensor:
