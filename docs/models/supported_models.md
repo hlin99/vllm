@@ -72,11 +72,19 @@ allocate another P2P workspace.
 This stage also prepares contiguous transposed weights for every fused projection.
 Forward calls reuse these copies without checking for weight changes.
 
-The CUDA backend currently uses static settings, without profiling or scanning.
-`--tpsp-microchunk-tokens` and `--tpsp-threshold-tokens` override the defaults of
-256 and 512 global tokens, respectively. Both are capped at the maximum batched
-token count; the microchunk is converted to per-rank rows, rounded up and capped
-at the CUDA workspace capacity. The SM target remains 0 (the backend default).
+The CUDA backend profiles per-projection microchunk sizes and SM counts, then
+selects a shared activation threshold. Profiling includes coarse screening,
+joint local refinement, output parity checks, and fallback to the original
+forward when no beneficial configuration is found.
+By default, microchunk scanning starts at 64 tokens per rank, or the available
+per-rank batch size if smaller. Manually specified microchunks need not be
+multiples of 64.
+`--tpsp-microchunk-tokens` fixes the global microchunk size while leaving SM
+selection and threshold profiling enabled. `--tpsp-threshold-tokens` fixes the
+activation threshold while leaving microchunk and SM profiling enabled. Both
+are capped at the maximum batched token count; the microchunk is converted to
+per-rank rows, rounded up and capped at the CUDA workspace capacity. Specifying
+both options bypasses scanning and uses SM target 0 (the backend default).
 
 #### Custom models
 

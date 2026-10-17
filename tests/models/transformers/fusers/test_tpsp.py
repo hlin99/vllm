@@ -598,6 +598,30 @@ def test_norm_validation_runs_once_at_installation_not_during_forward(
     validate.assert_not_called()
 
 
+@pytest.mark.parametrize("custom_norm", [False, True])
+def test_profiling_preserves_single_input_norm_calls_after_installation(
+    install, default_vllm_config, custom_norm
+):
+    from vllm.model_executor.models.transformers.tpsp_runtime import (
+        _ProjectionInputs,
+        _run_conventional_projection,
+    )
+
+    model = Decoder()
+    if custom_norm:
+        from vllm.model_executor.layers.layernorm import LayerNorm
+
+        model.layers[0].post_attention_layernorm = LayerNorm(16)
+    adapter, _ = install(model)
+    group = adapter.groups[0]
+    x, residual = torch.randn(7, 16), torch.randn(7, 16)
+    expected = group.norm(group.projection(x) + residual)
+    inputs = _ProjectionInputs(x, residual.clone(), residual.clone(), residual.clone())
+    torch.testing.assert_close(
+        _run_conventional_projection(group.projection, group.norm, inputs), expected
+    )
+
+
 def test_incomplete_forward_raises_and_restores_original_path(install):
     model = Decoder()
     x = torch.randn(1, 7, 16)

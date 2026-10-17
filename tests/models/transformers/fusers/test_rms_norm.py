@@ -293,14 +293,12 @@ def test_tpsp_rejects_norm_types_outside_runtime_scope(default_vllm_config):
     "microchunk_tokens,threshold_tokens,expected_microchunk_per_rank,"
     "expected_threshold",
     [
-        (None, None, 64, 512),
-        (1000, None, 250, 512),
-        (None, 800, 64, 800),
+        (1000, 800, 250, 800),
         (2000, 2000, 250, 1000),
         (7, 5, 2, 5),
     ],
 )
-def test_cuda_tpsp_profile_resolves_missing_token_settings(
+def test_cuda_tpsp_profile_honors_fixed_token_settings(
     cuda_tpsp_profile,
     microchunk_tokens,
     threshold_tokens,
@@ -317,8 +315,9 @@ def test_cuda_tpsp_profile_resolves_missing_token_settings(
 
     assert context is not None
     assert context.profile.threshold_tokens == expected_threshold
-    assert backend.configs == [expected_microchunk_per_rank]
-    assert list(context.handles) == ["proj"]
+    assert backend.configs[0].microchunk_tokens_per_rank == expected_microchunk_per_rank
+    assert backend.configs[0].sm_count_target == 0
+    assert list(context.handles) == ["o_proj"]
     assert backend.closed == []
 
 
@@ -328,7 +327,7 @@ def cuda_tpsp_profile(monkeypatch):
     from vllm.model_executor.models.transformers.tpsp_runtime import (
         TPSPOpsGroup,
     )
-    from vllm.platforms.tpsp_cuda import CudaTPSPBackend
+    from vllm.platforms.tpsp_cuda import CudaTPSPBackend, CudaTPSPConfig
 
     class Backend(CudaTPSPBackend):
         def __init__(self):
@@ -342,6 +341,9 @@ def cuda_tpsp_profile(monkeypatch):
         def set_config(self, handle, config):
             self.configs.append(config)
 
+        def get_tuning_configs(self, handle, chunk, **kwargs):
+            return (CudaTPSPConfig(chunk),)
+
         def close(self, context=None):
             self.closed.append(context)
 
@@ -349,11 +351,16 @@ def cuda_tpsp_profile(monkeypatch):
         parallel_state,
         "get_tp_group",
         lambda: SimpleNamespace(
-            world_size=4, device_group=SimpleNamespace(group_name="tp")
+            world_size=4, rank_in_group=0, device_group=SimpleNamespace(group_name="tp")
         ),
     )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=80),
+    )
     with torch.device("meta"):
-        ops_group = TPSPOpsGroup("proj", nn.Linear(8, 8, bias=False), nn.LayerNorm(8))
+        ops_group = TPSPOpsGroup("o_proj", nn.Linear(8, 8, bias=False), nn.LayerNorm(8))
     return Backend(), [ops_group]
 
 
@@ -394,11 +401,104 @@ def test_cuda_tpsp_profile_cleans_up_partial_initialization(
 
         monkeypatch.setattr(backend, "set_config", fail)
         with pytest.raises(RuntimeError, match="configuration failed"):
-            backend.profile(ops_groups, 1000)
+            backend.profile(
+                ops_groups, 1000, microchunk_tokens=100, threshold_tokens=200
+            )
     else:
         with pytest.raises(RuntimeError, match="context failed"):
-            backend.profile(ops_groups, 1000)
+            backend.profile(
+                ops_groups, 1000, microchunk_tokens=100, threshold_tokens=200
+            )
     assert backend.closed == [handle]
+
+
+def test_tpsp_microchunk_tokens_convert_to_per_rank_with_ceiling():
+    from vllm.model_executor.models.transformers.tpsp_runtime import (
+        _microchunk_tokens_per_rank,
+    )
+    from vllm.platforms.tpsp_cuda import CudaTPSPBackend
+
+    backend = CudaTPSPBackend("test", torch.device("cuda"))
+
+    assert _microchunk_tokens_per_rank(backend, 65, 4) == 17
+
+
+@pytest.mark.parametrize("chunk,threshold", [(None, None), (100, None), (None, 200)])
+def test_cuda_tpsp_scans_chunk_sm_and_threshold_honoring_overrides(
+    cuda_tpsp_profile, monkeypatch, chunk, threshold
+):
+    from vllm.model_executor.models.transformers import tpsp_runtime
+    from vllm.platforms.tpsp_cuda import CudaTPSPConfig
+
+    backend, ops_groups = cuda_tpsp_profile
+    calls = []
+
+    def scan(*args, **kwargs):
+        calls.append(kwargs)
+        return tpsp_runtime.TPSPScanResult(
+            4, 8, 1000, "candidate", "", config=CudaTPSPConfig(25 if chunk else 7, 79)
+        )
+
+    def scan_threshold(*args):
+        return tpsp_runtime.TPSPScanResult(
+            4, 8, 1000, "enabled", "", threshold_tokens=300
+        )
+
+    monkeypatch.setattr(tpsp_runtime, "_scan_microchunk", scan)
+    monkeypatch.setattr(tpsp_runtime, "_scan_threshold", scan_threshold)
+    context = backend.profile(
+        ops_groups, 1000, microchunk_tokens=chunk, threshold_tokens=threshold
+    )
+    assert context is not None
+    assert context.profile.threshold_tokens == (300 if threshold is None else threshold)
+    assert backend.configs == [CudaTPSPConfig(25 if chunk else 7, 79)]
+    assert len(calls) == 1
+    assert calls[0]["compute_engine_count_min"] == 60
+    assert calls[0]["compute_engine_count_max"] == 80
+    assert calls[0]["microchunk_tokens_per_rank_min_max"] == (
+        (64, 250) if chunk is None else (25, 25)
+    )
+
+
+def test_cuda_tpsp_uses_fixed_settings_without_scanning(cuda_tpsp_profile, monkeypatch):
+    from vllm.model_executor.models.transformers import tpsp_runtime
+
+    backend, ops_groups = cuda_tpsp_profile
+    for name in ("_scan_microchunk", "_scan_threshold"):
+        monkeypatch.setattr(
+            tpsp_runtime,
+            name,
+            lambda *args, **kwargs: pytest.fail("fixed settings must not scan"),
+        )
+    context = backend.profile(
+        ops_groups, 1000, microchunk_tokens=100, threshold_tokens=200
+    )
+    assert context is not None
+    assert context.profile.threshold_tokens == 200
+    assert backend.configs[0].microchunk_tokens_per_rank == 25
+    assert backend.configs[0].sm_count_target == 0
+
+
+def test_cuda_tpsp_enumerates_default_and_positive_sm_targets(
+    cuda_tpsp_profile, monkeypatch
+):
+    from vllm.platforms.tpsp_cuda import CudaTPSPBackend
+
+    backend, _ = cuda_tpsp_profile
+    monkeypatch.setattr(
+        backend,
+        "_profile_context",
+        lambda handle: SimpleNamespace(device=backend.device),
+    )
+    configs = CudaTPSPBackend.get_tuning_configs(
+        backend, object(), 17, group_name="o_proj", compute_engine_step=6
+    )
+    assert [config.sm_count_target for config in configs] == [0, 60, 66, 72, 78, 80]
+    assert all(config.microchunk_tokens_per_rank == 17 for config in configs)
+    with pytest.raises(ValueError, match="SM count"):
+        CudaTPSPBackend.get_tuning_configs(
+            backend, object(), 17, compute_engine_counts=(81,)
+        )
 
 
 @pytest.mark.parametrize(
