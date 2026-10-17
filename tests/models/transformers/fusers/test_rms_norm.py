@@ -230,12 +230,16 @@ def test_non_rms_norms_are_not_matched(cls):
 
 def test_tpsp_norm_type_accepts_known_norm_implementations(default_vllm_config):
     from vllm.model_executor.layers.layernorm import (
+        GemmaRMSNorm as VllmGemmaRMSNorm,
+    )
+    from vllm.model_executor.layers.layernorm import (
         LayerNorm as VllmLayerNorm,
     )
     from vllm.model_executor.layers.layernorm import (
         RMSNorm as VllmRMSNorm,
     )
     from vllm.model_executor.models.transformers.fusers.rms_norm import (
+        TPAwareGemmaRMSNorm,
         TPAwareRMSNorm,
     )
     from vllm.model_executor.models.transformers.tpsp_runtime import (
@@ -248,6 +252,8 @@ def test_tpsp_norm_type_accepts_known_norm_implementations(default_vllm_config):
             (VllmLayerNorm(16), "layer_norm"),
             (VllmRMSNorm(16), "rms_norm"),
             (TPAwareRMSNorm(16), "rms_norm"),
+            (VllmGemmaRMSNorm(16), "rms_norm_offset_weight"),
+            (TPAwareGemmaRMSNorm(16), "rms_norm_offset_weight"),
         )
     for norm, expected in norms:
         assert get_tpsp_norm_type(norm) == expected
@@ -269,6 +275,23 @@ def test_cuda_tpsp_declares_supported_norm_types():
     from vllm.platforms.tpsp_cuda import CudaTPSPBackend
 
     assert CudaTPSPBackend.supported_norm_types == {"layer_norm", "rms_norm"}
+    assert "rms_norm_offset_weight" not in CudaTPSPBackend.supported_norm_types
+
+
+def test_tpsp_matches_norm_types_against_backend_support(default_vllm_config):
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+    from vllm.model_executor.models.transformers.tpsp_runtime import (
+        TPSPOpsGroup,
+        _unsupported_tpsp_norm_types,
+    )
+    from vllm.platforms.tpsp_cuda import CudaTPSPBackend
+
+    with torch.device("meta"):
+        norm = GemmaRMSNorm(16)
+    backend = CudaTPSPBackend("test", torch.device("cuda"))
+    group = TPSPOpsGroup("gemma", nn.Identity(), norm)
+
+    assert _unsupported_tpsp_norm_types(backend, [group]) == {"rms_norm_offset_weight"}
 
 
 @pytest.mark.parametrize(

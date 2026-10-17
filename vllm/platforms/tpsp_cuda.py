@@ -217,6 +217,8 @@ class CudaTPSPBackend(TPSPBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._closed:
             raise RuntimeError("TPSP backend is closed")
+        if norm_type not in self.supported_norm_types:
+            raise ValueError(f"CUDA TPSP does not support norm type {norm_type}")
         context = self._profile_context(projection_context)
         hidden_size = norm.weight.numel()
         rows = (x.size(0) + context.tp_size - 1) // context.tp_size
@@ -245,11 +247,7 @@ class CudaTPSPBackend(TPSPBackend):
             > context.max_chunk_rows
         ):
             raise ValueError("CUDA TPSP microchunk exceeds P2P workspace capacity")
-        if (
-            norm_type not in ("rms_norm", "layer_norm")
-            or eps <= 0
-            or (norm_bias is not None and norm_type != "layer_norm")
-        ):
+        if eps <= 0 or (norm_bias is not None and norm_type != "layer_norm"):
             raise ValueError("Invalid CUDA TPSP normalization or chunk configuration")
         if (
             any(
