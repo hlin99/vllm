@@ -59,79 +59,6 @@ class CudaTPSPBackend(TPSPBackend):
         self._open_contexts: dict[int, CudaTPSPContext] = {}
         self._workspace: CudaTPSPWorkspace | None = None
 
-    def profile(
-        self,
-        ops_groups: Sequence[TPSPOpsGroup],
-        max_batched_tokens: int,
-        *,
-        microchunk_tokens: int | None = None,
-        threshold_tokens: int | None = None,
-    ) -> TPSPContext | None:
-        """Create a static context; no timing or parameter search."""
-        from vllm.distributed.parallel_state import get_tp_group
-
-        microchunk_tokens = 256 if microchunk_tokens is None else microchunk_tokens
-        threshold_tokens = 512 if threshold_tokens is None else threshold_tokens
-        for name, value in (
-            ("max_batched_tokens", max_batched_tokens),
-            ("microchunk_tokens", microchunk_tokens),
-            ("threshold_tokens", threshold_tokens),
-        ):
-            if type(value) is not int or value <= 0:
-                raise ValueError(f"TPSP {name} must be a positive integer")
-        if not ops_groups or any(not entry.name for entry in ops_groups):
-            raise ValueError("TPSP requires named ops groups")
-        if len({entry.name for entry in ops_groups}) != len(ops_groups):
-            raise ValueError("TPSP ops group names must be unique")
-        norm_types = {get_tpsp_norm_type(entry.norm) for entry in ops_groups}
-        if unsupported := norm_types - self.supported_norm_types:
-            logger.warning(
-                "CUDA TPSP using regular forward: unsupported norm types %s",
-                ", ".join(sorted(unsupported)),
-            )
-            return None
-        hidden_size = ops_groups[0].norm.weight.numel()
-        for entry in ops_groups:
-            weight = getattr(entry.projection, "weight", None)
-            if (
-                not isinstance(weight, torch.Tensor)
-                or weight.ndim != 2
-                or weight.size(1) <= 0
-            ):
-                raise ValueError("TPSP projections require a nonempty 2D weight")
-            if entry.norm.weight.numel() != hidden_size:
-                raise ValueError("TPSP ops groups require matching norm hidden sizes")
-        tp_group = get_tp_group()
-        if tp_group.world_size < 2 or hidden_size % tp_group.world_size:
-            logger.warning(
-                "CUDA TPSP using regular forward: unsupported TP configuration"
-            )
-            return None
-        chunk_per_rank = min(
-            math.ceil(min(microchunk_tokens, max_batched_tokens) / tp_group.world_size),
-            self.tpsp_max_microchunk_tokens_per_rank,
-        )
-        handles: dict[str, object] = {}
-        enabled = False
-        try:
-            for entry in ops_groups:
-                handle = self.create_context()
-                handles[entry.name] = handle
-                self.set_config(handle, chunk_per_rank)
-            context = TPSPContext(
-                TPSPProfile(
-                    True, min(threshold_tokens, max_batched_tokens), max_batched_tokens
-                ),
-                self,
-                handles,
-            )
-            enabled = True
-            return context
-        finally:
-            if not enabled:
-                for opened in handles.values():
-                    self.close(opened)
-
     def open(
         self,
         *,
@@ -252,54 +179,93 @@ class CudaTPSPBackend(TPSPBackend):
         self._workspace = context
         return True
 
-    def _get_workspace(self) -> CudaTPSPWorkspace:
-        if self._closed:
-            raise RuntimeError("TPSP backend is closed")
-        if self._workspace is None:
-            raise RuntimeError("TPSP backend must be opened before use")
-        return self._workspace
+    def close(self, context: object | None = None) -> None:
+        if context is not None:
+            context = self._profile_context(context)
+            del self._open_contexts[id(context)]
+        else:
+            workspace = self._workspace
+            if workspace is not None:
+                torch.cuda.synchronize(workspace.device)
+                dist.barrier(group=workspace.control_group)
+                torch.ops._C.destroy_tpsp_p2p(workspace.p2p_handle)
+                dist.barrier(group=workspace.control_group)
+                self._workspace = None
+            self._open_contexts.clear()
+            self._closed = True
 
-    def create_context(self) -> CudaTPSPContext:
-        self._get_workspace()
-        context = CudaTPSPContext()
-        self._open_contexts[id(context)] = context
-        return context
+    def profile(
+        self,
+        ops_groups: Sequence[TPSPOpsGroup],
+        max_batched_tokens: int,
+        *,
+        microchunk_tokens: int | None = None,
+        threshold_tokens: int | None = None,
+    ) -> TPSPContext | None:
+        """Create a static context; no timing or parameter search."""
+        from vllm.distributed.parallel_state import get_tp_group
 
-    @staticmethod
-    def _all_ranks_ready(ready: bool, group: dist.ProcessGroup) -> bool:
-        supported = torch.tensor(int(ready), device="cpu")
-        dist.all_reduce(supported, op=dist.ReduceOp.MIN, group=group)
-        return bool(supported.item())
-
-    def _profile_context(self, context: object) -> CudaTPSPContext:
-        self._get_workspace()
-        if context is None:
-            raise ValueError("CUDA TPSP requires a projection context")
-        if (
-            not isinstance(context, CudaTPSPContext)
-            or self._open_contexts.get(id(context)) is not context
+        microchunk_tokens = 256 if microchunk_tokens is None else microchunk_tokens
+        threshold_tokens = 512 if threshold_tokens is None else threshold_tokens
+        for name, value in (
+            ("max_batched_tokens", max_batched_tokens),
+            ("microchunk_tokens", microchunk_tokens),
+            ("threshold_tokens", threshold_tokens),
         ):
-            raise ValueError("CUDA TPSP context belongs to another backend")
-        return context
-
-    def set_config(self, handle: object, config: object) -> None:
-        context = self._profile_context(handle)
-        context.config = self._resolve_config(context, config)
-
-    def _resolve_config(
-        self, context: CudaTPSPContext, config: object
-    ) -> CudaTPSPConfig:
-        if type(config) is int:
-            config = CudaTPSPConfig(config)
-        if (
-            not isinstance(config, CudaTPSPConfig)
-            or type(config.microchunk_tokens_per_rank) is not int
-            or config.microchunk_tokens_per_rank <= 0
-            or type(config.sm_count_target) is not int
-            or config.sm_count_target < 0
-        ):
-            raise ValueError("Invalid CUDA TPSP tuning configuration")
-        return config
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"TPSP {name} must be a positive integer")
+        if not ops_groups or any(not entry.name for entry in ops_groups):
+            raise ValueError("TPSP requires named ops groups")
+        if len({entry.name for entry in ops_groups}) != len(ops_groups):
+            raise ValueError("TPSP ops group names must be unique")
+        norm_types = {get_tpsp_norm_type(entry.norm) for entry in ops_groups}
+        if unsupported := norm_types - self.supported_norm_types:
+            logger.warning(
+                "CUDA TPSP using regular forward: unsupported norm types %s",
+                ", ".join(sorted(unsupported)),
+            )
+            return None
+        hidden_size = ops_groups[0].norm.weight.numel()
+        for entry in ops_groups:
+            weight = getattr(entry.projection, "weight", None)
+            if (
+                not isinstance(weight, torch.Tensor)
+                or weight.ndim != 2
+                or weight.size(1) <= 0
+            ):
+                raise ValueError("TPSP projections require a nonempty 2D weight")
+            if entry.norm.weight.numel() != hidden_size:
+                raise ValueError("TPSP ops groups require matching norm hidden sizes")
+        tp_group = get_tp_group()
+        if tp_group.world_size < 2 or hidden_size % tp_group.world_size:
+            logger.warning(
+                "CUDA TPSP using regular forward: unsupported TP configuration"
+            )
+            return None
+        chunk_per_rank = min(
+            math.ceil(min(microchunk_tokens, max_batched_tokens) / tp_group.world_size),
+            self.tpsp_max_microchunk_tokens_per_rank,
+        )
+        handles: dict[str, object] = {}
+        enabled = False
+        try:
+            for entry in ops_groups:
+                handle = self.create_context()
+                handles[entry.name] = handle
+                self.set_config(handle, chunk_per_rank)
+            context = TPSPContext(
+                TPSPProfile(
+                    True, min(threshold_tokens, max_batched_tokens), max_batched_tokens
+                ),
+                self,
+                handles,
+            )
+            enabled = True
+            return context
+        finally:
+            if not enabled:
+                for opened in handles.values():
+                    self.close(opened)
 
     def fused_gemm_rs_norm_ag(
         self,
@@ -390,17 +356,51 @@ class CudaTPSPBackend(TPSPBackend):
         )
         return gathered, reduced
 
-    def close(self, context: object | None = None) -> None:
-        if context is not None:
-            context = self._profile_context(context)
-            del self._open_contexts[id(context)]
-        else:
-            workspace = self._workspace
-            if workspace is not None:
-                torch.cuda.synchronize(workspace.device)
-                dist.barrier(group=workspace.control_group)
-                torch.ops._C.destroy_tpsp_p2p(workspace.p2p_handle)
-                dist.barrier(group=workspace.control_group)
-                self._workspace = None
-            self._open_contexts.clear()
-            self._closed = True
+    def create_context(self) -> CudaTPSPContext:
+        self._get_workspace()
+        context = CudaTPSPContext()
+        self._open_contexts[id(context)] = context
+        return context
+
+    def set_config(self, handle: object, config: object) -> None:
+        context = self._profile_context(handle)
+        context.config = self._resolve_config(context, config)
+
+    def _get_workspace(self) -> CudaTPSPWorkspace:
+        if self._closed:
+            raise RuntimeError("TPSP backend is closed")
+        if self._workspace is None:
+            raise RuntimeError("TPSP backend must be opened before use")
+        return self._workspace
+
+    @staticmethod
+    def _all_ranks_ready(ready: bool, group: dist.ProcessGroup) -> bool:
+        supported = torch.tensor(int(ready), device="cpu")
+        dist.all_reduce(supported, op=dist.ReduceOp.MIN, group=group)
+        return bool(supported.item())
+
+    def _profile_context(self, context: object) -> CudaTPSPContext:
+        self._get_workspace()
+        if context is None:
+            raise ValueError("CUDA TPSP requires a projection context")
+        if (
+            not isinstance(context, CudaTPSPContext)
+            or self._open_contexts.get(id(context)) is not context
+        ):
+            raise ValueError("CUDA TPSP context belongs to another backend")
+        return context
+
+    def _resolve_config(
+        self, context: CudaTPSPContext, config: object
+    ) -> CudaTPSPConfig:
+        if type(config) is int:
+            config = CudaTPSPConfig(config)
+        if (
+            not isinstance(config, CudaTPSPConfig)
+            or type(config.microchunk_tokens_per_rank) is not int
+            or config.microchunk_tokens_per_rank <= 0
+            or type(config.sm_count_target) is not int
+            or config.sm_count_target < 0
+        ):
+            raise ValueError("Invalid CUDA TPSP tuning configuration")
+        return config

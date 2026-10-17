@@ -40,8 +40,7 @@ class TPSPBackend(ABC):
         """Initialize backend resources once, before configuring ops groups."""
 
     @abstractmethod
-    def create_context(self) -> object:
-        """Create independent ops configuration using an already-open backend."""
+    def close(self, context: Any | None = None) -> None: ...
 
     @abstractmethod
     def profile(
@@ -66,12 +65,6 @@ class TPSPBackend(ABC):
         """
 
     @abstractmethod
-    def set_config(self, handle: object, config: object) -> None: ...
-
-    def get_max_microchunk_tokens_per_rank(self) -> int | None:
-        return self.tpsp_max_microchunk_tokens_per_rank
-
-    @abstractmethod
     def fused_gemm_rs_norm_ag(
         self,
         projection_context: object,
@@ -85,7 +78,14 @@ class TPSPBackend(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     @abstractmethod
-    def close(self, context: Any | None = None) -> None: ...
+    def create_context(self) -> object:
+        """Create independent ops configuration using an already-open backend."""
+
+    @abstractmethod
+    def set_config(self, handle: object, config: object) -> None: ...
+
+    def get_max_microchunk_tokens_per_rank(self) -> int | None:
+        return self.tpsp_max_microchunk_tokens_per_rank
 
 
 @dataclass(frozen=True)
