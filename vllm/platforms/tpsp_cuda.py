@@ -359,12 +359,6 @@ class CudaTPSPBackend(TPSPBackend):
     def get_default_compute_engine_count(self) -> int:
         return 0
 
-    def create_context(self) -> CudaTPSPContext:
-        self._get_workspace()
-        context = CudaTPSPContext()
-        self._open_contexts[id(context)] = context
-        return context
-
     def set_config(self, handle: object, config: object) -> None:
         context = self._profile_context(handle)
         context.config = self._resolve_config(context, config)
@@ -414,6 +408,15 @@ class CudaTPSPBackend(TPSPBackend):
             raise RuntimeError("TPSP backend must be opened before use")
         return self._workspace
 
+    def _create_context(self) -> CudaTPSPContext:
+        if self._closed:
+            raise RuntimeError("TPSP backend is closed")
+        if self._workspace is None:
+            raise RuntimeError("TPSP backend must be opened before use")
+        context = CudaTPSPContext()
+        self._open_contexts[id(context)] = context
+        return context
+
     @staticmethod
     def _all_ranks_ready(ready: bool, group: dist.ProcessGroup) -> bool:
         supported = torch.tensor(int(ready), device="cpu")
@@ -421,7 +424,8 @@ class CudaTPSPBackend(TPSPBackend):
         return bool(supported.item())
 
     def _profile_context(self, context: object) -> CudaTPSPContext:
-        self._get_workspace()
+        if self._closed:
+            raise RuntimeError("TPSP backend is closed")
         if context is None:
             raise ValueError("CUDA TPSP requires a projection context")
         if (

@@ -164,10 +164,6 @@ class TPSPBackend(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     @abstractmethod
-    def create_context(self) -> object:
-        """Create independent ops configuration using an already-open backend."""
-
-    @abstractmethod
     def set_config(self, handle: object, config: object) -> None: ...
 
     def get_tuning_configs(
@@ -190,6 +186,10 @@ class TPSPBackend(ABC):
     def get_default_compute_engine_count(self) -> int | None:
         """Return the backend's default-selection sentinel, if it has one."""
         return None
+
+    @abstractmethod
+    def _create_context(self) -> object:
+        """Create independent ops configuration using an already-open backend."""
 
 
 @dataclass
@@ -688,7 +688,7 @@ def _scan_group_chunks(
         )
     for compiled in groups:
         entry = compiled.ops
-        handle = backend.create_context()
+        handle = backend._create_context()
         handles[entry.name] = handle
         bounds = _group_parameter(
             microchunk_tokens_per_rank_min_max,
