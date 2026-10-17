@@ -122,7 +122,12 @@ class TPSPBackend(ABC):
         max_batched_tokens: int,
         group_name: str,
         device: torch.device,
-    ) -> Any | None: ...
+    ) -> bool:
+        """Initialize backend resources once, before configuring ops groups."""
+
+    @abstractmethod
+    def create_context(self) -> object:
+        """Create independent ops configuration using an already-open backend."""
 
     @abstractmethod
     def profile(
@@ -133,7 +138,7 @@ class TPSPBackend(ABC):
         microchunk_tokens: int | None = None,
         threshold_tokens: int | None = None,
     ) -> TPSPContext | None:
-        """Create a backend-specific context for named ops groups.
+        """Configure named ops groups on an already-open backend.
 
         Args:
             ops_groups: Named projection and normalization pairs to profile.
@@ -524,7 +529,6 @@ def profile_tpsp(
         if not enabled:
             for handle in handles.values():
                 backend.close(handle)
-            backend.close()
 
 
 def _projection_inputs(
@@ -674,7 +678,6 @@ def _scan_group_chunks(
     """Select independent chunk/SM configurations per group."""
     if backend._closed:
         raise RuntimeError("TPSP backend is closed")
-    parameter = groups[0].ops.projection.weight
     hidden_size = groups[0].ops.norm.weight.numel()
     if (
         tp_group.world_size < 2
@@ -688,16 +691,7 @@ def _scan_group_chunks(
         )
     for compiled in groups:
         entry = compiled.ops
-        handle = backend.open(
-            dtype=parameter.dtype,
-            tp_size=tp_group.world_size,
-            hidden_size=hidden_size,
-            max_batched_tokens=max_batched_tokens,
-            group_name=tp_group.device_group.group_name,
-            device=parameter.device,
-        )
-        if handle is None:
-            return f"fused backend unavailable for {entry.name}"
+        handle = backend.create_context()
         handles[entry.name] = handle
         bounds = _group_parameter(
             microchunk_tokens_per_rank_min_max,

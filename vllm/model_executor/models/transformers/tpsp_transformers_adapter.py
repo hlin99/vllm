@@ -27,6 +27,7 @@ from vllm.model_executor.models.transformers.fx_utils import (
     single_self_call,
 )
 from vllm.model_executor.models.transformers.tpsp_runtime import (
+    TPSPBackend,
     TPSPContext,
     TPSPNormType,
     TPSPOpsGroup,
@@ -408,29 +409,56 @@ class TransformersDenseTPSP:
         for layer, rewritten in zip(layers, rewrites, strict=True):
             _bind(layer, MethodType(rewritten, layer))
 
+        from vllm.distributed.parallel_state import get_tp_group
+        from vllm.platforms import current_platform
+
+        self.backend: TPSPBackend | None = None
+        backend_cls = current_platform.get_tpsp_backend_cls()
+        if backend_cls is None:
+            logger.warning("Transformers TPSP using regular forward: no backend")
+            return
+        tp_group = get_tp_group()
+        device = torch.device(vllm_config.device_config.device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+        backend = backend_cls(
+            tp_group.device_group.group_name,
+            device,
+        )
+        try:
+            if backend.open(
+                dtype=vllm_config.model_config.dtype,
+                tp_size=tp_group.world_size,
+                hidden_size=hidden_size,
+                max_batched_tokens=self.max_batched_tokens,
+                group_name=tp_group.device_group.group_name,
+                device=device,
+            ):
+                self.backend = backend
+        finally:
+            if self.backend is None:
+                backend.close()
+
     @torch.inference_mode()
     def profile(self) -> None:
         if self.profile_attempted:
             return
         self.profile_attempted = True
-        self.model.eval()
-        from vllm.distributed.parallel_state import get_tp_group
-        from vllm.platforms import current_platform
-
-        backend_cls = current_platform.get_tpsp_backend_cls()
-        if backend_cls is None:
-            logger.warning("Transformers TPSP using regular forward: no backend")
+        backend = self.backend
+        if backend is None:
             return
-        backend = backend_cls(
-            get_tp_group().device_group.group_name,
-            self.groups[0].projection.weight.device,
-        )
-        self.context = backend.profile(
-            self.groups,
-            self.max_batched_tokens,
-            microchunk_tokens=self.microchunk_tokens,
-            threshold_tokens=self.threshold_tokens,
-        )
+        self.model.eval()
+        try:
+            self.context = backend.profile(
+                self.groups,
+                self.max_batched_tokens,
+                microchunk_tokens=self.microchunk_tokens,
+                threshold_tokens=self.threshold_tokens,
+            )
+        finally:
+            if self.context is None:
+                backend.close()
+                self.backend = None
 
     @contextmanager
     def forward_context(self, num_tokens: int, **kwargs) -> Iterator[None]:
