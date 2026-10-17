@@ -84,9 +84,6 @@ class TPSPBackend(ABC):
     @abstractmethod
     def set_config(self, handle: object, config: object) -> None: ...
 
-    def get_max_microchunk_tokens_per_rank(self) -> int | None:
-        return self.tpsp_max_microchunk_tokens_per_rank
-
 
 @dataclass(frozen=True)
 class TPSPProfile:

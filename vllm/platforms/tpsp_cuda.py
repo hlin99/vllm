@@ -131,7 +131,7 @@ class CudaTPSPBackend(TPSPBackend):
             return False
         rank = dist.get_rank(group)
         max_microchunk_tokens_per_rank = math.ceil(max_batched_tokens / tp_size)
-        max_microchunk_cap = self.get_max_microchunk_tokens_per_rank()
+        max_microchunk_cap = self.tpsp_max_microchunk_tokens_per_rank
         if max_microchunk_cap is not None:
             max_microchunk_tokens_per_rank = min(
                 max_microchunk_tokens_per_rank, max_microchunk_cap
