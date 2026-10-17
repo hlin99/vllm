@@ -295,6 +295,78 @@ def test_tpsp_matches_norm_types_against_backend_support(default_vllm_config):
 
 
 @pytest.mark.parametrize(
+    "microchunk_tokens,threshold_tokens,expected_microchunk_per_rank,"
+    "expected_threshold,default_calls",
+    [
+        (None, None, 64, 512, 1),
+        (1000, None, 250, 512, 1),
+        (None, 800, 64, 800, 1),
+        (2000, 2000, 250, 1000, 0),
+    ],
+)
+def test_tpsp_profile_resolves_missing_token_settings(
+    monkeypatch,
+    microchunk_tokens,
+    threshold_tokens,
+    expected_microchunk_per_rank,
+    expected_threshold,
+    default_calls,
+):
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.models.transformers.tpsp_runtime import (
+        TPSPBackend,
+        TPSPOpsGroup,
+    )
+
+    class Backend(TPSPBackend):
+        supported_norm_types = frozenset({"layer_norm"})
+
+        def __init__(self):
+            super().__init__("tp", torch.device("cpu"))
+            self.defaults_called = 0
+            self.configs = []
+
+        def get_default_profile_settings(self):
+            self.defaults_called += 1
+            return 256, 512
+
+        def open(self, **kwargs):
+            return object()
+
+        def set_config(self, handle, config):
+            self.configs.append(config)
+
+        def fused_gemm_rs_norm_ag(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def close(self, context=None):
+            pass
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            world_size=4, device_group=SimpleNamespace(group_name="tp")
+        ),
+    )
+    backend = Backend()
+    with torch.device("meta"):
+        ops_group = TPSPOpsGroup("proj", nn.Linear(8, 8, bias=False), nn.LayerNorm(8))
+
+    context = backend.profile(
+        [ops_group],
+        1000,
+        microchunk_tokens=microchunk_tokens,
+        threshold_tokens=threshold_tokens,
+    )
+
+    assert context is not None
+    assert context.profile.threshold_tokens == expected_threshold
+    assert backend.configs == [expected_microchunk_per_rank]
+    assert backend.defaults_called == default_calls
+
+
+@pytest.mark.parametrize(
     "cls", [GatedRMSNorm, GatedFusedRMSNorm, UntraceableGatedRMSNorm]
 )
 def test_gated_rms_norm_is_not_fused(cls):

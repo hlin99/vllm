@@ -47,6 +47,9 @@ class CudaTPSPBackend(TPSPBackend):
         super().__init__(group_name, device)
         self._open_context_ids: set[int] = set()
 
+    def get_default_profile_settings(self) -> tuple[int, int]:
+        return 256, 512
+
     def open(
         self,
         *,
@@ -201,15 +204,6 @@ class CudaTPSPBackend(TPSPBackend):
         ):
             raise ValueError("Invalid CUDA TPSP tuning configuration")
         return config
-
-    def get_tuning_configs(
-        self,
-        handle: object,
-        microchunk_tokens_per_rank: int,
-        group_name: str | None = None,
-    ) -> tuple[CudaTPSPConfig, ...]:
-        self._profile_context(handle)
-        return (CudaTPSPConfig(microchunk_tokens_per_rank, 0),)
 
     def fused_gemm_rs_norm_ag(
         self,

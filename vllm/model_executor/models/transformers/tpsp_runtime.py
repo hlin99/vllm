@@ -15,8 +15,6 @@ import torch
 from torch import nn
 
 _LOG = logging.getLogger(__name__)
-_STATIC_PROFILE_THRESHOLD_TOKENS = 512
-_STATIC_PROFILE_MICROCHUNK_TOKENS_PER_RANK = 256
 
 # TPSP v1 supports only standard LayerNorm and RMSNorm.
 TPSPNormType = Literal["layer_norm", "rms_norm"]
@@ -74,17 +72,12 @@ class TPSPBackend(ABC):
     @abstractmethod
     def set_config(self, handle: object, config: object) -> None: ...
 
-    def get_tuning_configs(
-        self,
-        handle: object,
-        microchunk_tokens_per_rank: int,
-        group_name: str | None = None,
-    ) -> Sequence[object]:
-        """Return the backend config for a fixed microchunk size per rank."""
-        return (microchunk_tokens_per_rank,)
-
     def get_max_microchunk_tokens_per_rank(self) -> int | None:
         return self.tpsp_max_microchunk_tokens_per_rank
+
+    @abstractmethod
+    def get_default_profile_settings(self) -> tuple[int, int]:
+        """Return global microchunk and threshold defaults when unset."""
 
     @abstractmethod
     def fused_gemm_rs_norm_ag(
@@ -235,28 +228,39 @@ def _build_static_tpsp_context(
     """Build the static TPSP context without profiling or scanning."""
     if backend is None:
         raise ValueError("TPSP requires a backend")
+    if type(max_batched_tokens) is not int or max_batched_tokens <= 0:
+        raise ValueError("TPSP max_batched_tokens must be a positive integer")
+    for name, value in (
+        ("microchunk_tokens", microchunk_tokens),
+        ("threshold_tokens", threshold_tokens),
+    ):
+        if value is not None and (type(value) is not int or value <= 0):
+            raise ValueError(f"TPSP {name} must be a positive integer")
     if not ops_groups or any(not entry.name for entry in ops_groups):
         raise ValueError("TPSP requires named ops groups")
     if len({entry.name for entry in ops_groups}) != len(ops_groups):
         raise ValueError("TPSP ops group names must be unique")
-    if threshold_tokens is not None and (
-        type(threshold_tokens) is not int or threshold_tokens <= 0
-    ):
-        raise ValueError("TPSP threshold tokens must be positive")
-    threshold = (
-        _STATIC_PROFILE_THRESHOLD_TOKENS
-        if threshold_tokens is None
-        else threshold_tokens
-    )
-    if threshold <= 0:
-        raise ValueError("TPSP threshold tokens must be positive")
-    if threshold > max_batched_tokens:
-        _LOG.warning(
-            "TPSP using regular forward: threshold=%d exceeds max_batched_tokens=%d",
-            threshold,
-            max_batched_tokens,
+    effective_microchunk_tokens = microchunk_tokens
+    effective_threshold_tokens = threshold_tokens
+    if effective_microchunk_tokens is None or effective_threshold_tokens is None:
+        default_microchunk_tokens, default_threshold_tokens = (
+            backend.get_default_profile_settings()
         )
-        return None
+        if effective_microchunk_tokens is None:
+            effective_microchunk_tokens = default_microchunk_tokens
+        if effective_threshold_tokens is None:
+            effective_threshold_tokens = default_threshold_tokens
+    assert effective_microchunk_tokens is not None
+    assert effective_threshold_tokens is not None
+    effective_microchunk_tokens = min(effective_microchunk_tokens, max_batched_tokens)
+    effective_threshold_tokens = min(effective_threshold_tokens, max_batched_tokens)
+    if (
+        type(effective_microchunk_tokens) is not int
+        or effective_microchunk_tokens <= 0
+        or type(effective_threshold_tokens) is not int
+        or effective_threshold_tokens <= 0
+    ):
+        raise ValueError("TPSP backend returned invalid default profile settings")
 
     first = ops_groups[0]
     norm_weight = getattr(first.norm, "weight", None)
@@ -282,17 +286,14 @@ def _build_static_tpsp_context(
     if tp_group.world_size < 2 or hidden_size % tp_group.world_size:
         _LOG.warning("TPSP using regular forward: unsupported TP configuration")
         return None
-    microchunk_tokens_per_rank = _STATIC_PROFILE_MICROCHUNK_TOKENS_PER_RANK
-    if microchunk_tokens is not None:
-        microchunk_tokens_per_rank = _microchunk_tokens_per_rank(
-            backend, microchunk_tokens, tp_group.world_size
+    microchunk_tokens_per_rank = math.ceil(
+        effective_microchunk_tokens / tp_group.world_size
+    )
+    max_microchunk_tokens_per_rank = backend.get_max_microchunk_tokens_per_rank()
+    if max_microchunk_tokens_per_rank is not None:
+        microchunk_tokens_per_rank = min(
+            microchunk_tokens_per_rank, max_microchunk_tokens_per_rank
         )
-    else:
-        max_microchunk_tokens_per_rank = backend.get_max_microchunk_tokens_per_rank()
-        if max_microchunk_tokens_per_rank is not None:
-            microchunk_tokens_per_rank = min(
-                microchunk_tokens_per_rank, max_microchunk_tokens_per_rank
-            )
 
     handles: dict[str, object] = {}
     enabled = False
@@ -314,22 +315,11 @@ def _build_static_tpsp_context(
                 )
                 return None
             handles[entry.name] = handle
-            configs = backend.get_tuning_configs(
-                handle,
-                microchunk_tokens_per_rank,
-                entry.name,
-            )
-            if not configs:
-                _LOG.warning(
-                    "TPSP using regular forward: no baseline config for %s",
-                    entry.name,
-                )
-                return None
-            backend.set_config(handle, configs[0])
+            backend.set_config(handle, microchunk_tokens_per_rank)
 
         enabled = True
         return TPSPContext(
-            TPSPProfile(True, threshold, max_batched_tokens),
+            TPSPProfile(True, effective_threshold_tokens, max_batched_tokens),
             backend,
             handles,
         )
@@ -338,22 +328,6 @@ def _build_static_tpsp_context(
             for handle in handles.values():
                 backend.close(handle)
             backend.close()
-
-
-def _microchunk_tokens_per_rank(
-    backend: TPSPBackend, microchunk_tokens: int, tp_size: int
-) -> int:
-    if type(microchunk_tokens) is not int or microchunk_tokens <= 0:
-        raise ValueError("TPSP microchunk tokens must be a positive integer")
-    if type(tp_size) is not int or tp_size <= 0:
-        raise ValueError("TPSP TP size must be a positive integer")
-    microchunk_tokens_per_rank = math.ceil(microchunk_tokens / tp_size)
-    max_microchunk_tokens_per_rank = backend.get_max_microchunk_tokens_per_rank()
-    if max_microchunk_tokens_per_rank is not None:
-        microchunk_tokens_per_rank = min(
-            microchunk_tokens_per_rank, max_microchunk_tokens_per_rank
-        )
-    return microchunk_tokens_per_rank
 
 
 def _projection_input_width(projection: nn.Module) -> int:
