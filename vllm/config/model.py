@@ -1068,6 +1068,11 @@ class ModelConfig:
                 f"got {type(self.max_model_len).__name__}: {self.max_model_len!r}. "
                 "Example: max_model_len=2048"
             )
+        if self.enable_tpsp and not self.using_transformers_backend():
+            raise ValueError(
+                "--enable-tpsp requires the Transformers modeling backend. "
+                "Set --model-impl transformers."
+            )
         if self.enable_prompt_embeds and self.is_encoder_decoder:
             # No encoder-decoder model accepts `inputs_embeds`; their decoders
             # embed `input_ids` internally.
