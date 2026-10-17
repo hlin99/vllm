@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -14,7 +15,9 @@ from torch.distributed import distributed_c10d as c10d
 from vllm.logger import init_logger
 from vllm.model_executor.models.transformers.tpsp_runtime import (
     TPSPBackend,
+    TPSPContext,
     TPSPNormType,
+    TPSPOpsGroup,
 )
 
 logger = init_logger(__name__)
@@ -47,8 +50,54 @@ class CudaTPSPBackend(TPSPBackend):
         super().__init__(group_name, device)
         self._open_context_ids: set[int] = set()
 
-    def get_default_profile_settings(self) -> tuple[int, int]:
-        return 256, 512
+    def profile(
+        self,
+        ops_groups: Sequence[TPSPOpsGroup],
+        max_batched_tokens: int,
+        *,
+        microchunk_tokens: int | None = None,
+        threshold_tokens: int | None = None,
+        chunk_min_max: tuple[int, int] | Mapping[str, tuple[int, int]] | None = None,
+        chunk_step_coarse: int = 256,
+        chunk_step_fine: int = 64,
+    ) -> TPSPContext | None:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_size = get_tp_group().world_size
+        if chunk_min_max is None and microchunk_tokens is None:
+            chunk_min_max = self._chunk_rows_range(max_batched_tokens, tp_size)
+        return super().profile(
+            ops_groups,
+            max_batched_tokens,
+            microchunk_tokens=microchunk_tokens,
+            threshold_tokens=threshold_tokens,
+            chunk_min_max=chunk_min_max,
+            chunk_step_coarse=chunk_step_coarse,
+            chunk_step_fine=chunk_step_fine,
+        )
+
+    def _chunk_rows_range(
+        self, max_batched_tokens: int, tp_size: int
+    ) -> tuple[int, int]:
+        shard_rows = math.ceil(max_batched_tokens / tp_size)
+        max_chunk_rows = math.ceil(shard_rows / self.tpsp_chunk_granularity)
+        max_chunk_rows *= self.tpsp_chunk_granularity
+        cap_rows = self.get_max_microchunk_rows(tp_size)
+        if cap_rows is not None:
+            if cap_rows >= self.tpsp_chunk_granularity:
+                cap_rows = (
+                    cap_rows // self.tpsp_chunk_granularity
+                ) * self.tpsp_chunk_granularity
+            max_chunk_rows = min(max_chunk_rows, cap_rows)
+        return min(self.tpsp_chunk_granularity, max_chunk_rows), max_chunk_rows
+
+    def get_compute_engine_count(self, config: object) -> int | None:
+        if isinstance(config, CudaTPSPConfig):
+            return config.sm_count_target
+        return None
+
+    def get_default_compute_engine_count(self) -> int:
+        return 0
 
     def open(
         self,
@@ -204,6 +253,22 @@ class CudaTPSPBackend(TPSPBackend):
         ):
             raise ValueError("Invalid CUDA TPSP tuning configuration")
         return config
+
+    def get_tuning_configs(
+        self,
+        handle: object,
+        chunk: int,
+        group_name: str | None = None,
+        *,
+        compute_engine_counts: Sequence[int] | None = None,
+        compute_engine_step: int = 6,
+    ) -> tuple[CudaTPSPConfig, ...]:
+        self._profile_context(handle)
+        if compute_engine_counts is not None and any(
+            target != 0 for target in compute_engine_counts
+        ):
+            raise ValueError("TPSP uses the default SM count target 0")
+        return (CudaTPSPConfig(chunk, 0),)
 
     def fused_gemm_rs_norm_ag(
         self,
