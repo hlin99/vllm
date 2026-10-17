@@ -137,6 +137,10 @@ class UnsupportedTPSPNormError(ValueError):
     """Normalization not supported by the Transformers TPSP path."""
 
 
+class UnsupportedTPSPModelError(ValueError):
+    """Transformers model structure not supported by the TPSP path."""
+
+
 def get_tpsp_norm_type(norm: nn.Module) -> TPSPNormType:
     """Identify known normalization implementations without guessing by attributes."""
     from vllm.model_executor.layers.layernorm import (

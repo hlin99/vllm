@@ -205,12 +205,15 @@ class Base(
 
         self.tpsp_adapter = None
         if self.model_config.enable_tpsp:
-            from .tpsp_runtime import UnsupportedTPSPNormError
+            from .tpsp_runtime import (
+                UnsupportedTPSPModelError,
+                UnsupportedTPSPNormError,
+            )
             from .tpsp_transformers_adapter import TransformersDenseTPSP
 
             try:
                 self.tpsp_adapter = TransformersDenseTPSP(self.model, vllm_config)
-            except UnsupportedTPSPNormError as exc:
+            except (UnsupportedTPSPModelError, UnsupportedTPSPNormError) as exc:
                 logger.warning("Transformers TPSP using regular forward: %s", exc)
 
         # Initialize any parameters that have not had their modules replaced
