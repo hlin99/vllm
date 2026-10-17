@@ -823,9 +823,7 @@ class Base(
                     num_tokens = input_ids.numel()
                 else:
                     num_tokens = positions.numel()
-                stack.enter_context(
-                    self.tpsp_adapter.forward_context(num_tokens, **kwargs)
-                )
+                stack.enter_context(self.tpsp_adapter.forward_context(num_tokens))
             outputs = self.model(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,

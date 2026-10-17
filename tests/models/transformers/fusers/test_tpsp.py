@@ -514,23 +514,8 @@ def test_incomplete_forward_raises_and_restores_original_path(install):
 
 
 @pytest.mark.parametrize("name", ["output_attentions", "output_hidden_states"])
-def test_intermediate_outputs_are_rejected_when_active(install, name):
-    adapter, _ = install(Decoder())
-    with (
-        pytest.raises(ValueError, match=name),
-        adapter.forward_context(7, **{name: True}),
-    ):
-        pytest.fail("unsupported request entered the fused forward")
-
-
-def test_cache_options_do_not_disable_local_fusion(install):
+def test_intermediate_outputs_are_rejected_at_initialization(install, name):
     model = Decoder()
-    x = torch.randn(1, 7, 16)
-    expected = model(x)
-    adapter, backend = install(model)
-    with adapter.forward_context(
-        7, use_cache=True, past_key_value=object(), past_key_values=object()
-    ):
-        actual = model(x)
-    torch.testing.assert_close(actual, expected)
-    assert backend.calls == ["o", "down"] * 2
+    model.config = SimpleNamespace(**{name: True})
+    with pytest.raises(UnsupportedTPSPModelError, match="intermediate HF outputs"):
+        install(model)

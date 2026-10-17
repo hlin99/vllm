@@ -19,7 +19,9 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from vllm.distributed import split_tensor_along_last_dim
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.model_executor.models.transformers.fx_utils import (
     block_chain,
     compile_forward,
@@ -270,6 +272,13 @@ def _bind_projection(group: TPSPOpsGroup, norm_type: TPSPNormType) -> None:
         assert state is not None
         if state.expected is not projection or state.residual is None:
             raise RuntimeError(f"Unexpected TPSP {group.name} invocation")
+        if (
+            isinstance(projection, RowParallelLinear)
+            and not projection.input_is_parallel
+        ):
+            x = split_tensor_along_last_dim(x, num_partitions=projection.tp_size)[
+                projection.tp_rank
+            ]
         hidden, state.residual = state.context.backend.fused_gemm_rs_norm_ag(
             state.context.handles[group.name],
             x.reshape(-1, x.shape[-1]).contiguous(),
@@ -307,6 +316,7 @@ class TransformersDenseTPSP:
     """Install two local fusion patterns, retaining the original forward path."""
 
     def __init__(self, model: nn.Module, vllm_config: "VllmConfig") -> None:
+        # TODO: Add TPSP support for quantized models.
         if vllm_config.quant_config is not None or vllm_config.lora_config is not None:
             raise ValueError("TPSP does not support quantization or LoRA")
         self.model = model
@@ -465,13 +475,10 @@ class TransformersDenseTPSP:
                 self.backend = None
 
     @contextmanager
-    def forward_context(self, num_tokens: int, **kwargs) -> Iterator[None]:
+    def forward_context(self, num_tokens: int) -> Iterator[None]:
         context = self.context
         state = None
         if context is not None and context.profile.is_active(num_tokens):
-            for name in ("output_attentions", "output_hidden_states"):
-                if kwargs.get(name) is not None and kwargs[name] is not False:
-                    raise ValueError(f"Transformers TPSP does not support {name}")
             state = _ForwardState(context, self.input_norm)
         token = _FORWARD_STATE.set(state)
         try:

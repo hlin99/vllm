@@ -124,9 +124,10 @@ def _record_tpsp_fusions(model):
 
 
 @multi_gpu_test(num_gpus=2)
-def test_tpsp_local_fusion_end_to_end(vllm_runner, tmp_path, monkeypatch):
+@pytest.mark.parametrize("model_type", ["llama", "qwen3", "glm", "hunyuan_v1_dense"])
+def test_tpsp_local_fusion_end_to_end(vllm_runner, tmp_path, monkeypatch, model_type):
     """Exercise real TPSP prefill, padding, chunking, and original decode."""
-    from transformers import LlamaConfig, LlamaForCausalLM
+    from transformers import AutoModelForCausalLM
 
     from vllm import SamplingParams
     from vllm.platforms import current_platform
@@ -134,17 +135,22 @@ def test_tpsp_local_fusion_end_to_end(vllm_runner, tmp_path, monkeypatch):
     if not current_platform.is_cuda():
         pytest.skip("TPSP currently requires CUDA")
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    config = LlamaConfig(
+    config = AutoConfig.for_model(
+        model_type,
         vocab_size=64,
         hidden_size=128,
         intermediate_size=256,
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=4,
+        head_dim=32,
         max_position_embeddings=64,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
     )
     torch.manual_seed(0)
-    LlamaForCausalLM(config).save_pretrained(tmp_path)
+    AutoModelForCausalLM.from_config(config).save_pretrained(tmp_path)
 
     outputs = []
     for enabled in (False, True):
