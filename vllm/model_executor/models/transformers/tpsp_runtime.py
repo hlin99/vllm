@@ -36,7 +36,12 @@ class TPSPBackend(ABC):
         max_batched_tokens: int,
         group_name: str,
         device: torch.device,
-    ) -> Any | None: ...
+    ) -> bool:
+        """Initialize backend resources once, before configuring ops groups."""
+
+    @abstractmethod
+    def create_context(self) -> object:
+        """Create independent ops configuration using an already-open backend."""
 
     @abstractmethod
     def profile(
@@ -47,7 +52,7 @@ class TPSPBackend(ABC):
         microchunk_tokens: int | None = None,
         threshold_tokens: int | None = None,
     ) -> TPSPContext | None:
-        """Create a backend-specific context for named ops groups.
+        """Configure named ops groups on an already-open backend.
 
         Args:
             ops_groups: Named projection and normalization pairs to configure.

@@ -64,6 +64,10 @@ original forward. Intermediate hidden-state/attention outputs are not supported
 on the active TPSP path. Cache handling remains the responsibility of the
 Transformers backend.
 
+During model construction, the CUDA backend opens one shared P2P workspace for
+both projection groups. Configuration runs after weight loading and does not
+allocate another P2P workspace.
+
 The CUDA backend currently uses static settings, without profiling or scanning.
 `--tpsp-microchunk-tokens` and `--tpsp-threshold-tokens` override the defaults of
 256 and 512 global tokens, respectively. Both are capped at the maximum batched

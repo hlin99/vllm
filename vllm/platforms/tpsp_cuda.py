@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -32,13 +32,17 @@ class CudaTPSPConfig:
 
 
 @dataclass
-class CudaTPSPContext:
+class CudaTPSPWorkspace:
     device: torch.device
     tp_size: int
     rank: int
     control_group: dist.ProcessGroup
     max_microchunk_tokens_per_rank: int
     p2p_handle: int = 0
+
+
+@dataclass
+class CudaTPSPContext:
     config: int | CudaTPSPConfig | None = None
 
 
@@ -53,8 +57,7 @@ class CudaTPSPBackend(TPSPBackend):
     def __init__(self, group_name: str, device: torch.device):
         super().__init__(group_name, device)
         self._open_contexts: dict[int, CudaTPSPContext] = {}
-        self._workspace_context: CudaTPSPContext | None = None
-        self._workspace_key: tuple[int, int, int, int] | None = None
+        self._workspace: CudaTPSPWorkspace | None = None
 
     def profile(
         self,
@@ -112,21 +115,7 @@ class CudaTPSPBackend(TPSPBackend):
         enabled = False
         try:
             for entry in ops_groups:
-                parameter = entry.projection.weight
-                handle = self.open(
-                    dtype=parameter.dtype,
-                    tp_size=tp_group.world_size,
-                    hidden_size=hidden_size,
-                    max_batched_tokens=max_batched_tokens,
-                    group_name=tp_group.device_group.group_name,
-                    device=parameter.device,
-                )
-                if handle is None:
-                    logger.warning(
-                        "CUDA TPSP using regular forward: backend unavailable for %s",
-                        entry.name,
-                    )
-                    return None
+                handle = self.create_context()
                 handles[entry.name] = handle
                 self.set_config(handle, chunk_per_rank)
             context = TPSPContext(
@@ -142,7 +131,6 @@ class CudaTPSPBackend(TPSPBackend):
             if not enabled:
                 for opened in handles.values():
                     self.close(opened)
-                self.close()
 
     def open(
         self,
@@ -153,15 +141,17 @@ class CudaTPSPBackend(TPSPBackend):
         max_batched_tokens: int,
         group_name: str,
         device: torch.device,
-    ) -> CudaTPSPContext | None:
+    ) -> bool:
         if self._closed:
             raise RuntimeError("TPSP backend is closed")
+        if self._workspace is not None:
+            raise RuntimeError("TPSP backend is already open")
         if (
             device != self.device
             or group_name != self.group_name
             or device.type != "cuda"
         ):
-            return None
+            return False
         if (
             dtype != torch.bfloat16
             or tp_size < 2
@@ -175,21 +165,21 @@ class CudaTPSPBackend(TPSPBackend):
                 tp_size,
                 hidden_size,
             )
-            return None
+            return False
         if (
             device.index is not None
             and device.index >= torch.accelerator.device_count()
         ):
             logger.warning("CUDA TPSP device index is unavailable: %s", device.index)
-            return None
+            return False
         try:
             group = c10d._resolve_process_group(group_name)
         except (RuntimeError, ValueError) as exc:
             logger.warning("CUDA TPSP process group is unavailable: %s", exc)
-            return None
+            return False
         if dist.get_world_size(group) != tp_size:
             logger.warning("TPSP unavailable: group_name and tp_size disagree")
-            return None
+            return False
         if not all(
             hasattr(torch.ops._C, name)
             for name in (
@@ -201,17 +191,17 @@ class CudaTPSPBackend(TPSPBackend):
             )
         ):
             logger.warning("CUDA TPSP native operator is not built")
-            return None
+            return False
         from vllm.distributed.parallel_state import get_tp_group
 
         tp_group = get_tp_group()
         if tp_group.device_group is not group:
             logger.warning("CUDA TPSP group is not the active TP group")
-            return None
+            return False
         control_group = tp_group.cpu_group
         if control_group is None:
             logger.warning("CUDA TPSP CPU control group is unavailable")
-            return None
+            return False
         rank = dist.get_rank(group)
         max_microchunk_tokens_per_rank = math.ceil(max_batched_tokens / tp_size)
         max_microchunk_cap = self.get_max_microchunk_tokens_per_rank()
@@ -219,29 +209,13 @@ class CudaTPSPBackend(TPSPBackend):
             max_microchunk_tokens_per_rank = min(
                 max_microchunk_tokens_per_rank, max_microchunk_cap
             )
-        context = CudaTPSPContext(
+        context = CudaTPSPWorkspace(
             device,
             tp_size,
             rank,
             control_group,
             max_microchunk_tokens_per_rank,
         )
-        workspace_key = (
-            tp_size,
-            hidden_size,
-            max_batched_tokens,
-            max_microchunk_tokens_per_rank,
-        )
-        if self._workspace_context is not None:
-            if (
-                workspace_key != self._workspace_key
-                or rank != self._workspace_context.rank
-                or control_group is not self._workspace_context.control_group
-            ):
-                raise ValueError("CUDA TPSP request does not match shared workspace")
-            context.p2p_handle = self._workspace_context.p2p_handle
-            self._open_contexts[id(context)] = context
-            return context
         context.p2p_handle = torch.ops._C.init_tpsp_p2p(
             device.index if device.index is not None else torch.cuda.current_device(),
             tp_size,
@@ -258,7 +232,7 @@ class CudaTPSPBackend(TPSPBackend):
                 logger.warning(
                     "CUDA TPSP P2P allocation is unavailable; disabling TPSP"
                 )
-            return None
+            return False
         local_handles = torch.ops._C.get_tpsp_p2p_handles(context.p2p_handle)
         gathered_handles = [torch.empty_like(local_handles) for _ in range(tp_size)]
         dist.all_gather(gathered_handles, local_handles, group=control_group)
@@ -269,14 +243,25 @@ class CudaTPSPBackend(TPSPBackend):
             dist.barrier(group=control_group)
             if rank == 0:
                 logger.warning("CUDA TPSP P2P mapping is unavailable; disabling TPSP")
-            return None
+            return False
         if rank == 0:
             logger.info(
                 "TPSP enabled with direct P2P for %s tokens per rank",
                 max_microchunk_tokens_per_rank,
             )
-        self._workspace_context = replace(context)
-        self._workspace_key = workspace_key
+        self._workspace = context
+        return True
+
+    def _get_workspace(self) -> CudaTPSPWorkspace:
+        if self._closed:
+            raise RuntimeError("TPSP backend is closed")
+        if self._workspace is None:
+            raise RuntimeError("TPSP backend must be opened before use")
+        return self._workspace
+
+    def create_context(self) -> CudaTPSPContext:
+        self._get_workspace()
+        context = CudaTPSPContext()
         self._open_contexts[id(context)] = context
         return context
 
@@ -287,6 +272,7 @@ class CudaTPSPBackend(TPSPBackend):
         return bool(supported.item())
 
     def _profile_context(self, context: object) -> CudaTPSPContext:
+        self._get_workspace()
         if context is None:
             raise ValueError("CUDA TPSP requires a projection context")
         if (
@@ -294,8 +280,6 @@ class CudaTPSPBackend(TPSPBackend):
             or self._open_contexts.get(id(context)) is not context
         ):
             raise ValueError("CUDA TPSP context belongs to another backend")
-        if not context.p2p_handle:
-            raise ValueError("CUDA TPSP requires an available P2P context")
         return context
 
     def set_config(self, handle: object, config: object) -> None:
@@ -334,8 +318,9 @@ class CudaTPSPBackend(TPSPBackend):
         if norm_type not in self.supported_norm_types:
             raise ValueError(f"CUDA TPSP does not support norm type {norm_type}")
         context = self._profile_context(projection_context)
+        workspace = self._get_workspace()
         hidden_size = norm.weight.numel()
-        tokens_per_rank = (x.size(0) + context.tp_size - 1) // context.tp_size
+        tokens_per_rank = (x.size(0) + workspace.tp_size - 1) // workspace.tp_size
         if residual.shape != (tokens_per_rank, hidden_size):
             raise RuntimeError("TPSP residual shard has an unexpected shape")
         local_residual = residual
@@ -355,20 +340,20 @@ class CudaTPSPBackend(TPSPBackend):
             context, context.config if config is None else config
         )
         microchunk_tokens_per_rank = selected.microchunk_tokens_per_rank
-        p2p_handle = context.p2p_handle
+        p2p_handle = workspace.p2p_handle
         if (
             min(
-                (a.size(0) + context.tp_size - 1) // context.tp_size,
+                (a.size(0) + workspace.tp_size - 1) // workspace.tp_size,
                 microchunk_tokens_per_rank,
             )
-            > context.max_microchunk_tokens_per_rank
+            > workspace.max_microchunk_tokens_per_rank
         ):
             raise ValueError("CUDA TPSP microchunk exceeds P2P workspace capacity")
         if eps <= 0 or (norm_bias is not None and norm_type != "layer_norm"):
             raise ValueError("Invalid CUDA TPSP normalization or chunk configuration")
         if (
             any(
-                t.dtype != torch.bfloat16 or t.device != context.device
+                t.dtype != torch.bfloat16 or t.device != self.device
                 for t in (a, b, norm_weight, local_residual)
             )
             or a.ndim != 2
@@ -382,7 +367,7 @@ class CudaTPSPBackend(TPSPBackend):
         for bias in (projection_bias, norm_bias):
             if bias is not None and (
                 bias.dtype != torch.bfloat16
-                or bias.device != context.device
+                or bias.device != self.device
                 or bias.shape != norm_weight.shape
                 or not bias.is_contiguous()
             ):
@@ -398,7 +383,7 @@ class CudaTPSPBackend(TPSPBackend):
                 eps,
                 1 if norm_type == "layer_norm" else 0,
                 microchunk_tokens_per_rank,
-                context.tp_size,
+                workspace.tp_size,
                 p2p_handle,
                 selected.sm_count_target,
             )
@@ -408,18 +393,14 @@ class CudaTPSPBackend(TPSPBackend):
     def close(self, context: object | None = None) -> None:
         if context is not None:
             context = self._profile_context(context)
-            context.p2p_handle = 0
             del self._open_contexts[id(context)]
         else:
-            workspace = self._workspace_context
+            workspace = self._workspace
             if workspace is not None:
                 torch.cuda.synchronize(workspace.device)
                 dist.barrier(group=workspace.control_group)
                 torch.ops._C.destroy_tpsp_p2p(workspace.p2p_handle)
                 dist.barrier(group=workspace.control_group)
-                self._workspace_context = None
-                self._workspace_key = None
-            for opened in self._open_contexts.values():
-                opened.p2p_handle = 0
+                self._workspace = None
             self._open_contexts.clear()
             self._closed = True

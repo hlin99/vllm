@@ -84,6 +84,13 @@ class ReferenceBackend:
         self.calls = []
         self.shared_output = shared_output
         self.output = None
+        self.open = Mock(return_value=True)
+        self.close = Mock()
+        self.profile = Mock(
+            return_value=TPSPContext(
+                TPSPProfile(True, 4, 32), self, {"o_proj": "o", "down_proj": "down"}
+            )
+        )
 
     def fused_gemm_rs_norm_ag(
         self, handle, x, projection, residual, norm, *, norm_type
@@ -106,25 +113,76 @@ def config():
     return SimpleNamespace(
         quant_config=None,
         lora_config=None,
+        device_config=SimpleNamespace(device=torch.device("cpu")),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
-        model_config=SimpleNamespace(tpsp_microchunk_tokens=4, tpsp_threshold_tokens=4),
+        model_config=SimpleNamespace(
+            dtype=torch.float32, tpsp_microchunk_tokens=4, tpsp_threshold_tokens=4
+        ),
     )
 
 
 @pytest.fixture
 def install(config, monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.platforms import current_platform
+
     # The adapter is independent of TP transport; emulate a one-rank shard here.
     monkeypatch.setattr(tpsp_transformers_adapter, "tpsp_shard_residual", torch.clone)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            world_size=1, device_group=SimpleNamespace(group_name="tp")
+        ),
+    )
 
-    def install(model, shared_output=False):
-        adapter = TransformersDenseTPSP(model, config)
+    def install(model, shared_output=False, *, profile=True):
         backend = ReferenceBackend(shared_output)
-        adapter.context = TPSPContext(
-            TPSPProfile(True, 4, 32), backend, {"o_proj": "o", "down_proj": "down"}
+        monkeypatch.setattr(
+            current_platform, "get_tpsp_backend_cls", lambda: lambda *args: backend
         )
+        adapter = TransformersDenseTPSP(model, config)
+        if profile:
+            adapter.profile()
         return adapter, backend
 
     return install
+
+
+def test_adapter_opens_before_weights_and_profiles_only_once(install):
+    with torch.device("meta"):
+        model = Decoder()
+    adapter, backend = install(model, profile=False)
+    backend.open.assert_called_once_with(
+        dtype=torch.float32,
+        tp_size=1,
+        hidden_size=16,
+        max_batched_tokens=32,
+        group_name="tp",
+        device=torch.device("cpu"),
+    )
+    backend.profile.assert_not_called()
+    model.to_empty(device="cpu")
+    adapter.profile()
+    adapter.profile()
+    backend.profile.assert_called_once()
+    backend.open.assert_called_once()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_adapter_closes_backend_when_profiling_fails(install, raises):
+    adapter, backend = install(Decoder(), profile=False)
+    if raises:
+        backend.profile.side_effect = RuntimeError("profile failed")
+        with pytest.raises(RuntimeError, match="profile failed"):
+            adapter.profile()
+    else:
+        backend.profile.return_value = None
+        adapter.profile()
+    backend.close.assert_called_once()
+    adapter.profile()
+    backend.profile.assert_called_once()
+    assert adapter.context is None and adapter.backend is None
 
 
 @pytest.mark.parametrize("tokens", [2, 7, 8])
@@ -187,10 +245,10 @@ def cuda_tpsp_backend(monkeypatch):
 
 def test_cuda_tpsp_reuses_workspace_without_sharing_configs(cuda_tpsp_backend):
     backend, settings, native = cuda_tpsp_backend
-    o_proj = backend.open(**settings)
-    down_proj = backend.open(**settings)
+    assert backend.open(**settings)
+    o_proj = backend.create_context()
+    down_proj = backend.create_context()
     assert o_proj is not down_proj
-    assert o_proj.p2p_handle == down_proj.p2p_handle == 123
     native.init_tpsp_p2p.assert_called_once_with(0, 2, 0, 16, 16, 32)
     native.get_tpsp_p2p_handles.assert_called_once_with(123)
     native.map_tpsp_p2p.assert_called_once()
@@ -202,8 +260,8 @@ def test_cuda_tpsp_reuses_workspace_without_sharing_configs(cuda_tpsp_backend):
     backend.close(o_proj)
     native.destroy_tpsp_p2p.assert_not_called()
     backend.set_config(down_proj, 2)
-    reopened = backend.open(**settings)
-    assert reopened.p2p_handle == 123
+    reopened = backend.create_context()
+    backend.set_config(reopened, 8)
     native.init_tpsp_p2p.assert_called_once()
     with pytest.raises(ValueError, match="another backend"):
         backend.set_config(o_proj, 4)
@@ -211,19 +269,24 @@ def test_cuda_tpsp_reuses_workspace_without_sharing_configs(cuda_tpsp_backend):
     backend.close()
     backend.close()
     native.destroy_tpsp_p2p.assert_called_once_with(123)
-    assert down_proj.p2p_handle == reopened.p2p_handle == 0
+    with pytest.raises(RuntimeError, match="closed"):
+        backend.set_config(down_proj, 4)
     with pytest.raises(RuntimeError, match="closed"):
         backend.open(**settings)
 
 
-@pytest.mark.parametrize(
-    "field,value", [("hidden_size", 32), ("max_batched_tokens", 64)]
-)
-def test_cuda_tpsp_rejects_incompatible_workspace(cuda_tpsp_backend, field, value):
+def test_cuda_tpsp_requires_open_before_configuring_ops(cuda_tpsp_backend):
+    backend, _, native = cuda_tpsp_backend
+    with pytest.raises(RuntimeError, match="opened before"):
+        backend.create_context()
+    native.init_tpsp_p2p.assert_not_called()
+
+
+def test_cuda_tpsp_rejects_repeated_open(cuda_tpsp_backend):
     backend, settings, native = cuda_tpsp_backend
     backend.open(**settings)
-    with pytest.raises(ValueError, match="shared workspace"):
-        backend.open(**{**settings, field: value})
+    with pytest.raises(RuntimeError, match="already open"):
+        backend.open(**settings)
     native.init_tpsp_p2p.assert_called_once()
     native.destroy_tpsp_p2p.assert_not_called()
 
@@ -235,11 +298,11 @@ def test_cuda_tpsp_failed_workspace_is_not_reused(cuda_tpsp_backend, failure):
         native.init_tpsp_p2p.return_value = 0
     else:
         native.map_tpsp_p2p.return_value = False
-    assert backend.open(**settings) is None
+    assert not backend.open(**settings)
     assert native.destroy_tpsp_p2p.call_count == (failure == "mapping")
     native.init_tpsp_p2p.return_value = 123
     native.map_tpsp_p2p.return_value = True
-    assert backend.open(**settings).p2p_handle == 123
+    assert backend.open(**settings)
     assert native.init_tpsp_p2p.call_count == 2
 
 

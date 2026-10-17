@@ -3,6 +3,7 @@
 """Unit tests for the Transformers modeling backend's RMSNorm fuser."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -335,7 +336,7 @@ def cuda_tpsp_profile(monkeypatch):
             self.configs = []
             self.closed = []
 
-        def open(self, **kwargs):
+        def create_context(self):
             return object()
 
         def set_config(self, handle, config):
@@ -381,8 +382,11 @@ def test_cuda_tpsp_profile_cleans_up_partial_initialization(
     first = ops_groups[0]
     ops_groups.append(TPSPOpsGroup("second", first.projection, first.norm))
     handle = object()
-    pending = iter([handle, None])
-    monkeypatch.setattr(backend, "open", lambda **kwargs: next(pending))
+    monkeypatch.setattr(
+        backend,
+        "create_context",
+        Mock(side_effect=[handle, RuntimeError("context failed")]),
+    )
     if fail_config:
 
         def fail(*args):
@@ -392,8 +396,9 @@ def test_cuda_tpsp_profile_cleans_up_partial_initialization(
         with pytest.raises(RuntimeError, match="configuration failed"):
             backend.profile(ops_groups, 1000)
     else:
-        assert backend.profile(ops_groups, 1000) is None
-    assert backend.closed == [handle, None]
+        with pytest.raises(RuntimeError, match="context failed"):
+            backend.profile(ops_groups, 1000)
+    assert backend.closed == [handle]
 
 
 @pytest.mark.parametrize(
