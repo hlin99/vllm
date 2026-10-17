@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -13,8 +12,6 @@ from typing import Any, Literal
 
 import torch
 from torch import nn
-
-_LOG = logging.getLogger(__name__)
 
 # TPSP v1 supports only standard LayerNorm and RMSNorm.
 TPSPNormType = Literal["layer_norm", "rms_norm"]
@@ -41,6 +38,7 @@ class TPSPBackend(ABC):
         device: torch.device,
     ) -> Any | None: ...
 
+    @abstractmethod
     def profile(
         self,
         ops_groups: Sequence[TPSPOpsGroup],
@@ -49,7 +47,7 @@ class TPSPBackend(ABC):
         microchunk_tokens: int | None = None,
         threshold_tokens: int | None = None,
     ) -> TPSPContext | None:
-        """Create a static baseline context for named ops groups.
+        """Create a backend-specific context for named ops groups.
 
         Args:
             ops_groups: Named projection and normalization pairs to configure.
@@ -58,26 +56,15 @@ class TPSPBackend(ABC):
             threshold_tokens: Optional global token threshold override.
 
         Returns:
-            The baseline TPSP context, or None when unsupported.
+            The TPSP context, or None when unsupported.
 
         """
-        return _build_static_tpsp_context(
-            self,
-            ops_groups,
-            max_batched_tokens,
-            microchunk_tokens=microchunk_tokens,
-            threshold_tokens=threshold_tokens,
-        )
 
     @abstractmethod
     def set_config(self, handle: object, config: object) -> None: ...
 
     def get_max_microchunk_tokens_per_rank(self) -> int | None:
         return self.tpsp_max_microchunk_tokens_per_rank
-
-    @abstractmethod
-    def get_default_profile_settings(self) -> tuple[int, int]:
-        """Return global microchunk and threshold defaults when unset."""
 
     @abstractmethod
     def fused_gemm_rs_norm_ag(
@@ -197,13 +184,6 @@ def get_tpsp_norm_type(norm: nn.Module) -> TPSPNormType:
     return norm_type
 
 
-def _unsupported_tpsp_norm_types(
-    backend: TPSPBackend, ops_groups: Sequence[TPSPOpsGroup]
-) -> frozenset[TPSPNormType]:
-    norm_types = {get_tpsp_norm_type(entry.norm) for entry in ops_groups}
-    return frozenset(norm_types - backend.supported_norm_types)
-
-
 def tpsp_shard_residual(residual: torch.Tensor) -> torch.Tensor:
     """Return the current TP rank's padded shard of a full residual."""
     from vllm.distributed.parallel_state import get_tp_group
@@ -219,129 +199,3 @@ def tpsp_shard_residual(residual: torch.Tensor) -> torch.Tensor:
     shard = residual.new_zeros((rows, residual.size(1)))
     shard[:count] = residual[start : start + count]
     return shard
-
-
-def _build_static_tpsp_context(
-    backend: Any,
-    ops_groups: Sequence[TPSPOpsGroup],
-    max_batched_tokens: int,
-    *,
-    microchunk_tokens: int | None = None,
-    threshold_tokens: int | None = None,
-) -> TPSPContext | None:
-    """Build the static TPSP context without profiling or scanning."""
-    if backend is None:
-        raise ValueError("TPSP requires a backend")
-    if type(max_batched_tokens) is not int or max_batched_tokens <= 0:
-        raise ValueError("TPSP max_batched_tokens must be a positive integer")
-    for name, value in (
-        ("microchunk_tokens", microchunk_tokens),
-        ("threshold_tokens", threshold_tokens),
-    ):
-        if value is not None and (type(value) is not int or value <= 0):
-            raise ValueError(f"TPSP {name} must be a positive integer")
-    if not ops_groups or any(not entry.name for entry in ops_groups):
-        raise ValueError("TPSP requires named ops groups")
-    if len({entry.name for entry in ops_groups}) != len(ops_groups):
-        raise ValueError("TPSP ops group names must be unique")
-    effective_microchunk_tokens = microchunk_tokens
-    effective_threshold_tokens = threshold_tokens
-    if effective_microchunk_tokens is None or effective_threshold_tokens is None:
-        default_microchunk_tokens, default_threshold_tokens = (
-            backend.get_default_profile_settings()
-        )
-        if effective_microchunk_tokens is None:
-            effective_microchunk_tokens = default_microchunk_tokens
-        if effective_threshold_tokens is None:
-            effective_threshold_tokens = default_threshold_tokens
-    assert effective_microchunk_tokens is not None
-    assert effective_threshold_tokens is not None
-    effective_microchunk_tokens = min(effective_microchunk_tokens, max_batched_tokens)
-    effective_threshold_tokens = min(effective_threshold_tokens, max_batched_tokens)
-    if (
-        type(effective_microchunk_tokens) is not int
-        or effective_microchunk_tokens <= 0
-        or type(effective_threshold_tokens) is not int
-        or effective_threshold_tokens <= 0
-    ):
-        raise ValueError("TPSP backend returned invalid default profile settings")
-
-    first = ops_groups[0]
-    norm_weight = getattr(first.norm, "weight", None)
-    if not isinstance(norm_weight, torch.Tensor):
-        raise ValueError("TPSP normalizations require a weight tensor")
-    hidden_size = norm_weight.numel()
-    for entry in ops_groups:
-        _projection_input_width(entry.projection)
-        weight = getattr(entry.norm, "weight", None)
-        if not isinstance(weight, torch.Tensor) or weight.numel() != hidden_size:
-            raise ValueError("TPSP ops groups require matching norm hidden sizes")
-    if unsupported := _unsupported_tpsp_norm_types(backend, ops_groups):
-        _LOG.warning(
-            "TPSP using regular forward: runtime or backend does not support "
-            "norm types %s",
-            ", ".join(sorted(unsupported)),
-        )
-        return None
-
-    from vllm.distributed.parallel_state import get_tp_group
-
-    tp_group = get_tp_group()
-    if tp_group.world_size < 2 or hidden_size % tp_group.world_size:
-        _LOG.warning("TPSP using regular forward: unsupported TP configuration")
-        return None
-    microchunk_tokens_per_rank = math.ceil(
-        effective_microchunk_tokens / tp_group.world_size
-    )
-    max_microchunk_tokens_per_rank = backend.get_max_microchunk_tokens_per_rank()
-    if max_microchunk_tokens_per_rank is not None:
-        microchunk_tokens_per_rank = min(
-            microchunk_tokens_per_rank, max_microchunk_tokens_per_rank
-        )
-
-    handles: dict[str, object] = {}
-    enabled = False
-    try:
-        for entry in ops_groups:
-            parameter = entry.projection.weight
-            handle = backend.open(
-                dtype=parameter.dtype,
-                tp_size=tp_group.world_size,
-                hidden_size=hidden_size,
-                max_batched_tokens=max_batched_tokens,
-                group_name=tp_group.device_group.group_name,
-                device=parameter.device,
-            )
-            if handle is None:
-                _LOG.warning(
-                    "TPSP using regular forward: fused backend unavailable for %s",
-                    entry.name,
-                )
-                return None
-            handles[entry.name] = handle
-            backend.set_config(handle, microchunk_tokens_per_rank)
-
-        enabled = True
-        return TPSPContext(
-            TPSPProfile(True, effective_threshold_tokens, max_batched_tokens),
-            backend,
-            handles,
-        )
-    finally:
-        if not enabled:
-            for handle in handles.values():
-                backend.close(handle)
-            backend.close()
-
-
-def _projection_input_width(projection: nn.Module) -> int:
-    input_width = getattr(projection, "input_size_per_partition", None)
-    if type(input_width) is int and input_width > 0:
-        return input_width
-    weight = getattr(projection, "weight", None)
-    if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
-        raise ValueError("TPSP projections must have a two-dimensional weight")
-    input_width = weight.shape[1]
-    if input_width <= 0:
-        raise ValueError("TPSP projection input width must be positive")
-    return input_width

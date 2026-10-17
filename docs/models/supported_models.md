@@ -64,6 +64,12 @@ original forward. Intermediate hidden-state/attention outputs are not supported
 on the active TPSP path. Cache handling remains the responsibility of the
 Transformers backend.
 
+The CUDA backend currently uses static settings, without profiling or scanning.
+`--tpsp-microchunk-tokens` and `--tpsp-threshold-tokens` override the defaults of
+256 and 512 global tokens, respectively. Both are capped at the maximum batched
+token count; the microchunk is converted to per-rank rows, rounded up and capped
+at the CUDA workspace capacity. The SM target remains 0 (the backend default).
+
 #### Custom models
 
 If a model is neither supported natively by vLLM nor Transformers, it can still be used in vLLM!
