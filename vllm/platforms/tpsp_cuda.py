@@ -12,7 +12,10 @@ import torch.distributed as dist
 from torch.distributed import distributed_c10d as c10d
 
 from vllm.logger import init_logger
-from vllm.model_executor.models.transformers.tpsp_runtime import TPSPBackend
+from vllm.model_executor.models.transformers.tpsp_runtime import (
+    TPSPBackend,
+    TPSPNormType,
+)
 
 logger = init_logger(__name__)
 
@@ -37,6 +40,9 @@ class CudaTPSPContext:
 class CudaTPSPBackend(TPSPBackend):
     tpsp_chunk_granularity = 64
     tpsp_max_microchunk_rows = 4_096
+    supported_norm_types: frozenset[TPSPNormType] = frozenset(
+        {"layer_norm", "rms_norm"}
+    )
 
     def __init__(self, group_name: str, device: torch.device):
         super().__init__(group_name, device)
@@ -207,7 +213,7 @@ class CudaTPSPBackend(TPSPBackend):
         norm: torch.nn.Module,
         *,
         config: object | None = None,
-        norm_type: str = "rms_norm",
+        norm_type: TPSPNormType = "rms_norm",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._closed:
             raise RuntimeError("TPSP backend is closed")

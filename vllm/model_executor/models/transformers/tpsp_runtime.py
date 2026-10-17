@@ -9,7 +9,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import nn
@@ -18,11 +18,14 @@ _LOG = logging.getLogger(__name__)
 _STATIC_PROFILE_THRESHOLD_TOKENS = 512
 _STATIC_PROFILE_CHUNK_ROWS = 256
 
+TPSPNormType = Literal["layer_norm", "rms_norm"]
+
 
 class TPSPBackend(ABC):
     tpsp_chunk_granularity: int
     tpsp_max_microchunk_rows: int | None = None
     tpsp_max_microchunk_tokens: int | None = None
+    supported_norm_types: frozenset[TPSPNormType] = frozenset()
 
     def __init__(self, group_name: str, device: torch.device) -> None:
         self.group_name = group_name
@@ -96,7 +99,7 @@ class TPSPBackend(ABC):
         norm: nn.Module,
         *,
         config: object | None = None,
-        norm_type: str = "rms_norm",
+        norm_type: TPSPNormType = "rms_norm",
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     @abstractmethod
@@ -144,21 +147,30 @@ class UnsupportedTPSPNormError(ValueError):
     """Normalization not supported by the Transformers TPSP path."""
 
 
-def get_tpsp_norm_type(norm: nn.Module) -> str:
-    """Return the fused normalization type after validating its parameters."""
-    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+def get_tpsp_norm_type(norm: nn.Module) -> TPSPNormType:
+    """Identify known normalization implementations without guessing by attributes."""
+    from vllm.model_executor.layers.layernorm import (
+        GemmaRMSNorm,
+        LayerNorm,
+        RMSNorm,
+    )
+    from vllm.model_executor.models.transformers.fusers.rms_norm import (
+        TPAwareGemmaRMSNorm,
+        TPAwareRMSNorm,
+    )
 
-    if isinstance(norm, GemmaRMSNorm):
+    norm_cls = type(norm)
+    if norm_cls in (GemmaRMSNorm, TPAwareGemmaRMSNorm):
         raise UnsupportedTPSPNormError("TPSP does not support offset-weight RMSNorm")
     weight = getattr(norm, "weight", None)
     if not isinstance(weight, torch.Tensor) or weight.ndim != 1:
         raise UnsupportedTPSPNormError(
             f"Unsupported TPSP normalization {type(norm).__name__}"
         )
-    if isinstance(norm, nn.LayerNorm) or hasattr(norm, "eps"):
-        norm_type = "layer_norm"
+    if norm_cls in (nn.LayerNorm, LayerNorm):
+        norm_type: TPSPNormType = "layer_norm"
         eps = getattr(norm, "eps", None)
-    elif hasattr(norm, "variance_epsilon"):
+    elif norm_cls in (RMSNorm, TPAwareRMSNorm):
         norm_type = "rms_norm"
         eps = norm.variance_epsilon
     else:
@@ -172,6 +184,13 @@ def get_tpsp_norm_type(norm: nn.Module) -> str:
     if eps <= 0:
         raise ValueError("TPSP norm_eps must be positive")
     return norm_type
+
+
+def _unsupported_tpsp_norm_types(
+    backend: TPSPBackend, ops_groups: Sequence[TPSPOpsGroup]
+) -> frozenset[TPSPNormType]:
+    norm_types = {get_tpsp_norm_type(entry.norm) for entry in ops_groups}
+    return frozenset(norm_types - backend.supported_norm_types)
 
 
 def tpsp_shard_residual(residual: torch.Tensor) -> torch.Tensor:
@@ -235,7 +254,12 @@ def _build_static_tpsp_context(
         weight = getattr(entry.norm, "weight", None)
         if not isinstance(weight, torch.Tensor) or weight.numel() != hidden_size:
             raise ValueError("TPSP ops groups require matching norm hidden sizes")
-        get_tpsp_norm_type(entry.norm)
+    if unsupported := _unsupported_tpsp_norm_types(backend, ops_groups):
+        _LOG.warning(
+            "TPSP using regular forward: backend does not support norm types %s",
+            ", ".join(sorted(unsupported)),
+        )
+        return None
 
     from vllm.distributed.parallel_state import get_tp_group
 

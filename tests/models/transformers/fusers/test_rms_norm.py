@@ -228,6 +228,49 @@ def test_non_rms_norms_are_not_matched(cls):
     assert get_fuser(module, RMSNormFuser) is None
 
 
+def test_tpsp_norm_type_accepts_known_norm_implementations(default_vllm_config):
+    from vllm.model_executor.layers.layernorm import (
+        LayerNorm as VllmLayerNorm,
+    )
+    from vllm.model_executor.layers.layernorm import (
+        RMSNorm as VllmRMSNorm,
+    )
+    from vllm.model_executor.models.transformers.fusers.rms_norm import (
+        TPAwareRMSNorm,
+    )
+    from vllm.model_executor.models.transformers.tpsp_runtime import (
+        get_tpsp_norm_type,
+    )
+
+    with torch.device("meta"):
+        norms = (
+            (nn.LayerNorm(16), "layer_norm"),
+            (VllmLayerNorm(16), "layer_norm"),
+            (VllmRMSNorm(16), "rms_norm"),
+            (TPAwareRMSNorm(16), "rms_norm"),
+        )
+    for norm, expected in norms:
+        assert get_tpsp_norm_type(norm) == expected
+
+
+def test_tpsp_norm_type_rejects_unknown_implementations():
+    from vllm.model_executor.models.transformers.tpsp_runtime import (
+        UnsupportedTPSPNormError,
+        get_tpsp_norm_type,
+    )
+
+    with torch.device("meta"):
+        norm = nn.RMSNorm(16)
+    with pytest.raises(UnsupportedTPSPNormError):
+        get_tpsp_norm_type(norm)
+
+
+def test_cuda_tpsp_declares_supported_norm_types():
+    from vllm.platforms.tpsp_cuda import CudaTPSPBackend
+
+    assert CudaTPSPBackend.supported_norm_types == {"layer_norm", "rms_norm"}
+
+
 @pytest.mark.parametrize(
     "cls", [GatedRMSNorm, GatedFusedRMSNorm, UntraceableGatedRMSNorm]
 )
