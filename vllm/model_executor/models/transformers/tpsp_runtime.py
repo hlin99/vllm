@@ -22,8 +22,8 @@ from torch.distributed import distributed_c10d as c10d
 
 _LOG = logging.getLogger(__name__)
 _TRIALS = 3
-_COARSE_CHUNK_STEP = 256
-_FINE_CHUNK_STEP = 64
+_COARSE_MICROCHUNK_STEP_PER_RANK = 256
+_FINE_MICROCHUNK_STEP_PER_RANK = 64
 _COARSE_COMPUTE_ENGINE_STEP = 6
 _FINE_COMPUTE_ENGINE_STEP = 1
 _FINALIST_COUNT = 3
@@ -131,50 +131,45 @@ class TPSPBackend(ABC):
         *,
         microchunk_tokens: int | None = None,
         threshold_tokens: int | None = None,
-        chunk_min_max: tuple[int, int] | Mapping[str, tuple[int, int]] | None = None,
-        chunk_step_coarse: int = _COARSE_CHUNK_STEP,
-        chunk_step_fine: int = _FINE_CHUNK_STEP,
     ) -> TPSPContext | None:
-        """Profile ops groups, honoring any explicitly fixed token settings.
+        """Create a static context, filling unset settings from the backend.
 
         Args:
             ops_groups: Named projection and normalization pairs to profile.
             max_batched_tokens: Maximum scheduler token count to profile.
-            microchunk_tokens: Fixed global token size, or None to scan.
-            threshold_tokens: Fixed global threshold, or None to scan.
-            chunk_min_max: Per-group chunk-row bounds, or shared row bounds.
-            chunk_step_coarse: Step for default-count chunk candidates.
-            chunk_step_fine: Step for the full chunk probe and local refinement.
+            microchunk_tokens: Optional global microchunk override.
+            threshold_tokens: Optional global threshold override.
 
         Returns:
-            The selected TPSP context, or None when profiling is inconclusive.
+            The static TPSP context, or None when unsupported.
 
         """
-        return profile_tpsp(
+        return _build_static_tpsp_context(
             self,
             ops_groups,
             max_batched_tokens,
             microchunk_tokens=microchunk_tokens,
             threshold_tokens=threshold_tokens,
-            chunk_min_max=chunk_min_max,
-            chunk_step_coarse=chunk_step_coarse,
-            chunk_step_fine=chunk_step_fine,
         )
 
     @abstractmethod
     def set_config(self, handle: object, config: object) -> None: ...
 
+    @abstractmethod
+    def get_default_profile_settings(self) -> tuple[int, int]:
+        """Return global microchunk and threshold defaults when unset."""
+
     def get_tuning_configs(
         self,
         handle: object,
-        chunk: int,
+        microchunk_tokens_per_rank: int,
         group_name: str | None = None,
         *,
         compute_engine_counts: Sequence[int] | None = None,
         compute_engine_step: int = _COARSE_COMPUTE_ENGINE_STEP,
     ) -> Sequence[object]:
-        """Return chunk configs for the requested compute-engine counts."""
-        return (chunk,)
+        """Return microchunk configs for the requested compute-engine counts."""
+        return (microchunk_tokens_per_rank,)
 
     def get_compute_engine_count(self, config: object) -> int | None:
         """Return the compute-engine count represented by a tuning config."""
@@ -185,10 +180,8 @@ class TPSPBackend(ABC):
         """Return the backend's default-selection sentinel, if it has one."""
         return None
 
-    def get_max_microchunk_rows(self, tp_size: int) -> int | None:
-        if self.tpsp_max_microchunk_tokens is not None:
-            return math.ceil(self.tpsp_max_microchunk_tokens / tp_size)
-        return self.tpsp_max_microchunk_rows
+    def get_max_microchunk_tokens_per_rank(self) -> int | None:
+        return self.tpsp_max_microchunk_tokens_per_rank
 
     @abstractmethod
     def fused_gemm_rs_norm_ag(
@@ -360,6 +353,117 @@ def _unsupported_tpsp_norm_types(
     return frozenset(norm_types - backend.supported_norm_types)
 
 
+def _build_static_tpsp_context(
+    backend: TPSPBackend,
+    ops_groups: Sequence[TPSPOpsGroup],
+    max_batched_tokens: int,
+    *,
+    microchunk_tokens: int | None = None,
+    threshold_tokens: int | None = None,
+) -> TPSPContext | None:
+    """Build a static context, using backend defaults only for missing values."""
+    if type(max_batched_tokens) is not int or max_batched_tokens <= 0:
+        raise ValueError("TPSP max_batched_tokens must be a positive integer")
+    for name, value in (
+        ("microchunk_tokens", microchunk_tokens),
+        ("threshold_tokens", threshold_tokens),
+    ):
+        if value is not None and (type(value) is not int or value <= 0):
+            raise ValueError(f"TPSP {name} must be a positive integer")
+    if not ops_groups or any(not entry.name for entry in ops_groups):
+        raise ValueError("TPSP requires named ops groups")
+    if len({entry.name for entry in ops_groups}) != len(ops_groups):
+        raise ValueError("TPSP ops group names must be unique")
+
+    effective_microchunk_tokens = microchunk_tokens
+    effective_threshold_tokens = threshold_tokens
+    if effective_microchunk_tokens is None or effective_threshold_tokens is None:
+        default_microchunk_tokens, default_threshold_tokens = (
+            backend.get_default_profile_settings()
+        )
+        if effective_microchunk_tokens is None:
+            effective_microchunk_tokens = default_microchunk_tokens
+        if effective_threshold_tokens is None:
+            effective_threshold_tokens = default_threshold_tokens
+    assert effective_microchunk_tokens is not None
+    assert effective_threshold_tokens is not None
+    if (
+        type(effective_microchunk_tokens) is not int
+        or effective_microchunk_tokens <= 0
+        or type(effective_threshold_tokens) is not int
+        or effective_threshold_tokens <= 0
+    ):
+        raise ValueError("TPSP backend returned invalid default profile settings")
+    effective_microchunk_tokens = min(effective_microchunk_tokens, max_batched_tokens)
+    effective_threshold_tokens = min(effective_threshold_tokens, max_batched_tokens)
+
+    norm_weight = getattr(ops_groups[0].norm, "weight", None)
+    if not isinstance(norm_weight, torch.Tensor):
+        raise ValueError("TPSP normalizations require a weight tensor")
+    hidden_size = norm_weight.numel()
+    for entry in ops_groups:
+        _projection_input_width(entry.projection)
+        weight = getattr(entry.norm, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.numel() != hidden_size:
+            raise ValueError("TPSP ops groups require matching norm hidden sizes")
+    if unsupported := _unsupported_tpsp_norm_types(backend, ops_groups):
+        _LOG.warning(
+            "TPSP using regular forward: runtime or backend does not support "
+            "norm types %s",
+            ", ".join(sorted(unsupported)),
+        )
+        return None
+
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp_group = get_tp_group()
+    if tp_group.world_size < 2 or hidden_size % tp_group.world_size:
+        _LOG.warning("TPSP using regular forward: unsupported TP configuration")
+        return None
+    microchunk_tokens_per_rank = math.ceil(
+        effective_microchunk_tokens / tp_group.world_size
+    )
+    max_microchunk_tokens_per_rank = backend.get_max_microchunk_tokens_per_rank()
+    if max_microchunk_tokens_per_rank is not None:
+        microchunk_tokens_per_rank = min(
+            microchunk_tokens_per_rank, max_microchunk_tokens_per_rank
+        )
+
+    handles: dict[str, object] = {}
+    enabled = False
+    try:
+        for entry in ops_groups:
+            parameter = entry.projection.weight
+            handle = backend.open(
+                dtype=parameter.dtype,
+                tp_size=tp_group.world_size,
+                hidden_size=hidden_size,
+                max_batched_tokens=max_batched_tokens,
+                group_name=tp_group.device_group.group_name,
+                device=parameter.device,
+            )
+            if handle is None:
+                _LOG.warning(
+                    "TPSP using regular forward: fused backend unavailable for %s",
+                    entry.name,
+                )
+                return None
+            handles[entry.name] = handle
+            backend.set_config(handle, microchunk_tokens_per_rank)
+
+        enabled = True
+        return TPSPContext(
+            TPSPProfile(True, effective_threshold_tokens, max_batched_tokens),
+            backend,
+            handles,
+        )
+    finally:
+        if not enabled:
+            for handle in handles.values():
+                backend.close(handle)
+            backend.close()
+
+
 def tpsp_shard_residual(residual: torch.Tensor) -> torch.Tensor:
     """Return the current TP rank's padded shard of a full residual."""
     from vllm.distributed.parallel_state import get_tp_group
@@ -399,11 +503,13 @@ def profile_tpsp(
     *,
     microchunk_tokens: int | None = None,
     threshold_tokens: int | None = None,
-    chunk_min_max: tuple[int, int] | Mapping[str, tuple[int, int]] | None = None,
-    chunk_step_coarse: int = _COARSE_CHUNK_STEP,
-    chunk_step_fine: int = _FINE_CHUNK_STEP,
+    microchunk_tokens_per_rank_min_max: (
+        tuple[int, int] | Mapping[str, tuple[int, int]] | None
+    ) = None,
+    microchunk_step_coarse_per_rank: int = _COARSE_MICROCHUNK_STEP_PER_RANK,
+    microchunk_step_fine_per_rank: int = _FINE_MICROCHUNK_STEP_PER_RANK,
 ) -> TPSPContext | None:
-    """Profile chunk sizes and threshold, using fixed token overrides when given.
+    """Profile microchunk sizes and threshold, honoring provided token values.
 
     1. Connect each group's projection and norm into a runnable path.
     2. Open a handle, probe chunks, and jointly refine each group's best region.
@@ -417,9 +523,9 @@ def profile_tpsp(
         max_batched_tokens: Maximum scheduler token count to profile.
         microchunk_tokens: Fixed global token size, or None to scan.
         threshold_tokens: Fixed global threshold, or None to scan.
-        chunk_min_max: Per-group chunk-row bounds, or shared row bounds.
-        chunk_step_coarse: Step for default-count chunk candidates.
-        chunk_step_fine: Step for the full chunk probe and local refinement.
+        microchunk_tokens_per_rank_min_max: Per-group per-rank microchunk bounds.
+        microchunk_step_coarse_per_rank: Step for coarse candidates.
+        microchunk_step_fine_per_rank: Step for local refinement.
 
     Returns:
         The selected TPSP context, or None when profiling is inconclusive.
@@ -427,6 +533,8 @@ def profile_tpsp(
     """
     if backend is None:
         raise ValueError("TPSP profiling requires a backend")
+    if type(max_batched_tokens) is not int or max_batched_tokens <= 0:
+        raise ValueError("TPSP max_batched_tokens must be a positive integer")
     if microchunk_tokens is not None and (
         type(microchunk_tokens) is not int or microchunk_tokens <= 0
     ):
@@ -435,8 +543,10 @@ def profile_tpsp(
         type(threshold_tokens) is not int or threshold_tokens <= 0
     ):
         raise ValueError("TPSP threshold tokens must be a positive integer")
-    if threshold_tokens is not None and threshold_tokens > max_batched_tokens:
-        raise ValueError("TPSP threshold tokens exceed max_batched_tokens")
+    if microchunk_tokens is not None:
+        microchunk_tokens = min(microchunk_tokens, max_batched_tokens)
+    if threshold_tokens is not None:
+        threshold_tokens = min(threshold_tokens, max_batched_tokens)
 
     # Step 1: assemble runnable ops groups.
     compiled = _compile_ops_groups(ops_groups)
@@ -454,17 +564,17 @@ def profile_tpsp(
             f"backend does not support norm types {', '.join(sorted(unsupported))}"
         )
 
-    scan_max_batched_tokens = max_batched_tokens - max_batched_tokens % group.world_size
+    scan_max_batched_tokens = max_batched_tokens
 
     started = time.perf_counter()
     enabled = False
     threshold = None
     handles: dict[str, object] = {}
     try:
-        if scan_max_batched_tokens < group.world_size:
-            return disabled("no TP-aligned token count within max_batched_tokens")
+        if scan_max_batched_tokens < 1:
+            return disabled("max_batched_tokens must be positive")
 
-        # Step 2: select a chunk for each group.
+        # Step 2: select a microchunk size for each group.
         if reason := _scan_group_chunks(
             backend,
             compiled,
@@ -472,9 +582,9 @@ def profile_tpsp(
             max_batched_tokens,
             handles,
             microchunk_tokens=microchunk_tokens,
-            chunk_min_max=chunk_min_max,
-            chunk_step_coarse=chunk_step_coarse,
-            chunk_step_fine=chunk_step_fine,
+            microchunk_tokens_per_rank_min_max=microchunk_tokens_per_rank_min_max,
+            microchunk_step_coarse_per_rank=microchunk_step_coarse_per_rank,
+            microchunk_step_fine_per_rank=microchunk_step_fine_per_rank,
         ):
             return disabled(reason)
 
@@ -598,7 +708,7 @@ def _run_fused_projection(
     projection: nn.Module,
     norm: nn.Module,
     inputs: _ProjectionInputs,
-    chunk: object | None = None,
+    microchunk_config: object | None = None,
 ) -> torch.Tensor:
     return backend.fused_gemm_rs_norm_ag(
         projection_context,
@@ -607,7 +717,7 @@ def _run_fused_projection(
         inputs.local_residual,
         norm,
         norm_type=get_tpsp_norm_type(norm),
-        config=chunk,
+        config=microchunk_config,
     )[0]
 
 
@@ -654,16 +764,15 @@ def _scan_group_chunks(
     handles: dict[str, object],
     *,
     microchunk_tokens: int | None,
-    chunk_min_max: tuple[int, int] | Mapping[str, tuple[int, int]] | None,
-    chunk_step_coarse: int,
-    chunk_step_fine: int,
+    microchunk_tokens_per_rank_min_max: (
+        tuple[int, int] | Mapping[str, tuple[int, int]] | None
+    ),
+    microchunk_step_coarse_per_rank: int,
+    microchunk_step_fine_per_rank: int,
 ) -> str | None:
-    """Select an independent chunk per group, retaining opened handles."""
+    """Select an independent microchunk size per group."""
     if backend._closed:
         raise RuntimeError("TPSP backend is closed")
-    granularity = backend.tpsp_chunk_granularity
-    if type(granularity) is not int or granularity <= 0:
-        raise ValueError("TPSP chunk granularity must be a positive integer")
     parameter = groups[0].ops.projection.weight
     hidden_size = groups[0].ops.norm.weight.numel()
     if (
@@ -690,12 +799,12 @@ def _scan_group_chunks(
             return f"fused backend unavailable for {entry.name}"
         handles[entry.name] = handle
         if microchunk_tokens is not None:
-            chunk_rows = _microchunk_rows_from_tokens(
+            microchunk_tokens_per_rank = _microchunk_tokens_per_rank(
                 backend, microchunk_tokens, tp_group.world_size
             )
             configs = backend.get_tuning_configs(
                 handle,
-                chunk_rows,
+                microchunk_tokens_per_rank,
                 group_name=entry.name,
                 compute_engine_counts=(0,),
             )
@@ -703,7 +812,7 @@ def _scan_group_chunks(
                 return f"no fixed TPSP config available for {entry.name}"
             config = configs[0]
         else:
-            candidate = _scan_chunk(
+            candidate = _scan_microchunk(
                 backend,
                 handle,
                 projection=entry.projection,
@@ -713,15 +822,17 @@ def _scan_group_chunks(
                 group_name=entry.name,
                 compute_engine_count_min=0,
                 compute_engine_count_max=0,
-                chunk_min_max=_group_parameter(
-                    chunk_min_max, entry.name, "chunk_min_max"
+                microchunk_tokens_per_rank_min_max=_group_parameter(
+                    microchunk_tokens_per_rank_min_max,
+                    entry.name,
+                    "microchunk_tokens_per_rank_min_max",
                 ),
-                chunk_step_coarse=chunk_step_coarse,
-                chunk_step_fine=chunk_step_fine,
+                microchunk_step_coarse_per_rank=microchunk_step_coarse_per_rank,
+                microchunk_step_fine_per_rank=microchunk_step_fine_per_rank,
             )
             if candidate.status != "candidate" or candidate.config is None:
                 return (
-                    f"{entry.name} chunk selection {candidate.status}: "
+                    f"{entry.name} microchunk selection {candidate.status}: "
                     f"{candidate.reason}"
                 )
             config = candidate.config
@@ -731,18 +842,18 @@ def _scan_group_chunks(
     return None
 
 
-def _microchunk_rows_from_tokens(
+def _microchunk_tokens_per_rank(
     backend: TPSPBackend, microchunk_tokens: int, tp_size: int
 ) -> int:
-    granularity = backend.tpsp_chunk_granularity
-    if type(granularity) is not int or granularity <= 0:
-        raise ValueError("TPSP chunk granularity must be a positive integer")
-    local_rows = math.ceil(microchunk_tokens / tp_size)
-    rows = max(granularity, math.ceil(local_rows / granularity) * granularity)
-    max_rows = backend.get_max_microchunk_rows(tp_size)
-    if max_rows is not None and max_rows >= granularity:
-        rows = min(rows, max_rows // granularity * granularity)
-    return rows
+    if type(microchunk_tokens) is not int or microchunk_tokens <= 0:
+        raise ValueError("TPSP microchunk tokens must be a positive integer")
+    if type(tp_size) is not int or tp_size <= 0:
+        raise ValueError("TPSP TP size must be a positive integer")
+    tokens_per_rank = math.ceil(microchunk_tokens / tp_size)
+    max_tokens_per_rank = backend.get_max_microchunk_tokens_per_rank()
+    if max_tokens_per_rank is not None:
+        tokens_per_rank = min(tokens_per_rank, max_tokens_per_rank)
+    return tokens_per_rank
 
 
 def _build_tpsp_context(
@@ -925,7 +1036,7 @@ def _scan_threshold(
     return profile
 
 
-def _scan_chunk(
+def _scan_microchunk(
     backend: Any,
     projection_context: object,
     projection: nn.Module,
@@ -937,9 +1048,9 @@ def _scan_chunk(
     compute_engine_count_max: int | None = None,
     compute_engine_step_coarse: int = _COARSE_COMPUTE_ENGINE_STEP,
     compute_engine_step_fine: int = _FINE_COMPUTE_ENGINE_STEP,
-    chunk_min_max: tuple[int, int] | None = None,
-    chunk_step_coarse: int = _COARSE_CHUNK_STEP,
-    chunk_step_fine: int = _FINE_CHUNK_STEP,
+    microchunk_tokens_per_rank_min_max: tuple[int, int] | None = None,
+    microchunk_step_coarse_per_rank: int = _COARSE_MICROCHUNK_STEP_PER_RANK,
+    microchunk_step_fine_per_rank: int = _FINE_MICROCHUNK_STEP_PER_RANK,
 ) -> TPSPScanResult:
     """Probe chunks, jointly refine a local grid, and check candidate parity.
 
@@ -949,7 +1060,6 @@ def _scan_chunk(
 
     """
     device = backend.device
-    chunk_granularity = backend.tpsp_chunk_granularity
     hidden_size = norm.weight.numel()
     input_width = _projection_input_width(projection)
     if any(
@@ -957,14 +1067,14 @@ def _scan_chunk(
         for step in (
             compute_engine_step_coarse,
             compute_engine_step_fine,
-            chunk_step_coarse,
-            chunk_step_fine,
+            microchunk_step_coarse_per_rank,
+            microchunk_step_fine_per_rank,
         )
     ):
         raise ValueError("TPSP scan steps must be positive integers")
     if (
         compute_engine_step_fine > compute_engine_step_coarse
-        or chunk_step_fine > chunk_step_coarse
+        or microchunk_step_fine_per_rank > microchunk_step_coarse_per_rank
     ):
         raise ValueError("Fine TPSP scan steps cannot exceed coarse steps")
     if (compute_engine_count_min is None) != (compute_engine_count_max is None):
@@ -982,7 +1092,6 @@ def _scan_chunk(
     if dist.get_world_size(group) != tp_size:
         raise ValueError("group_name and tp_size disagree")
     rank = dist.get_rank(group)
-    shard_rows = math.ceil(max_batched_tokens / tp_size)
 
     def make_inputs(tokens: int) -> _ProjectionInputs:
         return _projection_inputs(
@@ -1023,43 +1132,31 @@ def _scan_chunk(
 
     # Stage 1 screens the selected chunk/count candidates at full load.
     screening_inputs = make_inputs(max_batched_tokens)
-    supported_max_chunk_rows = (
-        math.ceil(shard_rows / chunk_granularity) * chunk_granularity
-    )
-    cap_rows = backend.get_max_microchunk_rows(tp_size)
-    if cap_rows is not None:
-        cap_rows = (
-            cap_rows // chunk_granularity * chunk_granularity
-            if cap_rows >= chunk_granularity
-            else cap_rows
+    supported_max_microchunk_tokens_per_rank = math.ceil(max_batched_tokens / tp_size)
+    cap_tokens_per_rank = backend.get_max_microchunk_tokens_per_rank()
+    if cap_tokens_per_rank is not None:
+        supported_max_microchunk_tokens_per_rank = min(
+            supported_max_microchunk_tokens_per_rank, cap_tokens_per_rank
         )
-        supported_max_chunk_rows = min(supported_max_chunk_rows, cap_rows)
-    supported_min_chunk_rows = min(chunk_granularity, supported_max_chunk_rows)
-    min_chunk_rows, max_chunk_rows = (
-        chunk_min_max
-        if chunk_min_max is not None
-        else (supported_min_chunk_rows, supported_max_chunk_rows)
+    min_microchunk_tokens_per_rank, max_microchunk_tokens_per_rank = (
+        microchunk_tokens_per_rank_min_max
+        if microchunk_tokens_per_rank_min_max is not None
+        else (1, supported_max_microchunk_tokens_per_rank)
     )
     if (
-        type(min_chunk_rows) is not int
-        or type(max_chunk_rows) is not int
-        or min_chunk_rows < supported_min_chunk_rows
-        or max_chunk_rows > supported_max_chunk_rows
-        or min_chunk_rows > max_chunk_rows
-        or (
-            supported_max_chunk_rows >= chunk_granularity
-            and (
-                min_chunk_rows % chunk_granularity or max_chunk_rows % chunk_granularity
-            )
-        )
+        type(min_microchunk_tokens_per_rank) is not int
+        or type(max_microchunk_tokens_per_rank) is not int
+        or min_microchunk_tokens_per_rank < 1
+        or max_microchunk_tokens_per_rank > supported_max_microchunk_tokens_per_rank
+        or min_microchunk_tokens_per_rank > max_microchunk_tokens_per_rank
     ):
-        raise ValueError("Invalid TPSP chunk range")
+        raise ValueError("Invalid TPSP microchunk token range")
     probe_count: int | None = None
-    if supported_max_chunk_rows >= chunk_granularity and (
-        chunk_step_coarse % chunk_granularity or chunk_step_fine % chunk_granularity
-    ):
-        raise ValueError("Chunk scan steps must align with chunk granularity")
-    sparse_chunks = _inclusive_range(min_chunk_rows, max_chunk_rows, chunk_step_coarse)
+    sparse_microchunks = _inclusive_range(
+        min_microchunk_tokens_per_rank,
+        max_microchunk_tokens_per_rank,
+        microchunk_step_coarse_per_rank,
+    )
     if compute_engine_count_min is not None:
         assert compute_engine_count_max is not None
         positive_min = max(1, compute_engine_count_min)
@@ -1078,15 +1175,17 @@ def _scan_chunk(
                 positive_counts,
                 key=lambda count: (abs(count - midpoint), -count),
             )
-            coarse_chunks = _inclusive_range(
-                min_chunk_rows, max_chunk_rows, chunk_step_fine
+            coarse_microchunks = _inclusive_range(
+                min_microchunk_tokens_per_rank,
+                max_microchunk_tokens_per_rank,
+                microchunk_step_fine_per_rank,
             )
         else:
             probe_count = None
-            coarse_chunks = sparse_chunks
+            coarse_microchunks = sparse_microchunks
     else:
         probe_count = None
-        coarse_chunks = sparse_chunks
+        coarse_microchunks = sparse_microchunks
     joint_probe_scan = probe_count is not None
     coarse_results: list[tuple[object, float, int]] = []
 
@@ -1135,14 +1234,14 @@ def _scan_chunk(
             targets = tuple(sorted((*targets, center)))
         return targets
 
-    def local_chunks(center: int) -> tuple[int, ...]:
-        radius = _FINE_NEIGHBORHOOD_RADIUS * chunk_step_fine
-        minimum = max(min_chunk_rows, center - radius)
-        maximum = min(max_chunk_rows, center + radius)
-        chunks = _inclusive_range(minimum, maximum, chunk_step_fine)
-        if center not in chunks:
-            chunks = tuple(sorted((*chunks, center)))
-        return chunks
+    def local_microchunks(center: int) -> tuple[int, ...]:
+        radius = _FINE_NEIGHBORHOOD_RADIUS * microchunk_step_fine_per_rank
+        minimum = max(min_microchunk_tokens_per_rank, center - radius)
+        maximum = min(max_microchunk_tokens_per_rank, center + radius)
+        microchunks = _inclusive_range(minimum, maximum, microchunk_step_fine_per_rank)
+        if center not in microchunks:
+            microchunks = tuple(sorted((*microchunks, center)))
+        return microchunks
 
     def score_config_ms(
         config: object, inputs: _ProjectionInputs, timings_count: int
@@ -1155,24 +1254,27 @@ def _scan_chunk(
 
     coarse_started = time.perf_counter()
     coarse_configs = []
-    for chunk in coarse_chunks:
+    for microchunk_tokens_per_rank in coarse_microchunks:
         targets = coarse_targets()
         if joint_probe_scan:
             assert probe_count is not None
             targets = (probe_count,)
             default_count = backend.get_default_compute_engine_count()
-            if default_count is not None and chunk in sparse_chunks:
+            if (
+                default_count is not None
+                and microchunk_tokens_per_rank in sparse_microchunks
+            ):
                 targets = tuple(dict.fromkeys((default_count, *targets)))
         configs = backend.get_tuning_configs(
             projection_context,
-            chunk,
+            microchunk_tokens_per_rank,
             group_name=group_name,
             compute_engine_counts=targets,
             compute_engine_step=compute_engine_step_coarse,
         )
         if not configs:
             raise ValueError("TPSP backend returned no tuning configurations")
-        coarse_configs.append((chunk, configs))
+        coarse_configs.append((microchunk_tokens_per_rank, configs))
     coarse_progress = _TPSPProgress(
         group_name or backend.group_name,
         "coarse",
@@ -1180,10 +1282,10 @@ def _scan_chunk(
         rank,
         started_at=coarse_started,
     )
-    for chunk, configs in coarse_configs:
+    for microchunk_tokens_per_rank, configs in coarse_configs:
         for config in configs:
             score = score_config_ms(config, screening_inputs, _COARSE_TIMINGS)
-            coarse_results.append((config, score, chunk))
+            coarse_results.append((config, score, microchunk_tokens_per_rank))
             coarse_progress.update(len(coarse_results))
     coarse_progress.finish("complete")
     coarse_ranked_results = tuple(sorted(coarse_results, key=lambda result: result[1]))
@@ -1234,17 +1336,17 @@ def _scan_chunk(
     ] = {}
     if joint_probe_scan:
         assert probe_seed is not None
-        probe_config, _, probe_chunk = probe_seed
+        probe_config, _, probe_microchunk_tokens_per_rank = probe_seed
         probe_counts = fine_targets(
             backend.get_compute_engine_count(probe_config), available_engine_counts
         )
-        fine_total = len(local_chunks(probe_chunk)) * len(
+        fine_total = len(local_microchunks(probe_microchunk_tokens_per_rank)) * len(
             probe_counts if probe_counts is not None else (None,)
         )
         fine_total += int(default_seed is not None)
     else:
         fine_total = sum(
-            len(local_chunks(seed_chunk))
+            len(local_microchunks(seed_microchunk_tokens_per_rank))
             + len(
                 fine_targets(
                     backend.get_compute_engine_count(seed_config),
@@ -1252,7 +1354,7 @@ def _scan_chunk(
                 )
                 or (None,)
             )
-            for seed_config, _, seed_chunk in coarse_top
+            for seed_config, _, seed_microchunk_tokens_per_rank in coarse_top
         )
     fine_progress = _TPSPProgress(
         group_name or backend.group_name,
@@ -1268,14 +1370,14 @@ def _scan_chunk(
         fine_progress.update(fine_completed, percent_limit=99)
 
     def measure_pair(
-        chunk: int, count: int | None, inputs: _ProjectionInputs
+        microchunk_tokens_per_rank: int, count: int | None, inputs: _ProjectionInputs
     ) -> tuple[tuple[object, float], ...]:
-        pair = (chunk, count)
+        pair = (microchunk_tokens_per_rank, count)
         if pair in fine_measurements:
             return fine_measurements[pair]
         configs = backend.get_tuning_configs(
             projection_context,
-            chunk,
+            microchunk_tokens_per_rank,
             group_name=group_name,
             compute_engine_counts=(count,) if count is not None else None,
             compute_engine_step=compute_engine_step_fine,
@@ -1306,26 +1408,33 @@ def _scan_chunk(
     refined_candidates: list[tuple[int, object, float]] = []
     if joint_probe_scan:
         assert probe_seed is not None
-        seed_config, _, seed_chunk = probe_seed
+        seed_config, _, seed_microchunk_tokens_per_rank = probe_seed
         seed_count = backend.get_compute_engine_count(seed_config)
         counts = fine_targets(seed_count, available_engine_counts)
         joint_results: list[tuple[int, object, float]] = []
-        for chunk in local_chunks(seed_chunk):
+        for microchunk_tokens_per_rank in local_microchunks(
+            seed_microchunk_tokens_per_rank
+        ):
             for count in counts if counts is not None else (None,):
-                measured = measure_pair(chunk, count, screening_inputs)
+                measured = measure_pair(
+                    microchunk_tokens_per_rank, count, screening_inputs
+                )
                 joint_results.extend(
-                    (chunk, config, score) for config, score in measured
+                    (microchunk_tokens_per_rank, config, score)
+                    for config, score in measured
                 )
                 advance_fine_progress()
         _, candidate, candidate_score = min(joint_results, key=lambda result: result[2])
         refined_candidates.append((1, candidate, candidate_score))
 
         if default_seed is not None:
-            default_config, _, default_chunk = default_seed
+            default_config, _, default_microchunk_tokens_per_rank = default_seed
             default_count = backend.get_default_compute_engine_count()
             assert default_count is not None
             default_results = measure_pair(
-                default_chunk, default_count, screening_inputs
+                default_microchunk_tokens_per_rank,
+                default_count,
+                screening_inputs,
             )
             advance_fine_progress()
             candidate, candidate_score = min(
@@ -1333,21 +1442,32 @@ def _scan_chunk(
             )
             refined_candidates.append((2, candidate, candidate_score))
     else:
-        for seed_rank, (seed_config, _, seed_chunk) in enumerate(coarse_top, start=1):
+        for seed_rank, (seed_config, _, seed_microchunk_tokens_per_rank) in enumerate(
+            coarse_top, start=1
+        ):
             seed_count = backend.get_compute_engine_count(seed_config)
-            chunk_results: list[tuple[int, object, float]] = []
-            for chunk in local_chunks(seed_chunk):
-                measured = measure_pair(chunk, seed_count, screening_inputs)
-                chunk_results.extend(
-                    (chunk, config, score) for config, score in measured
+            microchunk_results: list[tuple[int, object, float]] = []
+            for microchunk_tokens_per_rank in local_microchunks(
+                seed_microchunk_tokens_per_rank
+            ):
+                measured = measure_pair(
+                    microchunk_tokens_per_rank, seed_count, screening_inputs
+                )
+                microchunk_results.extend(
+                    (microchunk_tokens_per_rank, config, score)
+                    for config, score in measured
                 )
                 advance_fine_progress()
-            selected_chunk = min(chunk_results, key=lambda result: result[2])[0]
+            selected_microchunk_tokens_per_rank = min(
+                microchunk_results, key=lambda result: result[2]
+            )[0]
 
             counts = fine_targets(seed_count, available_engine_counts)
             count_results: list[tuple[object, float]] = []
             for count in counts if counts is not None else (None,):
-                measured = measure_pair(selected_chunk, count, screening_inputs)
+                measured = measure_pair(
+                    selected_microchunk_tokens_per_rank, count, screening_inputs
+                )
                 count_results.extend(measured)
                 advance_fine_progress()
             candidate, candidate_score = min(

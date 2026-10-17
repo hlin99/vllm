@@ -18,6 +18,7 @@ from vllm.model_executor.models.transformers.tpsp_runtime import (
     TPSPContext,
     TPSPNormType,
     TPSPOpsGroup,
+    profile_tpsp,
 )
 
 logger = init_logger(__name__)
@@ -50,6 +51,9 @@ class CudaTPSPBackend(TPSPBackend):
         super().__init__(group_name, device)
         self._open_context_ids: set[int] = set()
 
+    def get_default_profile_settings(self) -> tuple[int, int]:
+        return 256, 512
+
     def profile(
         self,
         ops_groups: Sequence[TPSPOpsGroup],
@@ -57,39 +61,51 @@ class CudaTPSPBackend(TPSPBackend):
         *,
         microchunk_tokens: int | None = None,
         threshold_tokens: int | None = None,
-        chunk_min_max: tuple[int, int] | Mapping[str, tuple[int, int]] | None = None,
-        chunk_step_coarse: int = 256,
-        chunk_step_fine: int = 64,
+        microchunk_tokens_per_rank_min_max: (
+            tuple[int, int] | Mapping[str, tuple[int, int]] | None
+        ) = None,
+        microchunk_step_coarse_per_rank: int = 256,
+        microchunk_step_fine_per_rank: int = 64,
     ) -> TPSPContext | None:
+        if microchunk_tokens is not None and threshold_tokens is not None:
+            return super().profile(
+                ops_groups,
+                max_batched_tokens,
+                microchunk_tokens=microchunk_tokens,
+                threshold_tokens=threshold_tokens,
+            )
+
         from vllm.distributed.parallel_state import get_tp_group
 
         tp_size = get_tp_group().world_size
-        if chunk_min_max is None and microchunk_tokens is None:
-            chunk_min_max = self._chunk_rows_range(max_batched_tokens, tp_size)
-        return super().profile(
+        if (
+            microchunk_tokens_per_rank_min_max is None
+            and microchunk_tokens is None
+            and type(max_batched_tokens) is int
+            and max_batched_tokens > 0
+        ):
+            microchunk_tokens_per_rank_min_max = self._microchunk_tokens_per_rank_range(
+                max_batched_tokens, tp_size
+            )
+        return profile_tpsp(
+            self,
             ops_groups,
             max_batched_tokens,
             microchunk_tokens=microchunk_tokens,
             threshold_tokens=threshold_tokens,
-            chunk_min_max=chunk_min_max,
-            chunk_step_coarse=chunk_step_coarse,
-            chunk_step_fine=chunk_step_fine,
+            microchunk_tokens_per_rank_min_max=microchunk_tokens_per_rank_min_max,
+            microchunk_step_coarse_per_rank=microchunk_step_coarse_per_rank,
+            microchunk_step_fine_per_rank=microchunk_step_fine_per_rank,
         )
 
-    def _chunk_rows_range(
+    def _microchunk_tokens_per_rank_range(
         self, max_batched_tokens: int, tp_size: int
     ) -> tuple[int, int]:
-        shard_rows = math.ceil(max_batched_tokens / tp_size)
-        max_chunk_rows = math.ceil(shard_rows / self.tpsp_chunk_granularity)
-        max_chunk_rows *= self.tpsp_chunk_granularity
-        cap_rows = self.get_max_microchunk_rows(tp_size)
-        if cap_rows is not None:
-            if cap_rows >= self.tpsp_chunk_granularity:
-                cap_rows = (
-                    cap_rows // self.tpsp_chunk_granularity
-                ) * self.tpsp_chunk_granularity
-            max_chunk_rows = min(max_chunk_rows, cap_rows)
-        return min(self.tpsp_chunk_granularity, max_chunk_rows), max_chunk_rows
+        max_tokens_per_rank = math.ceil(max_batched_tokens / tp_size)
+        cap_tokens_per_rank = self.get_max_microchunk_tokens_per_rank()
+        if cap_tokens_per_rank is not None:
+            max_tokens_per_rank = min(max_tokens_per_rank, cap_tokens_per_rank)
+        return 1, max_tokens_per_rank
 
     def get_compute_engine_count(self, config: object) -> int | None:
         if isinstance(config, CudaTPSPConfig):
@@ -257,7 +273,7 @@ class CudaTPSPBackend(TPSPBackend):
     def get_tuning_configs(
         self,
         handle: object,
-        chunk: int,
+        microchunk_tokens_per_rank: int,
         group_name: str | None = None,
         *,
         compute_engine_counts: Sequence[int] | None = None,
@@ -268,7 +284,7 @@ class CudaTPSPBackend(TPSPBackend):
             target != 0 for target in compute_engine_counts
         ):
             raise ValueError("TPSP uses the default SM count target 0")
-        return (CudaTPSPConfig(chunk, 0),)
+        return (CudaTPSPConfig(microchunk_tokens_per_rank, 0),)
 
     def fused_gemm_rs_norm_ag(
         self,
@@ -317,7 +333,9 @@ class CudaTPSPBackend(TPSPBackend):
         ):
             raise ValueError("CUDA TPSP microchunk exceeds P2P workspace capacity")
         if eps <= 0 or (norm_bias is not None and norm_type != "layer_norm"):
-            raise ValueError("Invalid CUDA TPSP normalization or chunk configuration")
+            raise ValueError(
+                "Invalid CUDA TPSP normalization or microchunk configuration"
+            )
         if (
             any(
                 t.dtype != torch.bfloat16 or t.device != context.device

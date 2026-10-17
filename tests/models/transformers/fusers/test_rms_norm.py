@@ -360,6 +360,78 @@ def test_tpsp_profile_resolves_missing_token_settings(
     assert backend.defaults_called == default_calls
 
 
+def test_tpsp_microchunk_tokens_convert_to_per_rank_with_ceiling():
+    from vllm.model_executor.models.transformers.tpsp_runtime import (
+        _microchunk_tokens_per_rank,
+    )
+    from vllm.platforms.tpsp_cuda import CudaTPSPBackend
+
+    backend = CudaTPSPBackend("test", torch.device("cuda"))
+
+    assert _microchunk_tokens_per_rank(backend, 65, 4) == 17
+
+
+def test_cuda_tpsp_profiles_when_a_token_setting_is_missing(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.platforms import tpsp_cuda
+    from vllm.platforms.tpsp_cuda import CudaTPSPBackend
+
+    backend = CudaTPSPBackend("tp", torch.device("cpu"))
+    result = object()
+    calls = []
+
+    def profile(*args, **kwargs):
+        calls.append((args, kwargs))
+        return result
+
+    monkeypatch.setattr(tpsp_cuda, "profile_tpsp", profile)
+    monkeypatch.setattr(
+        parallel_state, "get_tp_group", lambda: SimpleNamespace(world_size=4)
+    )
+
+    assert (
+        backend.profile(
+            [],
+            1000,
+            microchunk_tokens=100,
+            threshold_tokens=None,
+        )
+        is result
+    )
+    assert len(calls) == 1
+    assert calls[0][1]["microchunk_tokens"] == 100
+    assert calls[0][1]["threshold_tokens"] is None
+
+
+def test_cuda_tpsp_uses_fixed_settings_without_scanning(monkeypatch):
+    from vllm.model_executor.models.transformers import tpsp_runtime
+    from vllm.platforms import tpsp_cuda
+    from vllm.platforms.tpsp_cuda import CudaTPSPBackend
+
+    backend = CudaTPSPBackend("tp", torch.device("cpu"))
+    result = object()
+    monkeypatch.setattr(
+        tpsp_runtime,
+        "_build_static_tpsp_context",
+        lambda *args, **kwargs: result,
+    )
+    monkeypatch.setattr(
+        tpsp_cuda,
+        "profile_tpsp",
+        lambda *args, **kwargs: pytest.fail("fixed settings must not scan"),
+    )
+
+    assert (
+        backend.profile(
+            [],
+            1000,
+            microchunk_tokens=100,
+            threshold_tokens=200,
+        )
+        is result
+    )
+
+
 @pytest.mark.parametrize(
     "cls", [GatedRMSNorm, GatedFusedRMSNorm, UntraceableGatedRMSNorm]
 )
