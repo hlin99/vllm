@@ -40,6 +40,18 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_DECODER_LAYER_NAMES = ("layers", "h", "blocks")
+_INPUT_NORM_NAMES = (
+    "input_layernorm",
+    "input_layer_norm",
+    "pre_attention_layernorm",
+)
+_POST_ATTENTION_NORM_NAMES = (
+    "post_attention_layernorm",
+    "post_attention_layer_norm",
+)
+_FINAL_NORM_NAMES = ("norm", "final_norm", "final_layernorm", "final_layer_norm")
+
 
 @dataclass
 class _ForwardState:
@@ -307,30 +319,20 @@ class TransformersDenseTPSP:
                 for name in ("output_attentions", "output_hidden_states")
             ):
                 raise ValueError("TPSP does not support intermediate HF outputs")
-            layers_name = _module_name(decoder, ("layers", "h", "blocks"))
+            layers_name = _module_name(decoder, _DECODER_LAYER_NAMES)
             layers = getattr(decoder, layers_name)
             if not isinstance(layers, nn.ModuleList) or not layers:
                 raise ValueError("TPSP requires a nonempty decoder ModuleList")
-            final_name = _module_name(
-                decoder, ("norm", "final_norm", "final_layernorm", "final_layer_norm")
-            )
+            final_name = _module_name(decoder, _FINAL_NORM_NAMES)
             _validate_decoder(decoder, layers_name, final_name)
-            input_names = [
-                _module_name(
-                    layer,
-                    ("input_layernorm", "input_layer_norm", "pre_attention_layernorm"),
-                )
-                for layer in layers
-            ]
+            input_names = [_module_name(layer, _INPUT_NORM_NAMES) for layer in layers]
             norms = [
                 layer.get_submodule(name) for layer, name in zip(layers, input_names)
             ]
             norms.append(decoder.get_submodule(final_name))
             self.input_norm = norms[0]
             for index, layer in enumerate(layers):
-                post_name = _module_name(
-                    layer, ("post_attention_layernorm", "post_attention_layer_norm")
-                )
+                post_name = _module_name(layer, _POST_ATTENTION_NORM_NAMES)
                 parents = (
                     _projection_parent(layer, "o_proj"),
                     _projection_parent(layer, "down_proj"),
