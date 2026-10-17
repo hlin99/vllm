@@ -394,6 +394,7 @@ class TransformersDenseTPSP:
             ) from exc
 
         self.groups = groups[:2]
+        self._projections = [group.projection for group in groups]
         self.max_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.microchunk_tokens = vllm_config.model_config.tpsp_microchunk_tokens
         self.threshold_tokens = vllm_config.model_config.tpsp_threshold_tokens
@@ -449,6 +450,7 @@ class TransformersDenseTPSP:
             return
         self.model.eval()
         try:
+            backend.prepare_weights(self._projections)
             self.context = backend.profile(
                 self.groups,
                 self.max_batched_tokens,

@@ -80,6 +80,10 @@ class TPSPBackend(ABC):
     @abstractmethod
     def set_config(self, handle: object, config: object) -> None: ...
 
+    def prepare_weights(self, projections: Sequence[nn.Module]) -> None:
+        """Prepare backend-specific weights after model weights are loaded."""
+        return None
+
     @abstractmethod
     def _create_context(self) -> object:
         """Create independent ops configuration using an already-open backend."""

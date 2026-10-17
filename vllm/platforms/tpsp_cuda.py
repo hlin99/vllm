@@ -280,13 +280,7 @@ class CudaTPSPBackend(TPSPBackend):
         context = self._profile_context(projection_context)
         workspace = self._get_workspace()
 
-        weight = projection.weight
-        key = (weight.data_ptr(), weight._version)
-        cached = getattr(projection, "_tpsp_transposed_weight", None)
-        if cached is None or cached[0] != key:
-            cached = (key, weight.T.contiguous())
-            projection._tpsp_transposed_weight = cached
-        a, b = x.contiguous(), cached[1]
+        a, b = x.contiguous(), projection._tpsp_transposed_weight
         norm_weight = norm.weight
         eps = norm.eps if norm_type == "layer_norm" else norm.variance_epsilon
         projection_bias = projection.bias
@@ -317,6 +311,12 @@ class CudaTPSPBackend(TPSPBackend):
     def set_config(self, handle: object, config: object) -> None:
         context = self._profile_context(handle)
         context.config = self._resolve_config(context, config)
+
+    def prepare_weights(self, projections: Sequence[torch.nn.Module]) -> None:
+        for projection in projections:
+            projection._tpsp_transposed_weight = (
+                projection.weight.detach().T.contiguous()
+            )
 
     def _get_workspace(self) -> CudaTPSPWorkspace:
         if self._closed:
