@@ -3,6 +3,7 @@
 """Unit tests for the Transformers modeling backend's RMSNorm fuser."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -226,6 +227,178 @@ def test_non_rms_norms_are_not_matched(cls):
     with torch.device("meta"):
         module = cls(16) if cls is nn.LayerNorm else cls()
     assert get_fuser(module, RMSNormFuser) is None
+
+
+def test_tpsp_norm_type_accepts_known_norm_implementations(default_vllm_config):
+    from vllm.model_executor.layers.layernorm import (
+        LayerNorm as VllmLayerNorm,
+    )
+    from vllm.model_executor.layers.layernorm import (
+        RMSNorm as VllmRMSNorm,
+    )
+    from vllm.model_executor.models.transformers.fusers.rms_norm import (
+        TPAwareRMSNorm,
+    )
+    from vllm.model_executor.models.transformers.tpsp_runtime import (
+        get_tpsp_norm_type,
+    )
+
+    with torch.device("meta"):
+        norms = (
+            (nn.LayerNorm(16), "layer_norm"),
+            (VllmLayerNorm(16), "layer_norm"),
+            (VllmRMSNorm(16), "rms_norm"),
+            (TPAwareRMSNorm(16), "rms_norm"),
+        )
+    for norm, expected in norms:
+        assert get_tpsp_norm_type(norm) == expected
+
+
+def test_tpsp_norm_type_rejects_unsupported_implementations(default_vllm_config):
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+    from vllm.model_executor.models.transformers.tpsp_runtime import (
+        UnsupportedTPSPNormError,
+        get_tpsp_norm_type,
+    )
+
+    with torch.device("meta"):
+        norms = (nn.RMSNorm(16), GemmaRMSNorm(16))
+    for norm in norms:
+        with pytest.raises(UnsupportedTPSPNormError):
+            get_tpsp_norm_type(norm)
+
+
+def test_cuda_tpsp_declares_supported_norm_types():
+    from vllm.platforms.tpsp_cuda import CudaTPSPBackend
+
+    assert CudaTPSPBackend.supported_norm_types == {"layer_norm", "rms_norm"}
+    assert "rms_norm_offset_weight" not in CudaTPSPBackend.supported_norm_types
+
+
+def test_tpsp_rejects_norm_types_outside_runtime_scope(default_vllm_config):
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+    from vllm.model_executor.models.transformers.tpsp_runtime import (
+        UnsupportedTPSPNormError,
+        get_tpsp_norm_type,
+    )
+
+    with torch.device("meta"):
+        norm = GemmaRMSNorm(16)
+
+    with pytest.raises(UnsupportedTPSPNormError):
+        get_tpsp_norm_type(norm)
+
+
+@pytest.mark.parametrize(
+    "microchunk_tokens,threshold_tokens,expected_microchunk_per_rank,"
+    "expected_threshold",
+    [
+        (None, None, 64, 512),
+        (1000, None, 250, 512),
+        (None, 800, 64, 800),
+        (2000, 2000, 250, 1000),
+        (7, 5, 2, 5),
+    ],
+)
+def test_cuda_tpsp_profile_resolves_missing_token_settings(
+    cuda_tpsp_profile,
+    microchunk_tokens,
+    threshold_tokens,
+    expected_microchunk_per_rank,
+    expected_threshold,
+):
+    backend, ops_groups = cuda_tpsp_profile
+    context = backend.profile(
+        ops_groups,
+        1000,
+        microchunk_tokens=microchunk_tokens,
+        threshold_tokens=threshold_tokens,
+    )
+
+    assert context is not None
+    assert context.profile.threshold_tokens == expected_threshold
+    assert backend.configs == [expected_microchunk_per_rank]
+    assert list(context.handles) == ["proj"]
+    assert backend.closed == []
+
+
+@pytest.fixture
+def cuda_tpsp_profile(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.models.transformers.tpsp_runtime import (
+        TPSPOpsGroup,
+    )
+    from vllm.platforms.tpsp_cuda import CudaTPSPBackend
+
+    class Backend(CudaTPSPBackend):
+        def __init__(self):
+            super().__init__("tp", torch.device("cpu"))
+            self.configs = []
+            self.closed = []
+
+        def _create_context(self):
+            return object()
+
+        def set_config(self, handle, config):
+            self.configs.append(config)
+
+        def close(self, context=None):
+            self.closed.append(context)
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            world_size=4, device_group=SimpleNamespace(group_name="tp")
+        ),
+    )
+    with torch.device("meta"):
+        ops_group = TPSPOpsGroup("proj", nn.Linear(8, 8, bias=False), nn.LayerNorm(8))
+    return Backend(), [ops_group]
+
+
+@pytest.mark.parametrize(
+    "name", ["max_batched_tokens", "microchunk_tokens", "threshold_tokens"]
+)
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_cuda_tpsp_profile_rejects_invalid_token_settings(
+    cuda_tpsp_profile, name, value
+):
+    backend, ops_groups = cuda_tpsp_profile
+    settings = {"max_batched_tokens": 1000, name: value}
+    with pytest.raises(ValueError, match=name):
+        backend.profile(ops_groups, **settings)
+    assert backend.configs == []
+    assert backend.closed == []
+
+
+@pytest.mark.parametrize("fail_config", [False, True])
+def test_cuda_tpsp_profile_cleans_up_partial_initialization(
+    cuda_tpsp_profile, monkeypatch, fail_config
+):
+    from vllm.model_executor.models.transformers.tpsp_runtime import TPSPOpsGroup
+
+    backend, ops_groups = cuda_tpsp_profile
+    first = ops_groups[0]
+    ops_groups.append(TPSPOpsGroup("second", first.projection, first.norm))
+    handle = object()
+    monkeypatch.setattr(
+        backend,
+        "_create_context",
+        Mock(side_effect=[handle, RuntimeError("context failed")]),
+    )
+    if fail_config:
+
+        def fail(*args):
+            raise RuntimeError("configuration failed")
+
+        monkeypatch.setattr(backend, "set_config", fail)
+        with pytest.raises(RuntimeError, match="configuration failed"):
+            backend.profile(ops_groups, 1000)
+    else:
+        with pytest.raises(RuntimeError, match="context failed"):
+            backend.profile(ops_groups, 1000)
+    assert backend.closed == [handle]
 
 
 @pytest.mark.parametrize(

@@ -47,6 +47,37 @@ If a model has a vLLM implementation but you would prefer to use the Transformer
 !!! note
     For vision-language models, if you are loading with `dtype="auto"`, vLLM loads the whole model with config's `dtype` if it exists. In contrast the native Transformers will respect the `dtype` attribute of each backbone in the model. That might cause a slight difference in performance.
 
+#### Dense TPSP fusion
+
+With `--enable-tpsp`, supported dense decoders can fuse `o_proj` with the
+residual add and post-attention norm, and `down_proj` with the residual add and
+the next layer's input norm (or final norm). The adapter derives its local
+changes from the installed Transformers forward; it does not maintain a
+separate decoder implementation. Attention and MLP computations outside these
+regions continue to use their existing implementations.
+Row-parallel projections that receive unsharded inputs retain their input
+splitting before the fused operation.
+
+Fusion requires unchanged projection outputs and a direct path between each
+residual add and its norm, including across decoder layers. Changes inside these
+regions that cannot be matched disable TPSP with a warning before any hooks are
+installed. Unsupported backends and batches below the TPSP threshold use the
+original forward. Intermediate hidden-state/attention outputs are not supported
+on the active TPSP path. Cache handling remains the responsibility of the
+Transformers backend.
+
+During model construction, the CUDA backend opens one shared P2P workspace for
+both projection groups. Configuration runs after weight loading and does not
+allocate another P2P workspace.
+This stage also prepares contiguous transposed weights for every fused projection.
+Forward calls reuse these copies without checking for weight changes.
+
+The CUDA backend currently uses static settings, without profiling or scanning.
+`--tpsp-microchunk-tokens` and `--tpsp-threshold-tokens` override the defaults of
+256 and 512 global tokens, respectively. Both are capped at the maximum batched
+token count; the microchunk is converted to per-rank rows, rounded up and capped
+at the CUDA workspace capacity. The SM target remains 0 (the backend default).
+
 #### Custom models
 
 If a model is neither supported natively by vLLM nor Transformers, it can still be used in vLLM!
