@@ -60,8 +60,9 @@ Fusion requires unchanged projection outputs and a direct path between each
 residual add and its norm, including across decoder layers. Changes inside these
 regions that cannot be matched disable TPSP with a warning before any hooks are
 installed. Unsupported backends and batches below the TPSP threshold use the
-original forward. HF caches and intermediate hidden-state/attention outputs are
-not supported on the active TPSP path.
+original forward. Intermediate hidden-state/attention outputs are not supported
+on the active TPSP path. Cache handling remains the responsibility of the
+Transformers backend.
 
 #### Custom models
 

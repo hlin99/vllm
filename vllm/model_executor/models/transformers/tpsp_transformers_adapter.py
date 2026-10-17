@@ -443,13 +443,7 @@ class TransformersDenseTPSP:
         context = self.context
         state = None
         if context is not None and context.profile.is_active(num_tokens):
-            for name in (
-                "output_attentions",
-                "output_hidden_states",
-                "use_cache",
-                "past_key_value",
-                "past_key_values",
-            ):
+            for name in ("output_attentions", "output_hidden_states"):
                 if kwargs.get(name) is not None and kwargs[name] is not False:
                     raise ValueError(f"Transformers TPSP does not support {name}")
             state = _ForwardState(context, self.input_norm)
