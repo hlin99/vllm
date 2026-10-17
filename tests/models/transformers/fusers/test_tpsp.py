@@ -149,6 +149,16 @@ def install(config, monkeypatch):
     return install
 
 
+@pytest.mark.parametrize("device_type", ["cuda", "xpu"])
+def test_adapter_preserves_configured_accelerator_type(
+    install, config, monkeypatch, device_type
+):
+    config.device_config.device = torch.device(device_type)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 3)
+    _, backend = install(Decoder(), profile=False)
+    assert backend.open.call_args.kwargs["device"] == torch.device(device_type, 3)
+
+
 def test_adapter_opens_before_weights_and_profiles_only_once(install):
     with torch.device("meta"):
         model = Decoder()
