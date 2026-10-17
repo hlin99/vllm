@@ -78,11 +78,11 @@ class TPSPBackend(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     @abstractmethod
-    def create_context(self) -> object:
-        """Create independent ops configuration using an already-open backend."""
+    def set_config(self, handle: object, config: object) -> None: ...
 
     @abstractmethod
-    def set_config(self, handle: object, config: object) -> None: ...
+    def _create_context(self) -> object:
+        """Create independent ops configuration using an already-open backend."""
 
 
 @dataclass(frozen=True)

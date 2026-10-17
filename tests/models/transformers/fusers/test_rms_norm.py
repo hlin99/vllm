@@ -336,7 +336,7 @@ def cuda_tpsp_profile(monkeypatch):
             self.configs = []
             self.closed = []
 
-        def create_context(self):
+        def _create_context(self):
             return object()
 
         def set_config(self, handle, config):
@@ -384,7 +384,7 @@ def test_cuda_tpsp_profile_cleans_up_partial_initialization(
     handle = object()
     monkeypatch.setattr(
         backend,
-        "create_context",
+        "_create_context",
         Mock(side_effect=[handle, RuntimeError("context failed")]),
     )
     if fail_config:

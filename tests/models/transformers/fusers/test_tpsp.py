@@ -256,8 +256,8 @@ def cuda_tpsp_backend(monkeypatch):
 def test_cuda_tpsp_reuses_workspace_without_sharing_configs(cuda_tpsp_backend):
     backend, settings, native = cuda_tpsp_backend
     assert backend.open(**settings)
-    o_proj = backend.create_context()
-    down_proj = backend.create_context()
+    o_proj = backend._create_context()
+    down_proj = backend._create_context()
     assert o_proj is not down_proj
     native.init_tpsp_p2p.assert_called_once_with(0, 2, 0, 16, 16, 32)
     native.get_tpsp_p2p_handles.assert_called_once_with(123)
@@ -270,7 +270,7 @@ def test_cuda_tpsp_reuses_workspace_without_sharing_configs(cuda_tpsp_backend):
     backend.close(o_proj)
     native.destroy_tpsp_p2p.assert_not_called()
     backend.set_config(down_proj, 2)
-    reopened = backend.create_context()
+    reopened = backend._create_context()
     backend.set_config(reopened, 8)
     native.init_tpsp_p2p.assert_called_once()
     with pytest.raises(ValueError, match="another backend"):
@@ -285,10 +285,23 @@ def test_cuda_tpsp_reuses_workspace_without_sharing_configs(cuda_tpsp_backend):
         backend.open(**settings)
 
 
+def test_cuda_tpsp_configures_context_without_fetching_workspace(
+    cuda_tpsp_backend, monkeypatch
+):
+    backend, settings, _ = cuda_tpsp_backend
+    backend.open(**settings)
+    fetch = Mock(side_effect=AssertionError("configuration must not fetch workspace"))
+    monkeypatch.setattr(backend, "_get_workspace", fetch)
+    context = backend._create_context()
+    backend.set_config(context, 4)
+    assert context.config.microchunk_tokens_per_rank == 4
+    fetch.assert_not_called()
+
+
 def test_cuda_tpsp_requires_open_before_configuring_ops(cuda_tpsp_backend):
     backend, _, native = cuda_tpsp_backend
     with pytest.raises(RuntimeError, match="opened before"):
-        backend.create_context()
+        backend._create_context()
     native.init_tpsp_p2p.assert_not_called()
 
 
