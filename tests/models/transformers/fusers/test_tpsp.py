@@ -80,8 +80,10 @@ class Decoder(nn.Module):
 class ReferenceBackend:
     """Evaluate the fused contract on CPU, independently of the installed hooks."""
 
-    def __init__(self):
+    def __init__(self, shared_output=False):
         self.calls = []
+        self.shared_output = shared_output
+        self.output = None
 
     def fused_gemm_rs_norm_ag(
         self, handle, x, projection, residual, norm, *, norm_type
@@ -92,6 +94,10 @@ class ReferenceBackend:
         hidden = F.layer_norm(
             residual, norm.normalized_shape, norm.weight, norm.bias, norm.eps
         )
+        if self.shared_output:
+            if self.output is None:
+                self.output = torch.empty_like(hidden)
+            hidden = self.output.copy_(hidden)
         return hidden, residual
 
 
@@ -110,9 +116,9 @@ def install(config, monkeypatch):
     # The adapter is independent of TP transport; emulate a one-rank shard here.
     monkeypatch.setattr(tpsp_transformers_adapter, "tpsp_shard_residual", torch.clone)
 
-    def install(model):
+    def install(model, shared_output=False):
         adapter = TransformersDenseTPSP(model, config)
-        backend = ReferenceBackend()
+        backend = ReferenceBackend(shared_output)
         adapter.context = TPSPContext(
             TPSPProfile(True, 4, 32), backend, {"o_proj": "o", "down_proj": "down"}
         )
@@ -122,12 +128,15 @@ def install(config, monkeypatch):
 
 
 @pytest.mark.parametrize("tokens", [2, 7, 8])
-def test_original_computation_survives_outside_fused_regions(install, tokens):
+@pytest.mark.parametrize("shared_output", [False, True])
+def test_original_computation_survives_outside_fused_regions(
+    install, tokens, shared_output
+):
     torch.manual_seed(0)
     model = Decoder()
     x = torch.randn(1, tokens, 16)
     expected = model(x, scale=2.3)
-    adapter, backend = install(model)
+    adapter, backend = install(model, shared_output)
     for _ in range(2):
         with adapter.forward_context(tokens):
             actual = model(x, scale=2.3)
@@ -137,8 +146,106 @@ def test_original_computation_survives_outside_fused_regions(install, tokens):
     torch.testing.assert_close(model(x, scale=2.3), expected)
 
 
+@pytest.fixture
+def cuda_tpsp_backend(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.platforms import tpsp_cuda
+
+    group, control_group = object(), object()
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(device_group=group, cpu_group=control_group),
+    )
+    monkeypatch.setattr(tpsp_cuda.c10d, "_resolve_process_group", lambda name: group)
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 2)
+    for name, value in (("get_world_size", 2), ("get_rank", 0)):
+        monkeypatch.setattr(tpsp_cuda.dist, name, Mock(return_value=value))
+    for name in ("all_reduce", "all_gather", "barrier"):
+        monkeypatch.setattr(tpsp_cuda.dist, name, Mock())
+    monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+    native = SimpleNamespace(
+        init_tpsp_p2p=Mock(return_value=123),
+        get_tpsp_p2p_handles=Mock(return_value=torch.zeros(8, dtype=torch.uint8)),
+        map_tpsp_p2p=Mock(return_value=True),
+        destroy_tpsp_p2p=Mock(),
+        tpsp_fused_matmul_reduce_scatter_norm_all_gather=Mock(),
+    )
+    monkeypatch.setattr(torch.ops, "_C", native)
+    backend = tpsp_cuda.CudaTPSPBackend("tp", torch.device("cuda:0"))
+    settings = dict(
+        dtype=torch.bfloat16,
+        tp_size=2,
+        hidden_size=16,
+        max_batched_tokens=32,
+        group_name="tp",
+        device=backend.device,
+    )
+    yield backend, settings, native
+    backend.close()
+
+
+def test_cuda_tpsp_reuses_workspace_without_sharing_configs(cuda_tpsp_backend):
+    backend, settings, native = cuda_tpsp_backend
+    o_proj = backend.open(**settings)
+    down_proj = backend.open(**settings)
+    assert o_proj is not down_proj
+    assert o_proj.p2p_handle == down_proj.p2p_handle == 123
+    native.init_tpsp_p2p.assert_called_once_with(0, 2, 0, 16, 16, 32)
+    native.get_tpsp_p2p_handles.assert_called_once_with(123)
+    native.map_tpsp_p2p.assert_called_once()
+    backend.set_config(o_proj, 4)
+    backend.set_config(down_proj, 8)
+    assert o_proj.config.microchunk_tokens_per_rank == 4
+    assert down_proj.config.microchunk_tokens_per_rank == 8
+
+    backend.close(o_proj)
+    native.destroy_tpsp_p2p.assert_not_called()
+    backend.set_config(down_proj, 2)
+    reopened = backend.open(**settings)
+    assert reopened.p2p_handle == 123
+    native.init_tpsp_p2p.assert_called_once()
+    with pytest.raises(ValueError, match="another backend"):
+        backend.set_config(o_proj, 4)
+
+    backend.close()
+    backend.close()
+    native.destroy_tpsp_p2p.assert_called_once_with(123)
+    assert down_proj.p2p_handle == reopened.p2p_handle == 0
+    with pytest.raises(RuntimeError, match="closed"):
+        backend.open(**settings)
+
+
+@pytest.mark.parametrize(
+    "field,value", [("hidden_size", 32), ("max_batched_tokens", 64)]
+)
+def test_cuda_tpsp_rejects_incompatible_workspace(cuda_tpsp_backend, field, value):
+    backend, settings, native = cuda_tpsp_backend
+    backend.open(**settings)
+    with pytest.raises(ValueError, match="shared workspace"):
+        backend.open(**{**settings, field: value})
+    native.init_tpsp_p2p.assert_called_once()
+    native.destroy_tpsp_p2p.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["allocation", "mapping"])
+def test_cuda_tpsp_failed_workspace_is_not_reused(cuda_tpsp_backend, failure):
+    backend, settings, native = cuda_tpsp_backend
+    if failure == "allocation":
+        native.init_tpsp_p2p.return_value = 0
+    else:
+        native.map_tpsp_p2p.return_value = False
+    assert backend.open(**settings) is None
+    assert native.destroy_tpsp_p2p.call_count == (failure == "mapping")
+    native.init_tpsp_p2p.return_value = 123
+    native.map_tpsp_p2p.return_value = True
+    assert backend.open(**settings).p2p_handle == 123
+    assert native.init_tpsp_p2p.call_count == 2
+
+
 @pytest.mark.parametrize("architecture", ["llama", "qwen3"])
-def test_current_hf_forward_is_preserved(install, architecture):
+@pytest.mark.parametrize("shared_output", [False, True])
+def test_current_hf_forward_is_preserved(install, architecture, shared_output):
     from transformers import AutoConfig, AutoModel
 
     config = AutoConfig.for_model(
@@ -160,7 +267,7 @@ def test_current_hf_forward_is_preserved(install, architecture):
     inputs = torch.randint(0, 64, (1, 7))
     with torch.inference_mode():
         expected = model(inputs, use_cache=False).last_hidden_state
-        adapter, backend = install(model)
+        adapter, backend = install(model, shared_output)
         with adapter.forward_context(7):
             actual = model(inputs, use_cache=False).last_hidden_state
     torch.testing.assert_close(actual, expected)

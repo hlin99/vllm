@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CUDA implementation of the TPSP backend."""
+"""CUDA TPSP with backend-owned P2P buffers reused by sequential ops groups."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
@@ -55,6 +55,8 @@ class CudaTPSPContext:
 
 
 class CudaTPSPBackend(TPSPBackend):
+    """Own shared P2P buffers until close(); ops contexts only borrow them."""
+
     tpsp_max_microchunk_tokens_per_rank = 4_096
     supported_norm_types: frozenset[TPSPNormType] = frozenset(
         {"layer_norm", "rms_norm"}
@@ -62,7 +64,9 @@ class CudaTPSPBackend(TPSPBackend):
 
     def __init__(self, group_name: str, device: torch.device):
         super().__init__(group_name, device)
-        self._open_context_ids: set[int] = set()
+        self._open_contexts: dict[int, CudaTPSPContext] = {}
+        self._workspace_context: CudaTPSPContext | None = None
+        self._workspace_key: tuple[int, int, int, int] | None = None
 
     def profile(
         self,
@@ -221,6 +225,22 @@ class CudaTPSPBackend(TPSPBackend):
             control_group,
             max_microchunk_tokens_per_rank,
         )
+        workspace_key = (
+            tp_size,
+            hidden_size,
+            max_batched_tokens,
+            max_microchunk_tokens_per_rank,
+        )
+        if self._workspace_context is not None:
+            if (
+                workspace_key != self._workspace_key
+                or rank != self._workspace_context.rank
+                or control_group is not self._workspace_context.control_group
+            ):
+                raise ValueError("CUDA TPSP request does not match shared workspace")
+            context.p2p_handle = self._workspace_context.p2p_handle
+            self._open_contexts[id(context)] = context
+            return context
         context.p2p_handle = torch.ops._C.init_tpsp_p2p(
             device.index if device.index is not None else torch.cuda.current_device(),
             tp_size,
@@ -254,7 +274,9 @@ class CudaTPSPBackend(TPSPBackend):
                 "TPSP enabled with direct P2P for %s tokens per rank",
                 max_microchunk_tokens_per_rank,
             )
-        self._open_context_ids.add(id(context))
+        self._workspace_context = replace(context)
+        self._workspace_key = workspace_key
+        self._open_contexts[id(context)] = context
         return context
 
     @staticmethod
@@ -268,7 +290,7 @@ class CudaTPSPBackend(TPSPBackend):
             raise ValueError("CUDA TPSP requires a projection context")
         if (
             not isinstance(context, CudaTPSPContext)
-            or id(context) not in self._open_context_ids
+            or self._open_contexts.get(id(context)) is not context
         ):
             raise ValueError("CUDA TPSP context belongs to another backend")
         if not context.p2p_handle:
@@ -336,6 +358,7 @@ class CudaTPSPBackend(TPSPBackend):
         config: object | None = None,
         norm_type: TPSPNormType = "rms_norm",
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run sequentially; consume gathered output before the next TPSP call."""
         if self._closed:
             raise RuntimeError("TPSP backend is closed")
         if norm_type not in self.supported_norm_types:
@@ -415,12 +438,18 @@ class CudaTPSPBackend(TPSPBackend):
     def close(self, context: object | None = None) -> None:
         if context is not None:
             context = self._profile_context(context)
-            if context.p2p_handle:
-                torch.cuda.synchronize(context.device)
-                dist.barrier(group=context.control_group)
-                torch.ops._C.destroy_tpsp_p2p(context.p2p_handle)
-                dist.barrier(group=context.control_group)
-                context.p2p_handle = 0
-            self._open_context_ids.remove(id(context))
+            context.p2p_handle = 0
+            del self._open_contexts[id(context)]
         else:
+            workspace = self._workspace_context
+            if workspace is not None:
+                torch.cuda.synchronize(workspace.device)
+                dist.barrier(group=workspace.control_group)
+                torch.ops._C.destroy_tpsp_p2p(workspace.p2p_handle)
+                dist.barrier(group=workspace.control_group)
+                self._workspace_context = None
+                self._workspace_key = None
+            for opened in self._open_contexts.values():
+                opened.p2p_handle = 0
+            self._open_contexts.clear()
             self._closed = True
