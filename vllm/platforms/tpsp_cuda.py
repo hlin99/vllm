@@ -129,7 +129,7 @@ class CudaTPSPBackend(TPSPBackend):
         cap_tokens_per_rank = self.get_max_microchunk_tokens_per_rank()
         if cap_tokens_per_rank is not None:
             max_tokens_per_rank = min(max_tokens_per_rank, cap_tokens_per_rank)
-        return 1, max_tokens_per_rank
+        return min(64, max_tokens_per_rank), max_tokens_per_rank
 
     def get_compute_engine_count(self, config: object) -> int | None:
         if isinstance(config, CudaTPSPConfig):

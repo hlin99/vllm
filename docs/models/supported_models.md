@@ -68,6 +68,9 @@ The CUDA backend profiles per-projection microchunk sizes and SM counts, then
 selects a shared activation threshold. Profiling includes coarse screening,
 joint local refinement, output parity checks, and fallback to the original
 forward when no beneficial configuration is found.
+By default, microchunk scanning starts at 64 tokens per rank, or the available
+per-rank batch size if smaller. Manually specified microchunks need not be
+multiples of 64.
 `--tpsp-microchunk-tokens` fixes the global microchunk size while leaving SM
 selection and threshold profiling enabled. `--tpsp-threshold-tokens` fixes the
 activation threshold while leaving microchunk and SM profiling enabled. Both

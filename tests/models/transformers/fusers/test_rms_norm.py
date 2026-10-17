@@ -454,7 +454,7 @@ def test_cuda_tpsp_scans_chunk_sm_and_threshold_honoring_overrides(
     assert calls[0]["compute_engine_count_min"] == 60
     assert calls[0]["compute_engine_count_max"] == 80
     assert calls[0]["microchunk_tokens_per_rank_min_max"] == (
-        (1, 250) if chunk is None else (25, 25)
+        (64, 250) if chunk is None else (25, 25)
     )
 
 
