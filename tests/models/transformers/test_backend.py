@@ -311,39 +311,137 @@ def test_full_attention_still_uses_stateless_transformers_backend(
 
 
 @pytest.fixture(scope="module")
-def tiny_mixed_operator_path(tmp_path_factory):
+def tiny_recurrent_path(request, tmp_path_factory):
+    from transformers import (
+        JambaConfig,
+        JambaForCausalLM,
+        Lfm2Config,
+        Lfm2ForCausalLM,
+        MambaConfig,
+        MambaForCausalLM,
+        Zamba2Config,
+        Zamba2ForCausalLM,
+    )
+
+    kwargs = dict(
+        vocab_size=256,
+        hidden_size=128,
+        num_hidden_layers=3,
+        max_position_embeddings=128,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+    )
+    kind = request.param
+    if kind == "mamba":
+        config = MambaConfig(**kwargs, state_size=16)
+        model_cls = MambaForCausalLM
+    elif kind == "jamba":
+        config = JambaConfig(
+            **kwargs,
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attn_layer_period=2,
+            attn_layer_offset=1,
+            num_experts=4,
+            num_experts_per_tok=2,
+            expert_layer_period=2,
+            expert_layer_offset=1,
+        )
+        model_cls = JambaForCausalLM
+    elif kind == "zamba2":
+        kwargs["num_hidden_layers"] = 4
+        config = Zamba2Config(
+            **kwargs,
+            intermediate_size=256,
+            layers_block_type=["hybrid"] * 4,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_mamba_heads=4,
+            mamba_d_state=16,
+            num_mem_blocks=1,
+            use_shared_attention_adapter=True,
+            adapter_rank=8,
+            use_mem_rope=True,
+        )
+        model_cls = Zamba2ForCausalLM
+    else:
+        config = Lfm2Config(
+            **kwargs,
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            layer_types=["conv", "full_attention", "conv"],
+        )
+        model_cls = Lfm2ForCausalLM
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        model = model_cls(config)
+    path = tmp_path_factory.mktemp(f"tiny_recurrent_{kind}")
+    # Compare FP32 math on the same stored weights that BF16 serving loads.
+    model.to(torch.bfloat16).save_pretrained(path, save_original_format=False)
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    "tiny_recurrent_path", ["mamba", "jamba", "zamba2", "lfm2"], indirect=True
+)
+@pytest.mark.parametrize("enforce_eager", [True, False])
+def test_adapted_recurrent_operators_match_transformers(
+    vllm_runner, tiny_recurrent_path, monkeypatch, enforce_eager
+):
+    """State kernels retain HF recurrent, MoE and tied-block semantics."""
+    outputs, repeated = _check_recurrent_cache(
+        vllm_runner, tiny_recurrent_path, 1, enforce_eager, monkeypatch
+    )
+    assert [o.outputs[0].token_ids for o in outputs] == [
+        o.outputs[0].token_ids for o in repeated[::-1]
+    ]
+
+
+@pytest.fixture(scope="module")
+def tiny_mixed_operator_path(request, tmp_path_factory):
     from .hybrid_test_model import (
         HybridTestConfig,
         HybridTestForCausalLM,
     )
 
+    specs = [
+        {"kind": "qwen_gdn"},
+        {"kind": "sliding_attention"},
+        {"kind": "olmo_gdn", "linear_conv_kernel_dim": 3},
+        {"kind": "full_attention"},
+        {
+            "kind": "qwen_gdn",
+            "linear_num_value_heads": 2,
+            "linear_conv_kernel_dim": 5,
+        },
+        {"kind": "sliding_attention"},
+    ]
+    if getattr(request, "param", False):
+        specs[2:2] = [
+            {"kind": "short_conv"},
+            {"kind": "mamba2"},
+            {"kind": "mamba1"},
+        ]
     config = HybridTestConfig(
         vocab_size=256,
         hidden_size=128,
         intermediate_size=256,
-        num_hidden_layers=6,
+        num_hidden_layers=len(specs),
         num_attention_heads=4,
         num_key_value_heads=2,
         max_position_embeddings=128,
         sliding_window=8,
+        mamba_chunk_size=32,
         attention_layer_index=-1,
         bos_token_id=1,
         eos_token_id=2,
         pad_token_id=0,
         tie_word_embeddings=False,
         auto_map={"AutoModel": "hybrid_test_model.HybridTestModel"},
-        operator_specs=[
-            {"kind": "qwen_gdn"},
-            {"kind": "sliding_attention"},
-            {"kind": "olmo_gdn", "linear_conv_kernel_dim": 3},
-            {"kind": "full_attention"},
-            {
-                "kind": "qwen_gdn",
-                "linear_num_value_heads": 2,
-                "linear_conv_kernel_dim": 5,
-            },
-            {"kind": "sliding_attention"},
-        ],
+        operator_specs=specs,
     )
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(0)
@@ -354,10 +452,11 @@ def tiny_mixed_operator_path(tmp_path_factory):
 
 
 @pytest.mark.parametrize("max_num_batched_tokens", [32, 128])
+@pytest.mark.parametrize("tiny_mixed_operator_path", [False, True], indirect=True)
 def test_mixed_state_geometry_and_sliding_cache_matches_transformers(
     vllm_runner, tiny_mixed_operator_path, monkeypatch, max_num_batched_tokens
 ):
-    """Real GDN expressions, different state specs and sliding compose per site."""
+    """Different state algorithms, geometries and sliding compose per site."""
     _check_recurrent_cache(
         vllm_runner,
         tiny_mixed_operator_path,
@@ -534,24 +633,35 @@ def test_state_prefill_kernels_do_not_share_incompatible_metadata(
     )
 
 
-@pytest.mark.parametrize("failure", ["unknown", "unknown-conv", "activation", "shared"])
+@pytest.mark.parametrize(
+    "failure", ["unknown", "unknown-cache", "convolution", "activation", "shared"]
+)
 def test_unadapted_state_semantics_fail_explicitly(failure):
-    from transformers import JambaConfig
+    from transformers import FalconMambaConfig
 
     from vllm.transformers_utils.hybrid import describe_state_operators
 
-    if failure == "unknown":
+    if failure == "unknown-cache":
+
+        class UnknownMixer(nn.Module):
+            def forward(self, hidden_states, cache_params=None):
+                raise NotImplementedError
+
+        model = UnknownMixer()
+        match = "UnknownMixer.*no vLLM state adapter"
+    elif failure == "unknown":
         with torch.device("meta"):
-            model = AutoModel.from_config(JambaConfig(num_hidden_layers=2))
-        match = "layers.0.mamba.*JambaMambaMixer.*no vLLM state adapter"
-    elif failure == "unknown-conv":
+            model = AutoModel.from_config(FalconMambaConfig(num_hidden_layers=2))
+        match = "layers.0.mixer.*FalconMambaMixer.*no vLLM state adapter"
+    elif failure == "convolution":
         from transformers import Lfm2Config
 
         with torch.device("meta"):
             model = AutoModel.from_config(
                 Lfm2Config(num_hidden_layers=2, layer_types=["conv", "full_attention"])
             )
-        match = "layers.0.*Lfm2ShortConv.*no vLLM state adapter"
+        model.layers[0].conv.conv.stride = (2,)
+        match = "layers.0.conv.*unsupported non-causal/depthwise convolution"
     else:
         from transformers import Qwen3_5TextConfig
 

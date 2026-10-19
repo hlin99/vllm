@@ -292,8 +292,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        time_step_limit: tuple[float, float] = (0.0, float("inf")),
     ):
         super().__init__()
+        self.time_step_limit = time_step_limit
 
         # For TP, the sharding plan is as follows:
         # - for the conv modules, since
@@ -694,7 +696,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     dt_bias=self.dt_bias,
                     initial_states=initial_states,
                     dt_softplus=True,
-                    dt_limit=(0.0, float("inf")),
+                    dt_limit=self.time_step_limit,
                     state_dtype=ssm_state_dtype,
                 )
             except Exception:
@@ -865,7 +867,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 initial_states=initial_states,
                 return_intermediate_states=has_checkpoints,
                 dt_softplus=True,
-                dt_limit=(0.0, float("inf")),
+                dt_limit=self.time_step_limit,
                 out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
                 state_dtype=ssm_state.dtype,
             )

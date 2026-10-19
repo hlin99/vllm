@@ -6,7 +6,14 @@ import copy
 
 import torch
 from torch import nn
-from transformers import LlamaConfig, OlmoHybridConfig, Qwen3_5TextConfig
+from transformers import (
+    Lfm2Config,
+    LlamaConfig,
+    MambaConfig,
+    OlmoHybridConfig,
+    Qwen3_5TextConfig,
+    Zamba2Config,
+)
 from transformers.masking_utils import (
     create_causal_mask,
     create_sliding_window_causal_mask,
@@ -15,6 +22,7 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
+from transformers.models.lfm2.modeling_lfm2 import Lfm2ShortConv
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaMLP,
@@ -22,8 +30,10 @@ from transformers.models.llama.modeling_llama import (
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
 )
+from transformers.models.mamba.modeling_mamba import MambaMixer
 from transformers.models.olmo_hybrid.modeling_olmo_hybrid import OlmoHybridGatedDeltaNet
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
+from transformers.models.zamba2.modeling_zamba2 import Zamba2MambaMixer
 
 
 class HybridTestConfig(LlamaConfig):
@@ -53,6 +63,24 @@ class HybridTestBlock(nn.Module):
                 self.mixer.layer_idx = config.attention_layer_index
             self.mixer.sliding_window = (
                 config.sliding_window if self.kind == "sliding_attention" else None
+            )
+        elif self.kind == "mamba1":
+            self.mixer = MambaMixer(
+                MambaConfig(hidden_size=config.hidden_size, state_size=16), index
+            )
+        elif self.kind == "mamba2":
+            self.mixer = Zamba2MambaMixer(
+                Zamba2Config(
+                    hidden_size=config.hidden_size,
+                    n_mamba_heads=4,
+                    mamba_d_state=16,
+                    chunk_size=32,
+                ),
+                index,
+            )
+        elif self.kind == "short_conv":
+            self.mixer = Lfm2ShortConv(
+                Lfm2Config(hidden_size=config.hidden_size), index
             )
         else:
             params = dict(

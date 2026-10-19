@@ -6,7 +6,8 @@ import copy
 import importlib
 import inspect
 import json
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Protocol
 
@@ -95,6 +96,219 @@ class GDNGeometry:
         )
 
 
+@dataclass(frozen=True)
+class Mamba1Geometry:
+    hidden_size: int
+    intermediate_size: int
+    state_size: int
+    conv_kernel_size: int
+    time_step_rank: int
+    activation: str
+    use_conv_bias: bool
+    use_bias: bool
+    norm_eps: float | None
+
+    def config(self) -> PreTrainedConfig:
+        return PreTrainedConfig(**asdict(self))
+
+    def state_spec(self, path: str, vllm_config: "VllmConfig") -> "MambaSpec":
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateDtypeCalculator,
+            MambaStateShapeCalculator,
+        )
+        from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        tp = vllm_config.parallel_config.tensor_parallel_size
+        if self.intermediate_size % tp:
+            raise ValueError(
+                f"State operator {path}: intermediate size must divide TP."
+            )
+        return MambaSpec(
+            shapes=MambaStateShapeCalculator.mamba1_state_shape(
+                tp, self.intermediate_size, self.state_size, self.conv_kernel_size
+            ),
+            dtypes=MambaStateDtypeCalculator.mamba1_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                vllm_config.cache_config.mamba_ssm_cache_dtype,
+            ),
+            block_size=-1,
+            mamba_type=MambaAttentionBackendEnum.MAMBA1,
+        )
+
+
+@dataclass(frozen=True)
+class Mamba2Geometry:
+    hidden_size: int
+    intermediate_size: int
+    state_size: int
+    conv_kernel_size: int
+    num_heads: int
+    head_dim: int
+    n_groups: int
+    activation: str
+    use_conv_bias: bool
+    use_bias: bool
+    norm_eps: float
+    time_step_limit: tuple[float, float]
+
+    def config(self) -> PreTrainedConfig:
+        return PreTrainedConfig(**asdict(self))
+
+    def state_spec(self, path: str, vllm_config: "VllmConfig") -> "MambaSpec":
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateDtypeCalculator,
+            MambaStateShapeCalculator,
+        )
+        from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        tp = vllm_config.parallel_config.tensor_parallel_size
+        if self.num_heads % tp or (self.n_groups != 1 and self.n_groups % tp):
+            raise ValueError(f"State operator {path}: unsupported Mamba2 TP geometry.")
+        return MambaSpec(
+            shapes=MambaStateShapeCalculator.mamba2_state_shape(
+                tp,
+                self.intermediate_size,
+                self.n_groups,
+                self.num_heads,
+                self.head_dim,
+                self.state_size,
+                self.conv_kernel_size,
+                vllm_config.num_speculative_tokens,
+            ),
+            dtypes=MambaStateDtypeCalculator.mamba2_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                vllm_config.cache_config.mamba_ssm_cache_dtype,
+            ),
+            block_size=-1,
+            mamba_type=MambaAttentionBackendEnum.MAMBA2,
+        )
+
+
+@dataclass(frozen=True)
+class ShortConvGeometry:
+    hidden_size: int
+    conv_L_cache: int
+    conv_bias: bool
+
+    def config(self) -> PreTrainedConfig:
+        return PreTrainedConfig(**asdict(self))
+
+    def state_spec(self, path: str, vllm_config: "VllmConfig") -> "MambaSpec":
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateDtypeCalculator,
+            MambaStateShapeCalculator,
+        )
+        from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        tp = vllm_config.parallel_config.tensor_parallel_size
+        if self.hidden_size % tp:
+            raise ValueError(f"State operator {path}: hidden size must divide TP.")
+        return MambaSpec(
+            shapes=MambaStateShapeCalculator.short_conv_state_shape(
+                tp,
+                self.hidden_size,
+                self.conv_L_cache,
+                vllm_config.num_speculative_tokens,
+            ),
+            dtypes=MambaStateDtypeCalculator.short_conv_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+            ),
+            block_size=-1,
+            mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
+        )
+
+
+def validate_state_conv(conv: nn.Conv1d, path: str):
+    if (
+        conv.groups != conv.in_channels
+        or conv.out_channels != conv.in_channels
+        or conv.dilation != (1,)
+        or conv.stride != (1,)
+        or conv.padding != (conv.kernel_size[0] - 1,)
+    ):
+        raise ValueError(
+            f"State operator {path}: unsupported non-causal/depthwise convolution."
+        )
+
+
+def describe_mamba1(module: nn.Module, path: str, *, has_norm: bool) -> StateOperator:
+    validate_state_conv(module.conv1d, path)
+    if module.activation not in ("silu", "swish"):
+        raise ValueError(f"State operator {path}: unsupported Mamba activation.")
+    norm_eps = module.dt_layernorm.variance_epsilon if has_norm else None
+    if has_norm and any(
+        norm.variance_epsilon != norm_eps
+        for norm in (module.b_layernorm, module.c_layernorm)
+    ):
+        raise ValueError(f"State operator {path}: inconsistent Mamba projection norms.")
+    return StateOperator(
+        path,
+        "mamba1",
+        Mamba1Geometry(
+            hidden_size=module.hidden_size,
+            intermediate_size=module.intermediate_size,
+            state_size=module.ssm_state_size,
+            conv_kernel_size=module.conv_kernel_size,
+            time_step_rank=module.time_step_rank,
+            activation=module.activation,
+            use_conv_bias=module.conv1d.bias is not None,
+            use_bias=module.in_proj.bias is not None,
+            norm_eps=norm_eps,
+        ),
+    )
+
+
+def describe_mamba2(module: nn.Module, path: str) -> StateOperator:
+    validate_state_conv(module.conv1d, path)
+    if (
+        module.activation not in ("silu", "swish")
+        or module.head_dim * module.num_heads != module.intermediate_size
+        or module.norm.group_size != module.intermediate_size // module.n_groups
+    ):
+        raise ValueError(f"State operator {path}: unsupported Mamba2 geometry or gate.")
+    return StateOperator(
+        path,
+        "mamba2",
+        Mamba2Geometry(
+            hidden_size=module.hidden_size,
+            intermediate_size=module.intermediate_size,
+            state_size=module.ssm_state_size,
+            conv_kernel_size=module.conv_kernel_size,
+            num_heads=module.num_heads,
+            head_dim=module.head_dim,
+            n_groups=module.n_groups,
+            activation=module.activation,
+            use_conv_bias=module.conv1d.bias is not None,
+            use_bias=module.in_proj.bias is not None,
+            norm_eps=module.norm.variance_epsilon,
+            time_step_limit=tuple(module.time_step_limit),
+        ),
+    )
+
+
+def describe_short_conv(module: nn.Module, path: str) -> StateOperator:
+    validate_state_conv(module.conv, path)
+    if module.in_proj.bias is not None or module.out_proj.bias is not None:
+        raise ValueError(
+            f"State operator {path}: unsupported ShortConv projection bias."
+        )
+    return StateOperator(
+        path,
+        "short_conv",
+        ShortConvGeometry(
+            hidden_size=module.in_proj.in_features,
+            conv_L_cache=module.conv_kernel_size,
+            conv_bias=module.conv.bias is not None,
+        ),
+    )
+
+
 def describe_gdn(
     module: nn.Module, path: str, *, implementation: str, norm_name: str
 ) -> StateOperator:
@@ -150,7 +364,15 @@ def describe_gdn(
     )
 
 
-_IMPLEMENTATIONS = {
+_IMPLEMENTATIONS: dict[tuple[str, str], Callable[[nn.Module, str], StateOperator]] = {
+    ("transformers.models.mamba.modeling_mamba", "MambaMixer"): partial(
+        describe_mamba1, has_norm=False
+    ),
+    ("transformers.models.jamba.modeling_jamba", "JambaMambaMixer"): partial(
+        describe_mamba1, has_norm=True
+    ),
+    ("transformers.models.zamba2.modeling_zamba2", "Zamba2MambaMixer"): describe_mamba2,
+    ("transformers.models.lfm2.modeling_lfm2", "Lfm2ShortConv"): describe_short_conv,
     ("transformers.models.qwen3_5.modeling_qwen3_5", "Qwen3_5GatedDeltaNet"): partial(
         describe_gdn, implementation="qwen_gdn", norm_name="norm"
     ),
@@ -176,8 +398,13 @@ def describe_state_operators(model: nn.Module) -> tuple[StateOperator, ...]:
             # An unadapted HF recurrent mixer must never run cacheless on
             # packed requests, even if its enclosing block also has attention.
             parameters = inspect.signature(cls.forward).parameters
-            if "cache_params" in parameters or (
-                "past_key_values" in parameters
+            cache_container = isinstance(module, PreTrainedModel) or any(
+                (type(child).__module__, type(child).__name__) in _IMPLEMENTATIONS
+                or "cache_params" in inspect.signature(type(child).forward).parameters
+                for child in module.children()
+            )
+            if ("cache_params" in parameters and not cache_container) or (
+                ("cache_params" in parameters or "past_key_values" in parameters)
                 and any(isinstance(child, nn.Conv1d) for child in module.children())
             ):
                 raise ValueError(

@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Operator adapters retaining the Transformers decoder's original forward."""
 
+from collections.abc import Callable
 from copy import copy
 from functools import cache
 from typing import Literal
 
 import torch
+from transformers import PreTrainedConfig
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.gdn.olmo_gdn_linear_attn import (
@@ -15,10 +17,15 @@ from vllm.model_executor.layers.mamba.gdn.olmo_gdn_linear_attn import (
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
-from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
+from vllm.model_executor.layers.mamba.mamba_mixer import MambaMixer
+from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+    MambaMixer2,
+    mamba_v2_sharded_weight_loader,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFuncCalculator,
 )
+from vllm.model_executor.layers.mamba.short_conv import ShortConv
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid, SupportsMRoPE
 from vllm.model_executor.models.transformers.base import Base
 from vllm.model_executor.models.utils import ShardId, WeightsMapper
@@ -166,13 +173,143 @@ class TransformersOlmoGDN(OlmoHybridGatedDeltaNetAttention):
         return output.unsqueeze(0)
 
 
+class TransformersMamba1(MambaMixer):
+    checkpoint_mapping: tuple[tuple[str, str, ShardId], ...] = ()
+    packed_projections = {"in_proj": ["in_proj"]}
+    checkpoint_renaming = {"A_log": "A"}
+
+    def __init__(self, config, vllm_config, prefix):
+        if vllm_config.quant_config is not None:
+            raise ValueError(
+                f"State operator {prefix}: Mamba1 quantization unsupported."
+            )
+        super().__init__(
+            hidden_size=config.hidden_size,
+            ssm_state_size=config.state_size,
+            conv_kernel_size=config.conv_kernel_size,
+            intermediate_size=config.intermediate_size,
+            time_step_rank=config.time_step_rank,
+            use_conv_bias=config.use_conv_bias,
+            use_bias=config.use_bias,
+            use_rms_norm=config.norm_eps is not None,
+            rms_norm_eps=config.norm_eps if config.norm_eps is not None else 1e-5,
+            activation=config.activation,
+            is_lora_enabled=bool(vllm_config.lora_config),
+            model_config=vllm_config.model_config,
+            cache_config=vllm_config.cache_config,
+            prefix=prefix,
+        )
+
+    def forward(
+        self,
+        hidden_states,
+        output=None,
+        *,
+        cache_params=None,
+        attention_mask=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if output is not None:
+            raise ValueError(
+                "HF Mamba forward must not receive a native output buffer."
+            )
+        hidden_states = packed_hidden_states(
+            hidden_states, cache_params, attention_mask
+        )
+        output = torch.empty_like(hidden_states)
+        super().forward(hidden_states, output)
+        return output.unsqueeze(0)
+
+
+class TransformersMamba2(MambaMixer2):
+    checkpoint_mapping: tuple[tuple[str, str, ShardId], ...] = ()
+    packed_projections = {"in_proj": ["in_proj"]}
+    checkpoint_renaming = {"A_log": "A"}
+
+    def __init__(self, config, vllm_config, prefix):
+        super().__init__(
+            hidden_size=config.hidden_size,
+            ssm_state_size=config.state_size,
+            conv_kernel_size=config.conv_kernel_size,
+            intermediate_size=config.intermediate_size,
+            use_conv_bias=config.use_conv_bias,
+            use_bias=config.use_bias,
+            n_groups=config.n_groups,
+            num_heads=config.num_heads,
+            head_dim=config.head_dim,
+            rms_norm_eps=config.norm_eps,
+            activation=config.activation,
+            model_config=vllm_config.model_config,
+            cache_config=vllm_config.cache_config,
+            quant_config=vllm_config.quant_config,
+            prefix=prefix,
+            time_step_limit=config.time_step_limit,
+        )
+
+    def forward(
+        self,
+        hidden_states,
+        mup_vector=None,
+        *,
+        cache_params=None,
+        attention_mask=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if mup_vector is not None:
+            raise ValueError("HF Mamba2 forward must not receive a native mup vector.")
+        hidden_states = packed_hidden_states(
+            hidden_states, cache_params, attention_mask
+        )
+        return super().forward(hidden_states).unsqueeze(0)
+
+
+class TransformersShortConv(ShortConv):
+    checkpoint_mapping: tuple[tuple[str, str, ShardId], ...] = ()
+    packed_projections = {"in_proj": ["in_proj"]}
+
+    def __init__(self, config, vllm_config, prefix):
+        super().__init__(
+            config=config,
+            dim=config.hidden_size,
+            layer_idx=-1,
+            model_config=vllm_config.model_config,
+            cache_config=vllm_config.cache_config,
+            quant_config=vllm_config.quant_config,
+            prefix=prefix,
+        )
+
+    def forward(
+        self, hidden_states, past_key_values=None, attention_mask=None, seq_idx=None
+    ) -> torch.Tensor:
+        if seq_idx is not None:
+            raise ValueError("HF ShortConv sequence IDs cannot replace vLLM metadata.")
+        hidden_states = packed_hidden_states(
+            hidden_states, past_key_values, attention_mask
+        )
+        output = torch.empty_like(hidden_states)
+        super().forward(hidden_states, output)
+        return output.unsqueeze(0)
+
+
+StateAdapter = (
+    TransformersQwenGDN
+    | TransformersOlmoGDN
+    | TransformersMamba1
+    | TransformersMamba2
+    | TransformersShortConv
+)
+
+
 def state_spec(operator: StateOperator, vllm_config: VllmConfig) -> MambaSpec:
     return operator.geometry.state_spec(operator.path, vllm_config)
 
 
-_ADAPTERS: dict[str, type[TransformersQwenGDN] | type[TransformersOlmoGDN]] = {
+_ADAPTERS: dict[str, Callable[[PreTrainedConfig, VllmConfig, str], StateAdapter]] = {
     "qwen_gdn": TransformersQwenGDN,
     "olmo_gdn": TransformersOlmoGDN,
+    "mamba1": TransformersMamba1,
+    "mamba2": TransformersMamba2,
+    "short_conv": TransformersShortConv,
 }
 
 
@@ -190,6 +327,7 @@ class HybridMixin(HasInnerState, IsHybrid, Base):
         # PP has already removed non-local layers. Compare each surviving site.
         expected_by_path = {operator.path: operator for operator in expected}
         stacked: dict[str, tuple[str, ShardId]] = {}
+        renamed: dict[str, str] = {}
         for operator in actual:
             if expected_by_path.get(operator.path) != operator:
                 raise ValueError(
@@ -203,10 +341,8 @@ class HybridMixin(HasInnerState, IsHybrid, Base):
                     f"{operator.implementation!r}."
                 )
             adapter = _ADAPTERS[operator.implementation]
-            replacement = adapter(
-                operator.geometry.config(), self.vllm_config, prefix=name
-            )
-            self.packed_modules_mapping.update(adapter.packed_projections)
+            replacement = adapter(operator.geometry.config(), self.vllm_config, name)
+            self.packed_modules_mapping.update(replacement.packed_projections)
             if (
                 tuple(replacement.get_state_shape()) != spec.shapes
                 or replacement.get_state_dtype() != spec.dtypes
@@ -214,11 +350,16 @@ class HybridMixin(HasInnerState, IsHybrid, Base):
                 raise ValueError(f"State operator {name}: runtime cache spec mismatch.")
             parent, _, child = operator.path.rpartition(".")
             setattr(self.model.get_submodule(parent), child, replacement)
-            for source, target, shard in adapter.checkpoint_mapping:
+            for source, target, shard in replacement.checkpoint_mapping:
                 stacked[f"{name}.{source}"] = (f"{name}.{target}", shard)
+            if isinstance(replacement, (TransformersMamba1, TransformersMamba2)):
+                for source, target in replacement.checkpoint_renaming.items():
+                    renamed[f"{name}.{source}"] = f"{name}.{target}"
         if self.quant_config is not None:
             self.quant_config.packed_modules_mapping.update(self.packed_modules_mapping)
-        self.hf_to_vllm_mapper |= WeightsMapper(orig_to_new_stacked=stacked)
+        self.hf_to_vllm_mapper |= WeightsMapper(
+            orig_to_new_stacked=stacked, orig_to_new_substr=renamed
+        )
         super().recursive_replace()
 
     @classmethod
@@ -237,8 +378,12 @@ class HybridMixin(HasInnerState, IsHybrid, Base):
 
     @classmethod
     def get_mamba_state_copy_funcs(cls, mamba_types):
+        calc = MambaStateCopyFuncCalculator
         supported = {
-            MambaAttentionBackendEnum.GDN_ATTN: cls.get_mamba_state_copy_func()
+            MambaAttentionBackendEnum.GDN_ATTN: cls.get_mamba_state_copy_func(),
+            MambaAttentionBackendEnum.MAMBA1: calc.mamba1_state_copy_func(),
+            MambaAttentionBackendEnum.MAMBA2: calc.mamba2_state_copy_func(),
+            MambaAttentionBackendEnum.SHORT_CONV: calc.short_conv_state_copy_func(),
         }
         if missing := mamba_types - supported.keys():
             raise ValueError(f"Missing Transformers state copy adapters for {missing}.")

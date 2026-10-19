@@ -20,6 +20,7 @@ import os
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from functools import cached_property
+from inspect import signature
 from itertools import chain
 from operator import attrgetter
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -195,6 +196,8 @@ class Base(
 
         # Upcast weights Transformers always keeps in fp32
         self.keep_in_fp32(self.model)
+        # Replacements must retain declared parameter ties, not shared KV states.
+        self.model.tie_weights()
 
         # Pipeline parallel intermediate tensors
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -286,13 +289,14 @@ class Base(
     def _decorate_for_torch_compile(self):
         """Decorate the model's decoder class to indicate to vLLM that it
         supports torch compile if `can_enable_torch_compile` is True."""
+        decoder = self._pre_trained_model_classes.decoder
+        dimensions = {"input_ids": 1, "inputs_embeds": 1, "position_ids": -1}
+        parameters = signature(decoder.forward).parameters
         self._decorate_cls_for_torch_compile(
-            cls=self._pre_trained_model_classes.decoder,
+            cls=decoder,
             # Applied to a PreTrainedModel so the batch dimension will exist
             dynamic_arg_dims=DynamicArgDims(
-                input_ids=1,  # shape: [1, seq_len]
-                inputs_embeds=1,  # shape: [1, seq_len, hidden_size]
-                position_ids=-1,  # shape: [1, seq_len] or [3, 1, seq_len] for mrope
+                **{name: dim for name, dim in dimensions.items() if name in parameters}
             ),
             enable_if=can_enable_torch_compile,
             is_encoder=False,
@@ -624,10 +628,12 @@ class Base(
             )
         # Validate real decoder blocks, rather than inferring state sites from
         # path digits or a layer-type string (which does not identify an algorithm).
+        inside_blocks: set[int] = set()
         for name, module in self.model.get_decoder().named_modules():
             if (
                 isinstance(module, nn.ModuleList)
                 and len(module) == text_config.num_hidden_layers
+                and id(module) not in inside_blocks
             ):
                 for i in range(start, end):
                     block = module[i]
@@ -638,6 +644,7 @@ class Base(
                             f"{[type(child).__name__ for child in block.children()]}. "
                             "No vLLM state adapter or attention interface was found."
                         )
+                    inside_blocks.update(id(child) for child in block.modules())
 
         for identity, (attn_prefix, attn_fuser) in self.attention_fusers.items():
             attn_module = self.get_submodule(attn_prefix)
