@@ -351,6 +351,14 @@ class ModelConfig:
     e.g. `{"GlmMoeDsaForCausalLM":
     "vllm.models.deepseek_v32.nvidia.model:DeepseekV32ForCausalLM"}`. This
     argument is for development and debugging purposes only."""
+    enable_tpsp: bool = False
+    """Attempt paired TP/SP projections above a fixed or profiled threshold.
+    Incompatible with pipeline parallelism and target-hidden-state speculation."""
+    tpsp_microchunk_tokens: int | None = None
+    """Fix the TPSP microchunk size in global tokens. The backend rounds this up
+    to its per-rank row granularity and capacity instead of selecting a size."""
+    tpsp_threshold_tokens: int | None = None
+    """Fix the TPSP activation threshold in global tokens instead of selecting it."""
     generation_config: str = "auto"
     """The folder path to the generation config. Defaults to `"auto"`, the
     generation config will be loaded from model path. If set to `"vllm"`, no
@@ -1060,6 +1068,11 @@ class ModelConfig:
                 f"got {type(self.max_model_len).__name__}: {self.max_model_len!r}. "
                 "Example: max_model_len=2048"
             )
+        if self.enable_tpsp and not self.using_transformers_backend():
+            raise ValueError(
+                "--enable-tpsp requires the Transformers modeling backend. "
+                "Set --model-impl transformers."
+            )
         if self.enable_prompt_embeds and self.is_encoder_decoder:
             # No encoder-decoder model accepts `inputs_embeds`; their decoders
             # embed `input_ids` internally.
@@ -1622,8 +1635,8 @@ class ModelConfig:
     def get_inputs_embeds_size(self) -> int:
         # The size of inputs_embeds is usually identical to the size
         # of the hidden states, however there are exceptions, such as
-        # embedding models like CLIP and SigLIP
-        names = ("projection_dim", "projection_size")
+        # OPT's projected token embeddings and embedding models like CLIP/SigLIP.
+        names = ("word_embed_proj_dim", "projection_dim", "projection_size")
         return getattr_iter(
             self.hf_text_config, names, default_factory=self.get_hidden_size
         )
@@ -2016,6 +2029,10 @@ class ModelConfig:
         return self._model_info.supports_pp
 
     @property
+    def is_lora_supported(self) -> bool:
+        return self._model_info.supports_lora
+
+    @property
     def is_attention_free(self) -> bool:
         return self._model_info.is_attention_free
 
@@ -2033,6 +2050,10 @@ class ModelConfig:
     @property
     def has_noops(self) -> bool:
         return self._model_info.has_noops
+
+    @property
+    def supports_kv_cache_grouping(self) -> bool:
+        return self._model_info.supports_kv_cache_grouping
 
     @property
     def has_inner_state(self):

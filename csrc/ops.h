@@ -6,6 +6,7 @@
 
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <torch/csrc/stable/ops.h>
@@ -44,6 +45,22 @@ void per_token_group_quant_int8(const torch::stable::Tensor& input,
                                 double int8_max);
 
 #ifndef USE_ROCM
+int64_t init_tpsp_p2p(int64_t device_index, int64_t tp_size, int64_t rank,
+                      int64_t max_microchunk_tokens_per_rank,
+                      int64_t hidden_size, int64_t max_tokens);
+torch::stable::Tensor get_tpsp_p2p_handles(int64_t handle);
+bool map_tpsp_p2p(int64_t handle, const torch::stable::Tensor& peer_handles);
+void destroy_tpsp_p2p(int64_t handle);
+
+std::tuple<torch::stable::Tensor, torch::stable::Tensor>
+tpsp_matmul_reduce_scatter_norm_all_gather(
+    const torch::stable::Tensor& a, const torch::stable::Tensor& b,
+    const torch::stable::Tensor& weight, torch::stable::Tensor& residual,
+    const std::optional<torch::stable::Tensor>& projection_bias,
+    const std::optional<torch::stable::Tensor>& norm_bias, double eps,
+    int64_t norm_kind, int64_t microchunk_tokens_per_rank, int64_t tp_size,
+    int64_t p2p_handle, int64_t sm_count_target);
+
 bool cutlass_scaled_mm_supports_fp8(int64_t cuda_device_capability);
 bool cutlass_scaled_mm_supports_block_fp8(int64_t cuda_device_capability);
 bool cutlass_group_gemm_supported(int64_t cuda_device_capability);
@@ -203,6 +220,10 @@ void fused_add_rms_norm(torch::stable::Tensor& input,
                         torch::stable::Tensor& residual,
                         std::optional<torch::stable::Tensor> weight,
                         double epsilon);
+void fused_add_rms_norm_with_stream(torch::stable::Tensor& input,
+                                    torch::stable::Tensor& residual,
+                                    std::optional<torch::stable::Tensor> weight,
+                                    double epsilon, void* stream_ptr);
 
 // Layernorm-quant kernels (shared CUDA/ROCm)
 void rms_norm_static_fp8_quant(torch::stable::Tensor& out,
@@ -362,6 +383,35 @@ minimax_allreduce_rms_qk(torch::stable::Tensor qkv,
                          int64_t const kv_size, int64_t const rank,
                          int64_t const nranks, double const eps);
 #endif
+
+#ifndef USE_ROCM
+namespace vllm {
+void fused_qknorm_rope_cache(
+    torch::stable::Tensor& q_out, torch::stable::Tensor& k_out,
+    torch::stable::Tensor& v_out, torch::stable::Tensor& qkv,
+    torch::stable::Tensor& q_weight, torch::stable::Tensor& k_weight,
+    torch::stable::Tensor& cos, torch::stable::Tensor& sin,
+    torch::stable::Tensor& positions, torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& k_cache, torch::stable::Tensor& v_cache,
+    int64_t head_dim, int64_t num_q_heads, int64_t num_kv_heads,
+    int64_t rotary_pairs, double epsilon, double norm_weight_bias,
+    const std::string& kv_cache_dtype,
+    std::optional<torch::stable::Tensor> k_scale,
+    std::optional<torch::stable::Tensor> v_scale);
+}  // namespace vllm
+#endif
+
+void fused_muse_spark_qknorm_rope_kv_insert(
+    torch::stable::Tensor& qkv, torch::stable::Tensor const& positions,
+    int64_t num_heads, int64_t num_kv_heads, int64_t head_dim, double eps,
+    std::optional<torch::stable::Tensor> cos_sin_cache, int64_t rotary_dim,
+    std::optional<torch::stable::Tensor> slot_mapping,
+    std::optional<torch::stable::Tensor> kv_cache, int64_t block_size,
+    const std::string& kv_cache_dtype,
+    std::optional<torch::stable::Tensor> k_scale,
+    std::optional<torch::stable::Tensor> v_scale,
+    std::optional<torch::stable::Tensor> q_fp8_out,
+    std::optional<torch::stable::Tensor> q_scale);
 
 // Horizontally-fused MiniMax-M3 QK-norm + partial NeoX RoPE (+ optional KV /
 // index-cache insert). Dense layer: norm+RoPE only; sparse layer: also packs
@@ -546,6 +596,10 @@ std::tuple<int64_t, torch::stable::Tensor> allocate_shared_buffer_and_handle(
 int64_t open_mem_handle(torch::stable::Tensor& mem_handle);
 void free_shared_buffer(int64_t buffer);
 
+void muse_spark_mul_tanh_soft_cap(torch::stable::Tensor& out,
+                                  torch::stable::Tensor& input,
+                                  double multiplier, double soft_cap_temp);
+
 // Activation kernels (shared CUDA/ROCm)
 void silu_and_mul(torch::stable::Tensor& out, torch::stable::Tensor& input);
 void silu_and_mul_clamp(torch::stable::Tensor& out,
@@ -579,10 +633,6 @@ void situ_and_mul_quant(
     int64_t group_size = 0,
     std::optional<torch::stable::Tensor> num_valid_tokens = std::nullopt,
     int64_t topk = 1);
-void masked_situ_and_mul(torch::stable::Tensor& out,
-                         torch::stable::Tensor& input,
-                         const torch::stable::Tensor& expert_num_tokens,
-                         double beta = 1.0, double linear_beta = -1.0);
 void masked_moe_activation(torch::stable::Tensor& out,
                            torch::stable::Tensor& input,
                            const torch::stable::Tensor& valid_token_counts,

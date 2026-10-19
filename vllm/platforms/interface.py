@@ -22,6 +22,9 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.kernel import IrOpPriorityConfig
     from vllm.inputs import EngineInput
+    from vllm.model_executor.models.transformers.tpsp_runtime import (
+        TPSPBackend,
+    )
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -254,6 +257,11 @@ class Platform:
     def get_compile_backend(cls) -> str:
         """Get the custom compile backend for current platform."""
         return cls.simple_compile_backend
+
+    @classmethod
+    def get_tpsp_backend_cls(cls) -> "type[TPSPBackend] | None":
+        """Return the TPSP backend class, or None if unsupported."""
+        return None
 
     @classmethod
     def import_ir_kernels(cls) -> None:
@@ -1466,6 +1474,28 @@ class Platform:
                     logger.warning(
                         "Unknown vLLM environment variable detected: %s", env
                     )
+
+    @classmethod
+    def get_kv_cache_config_builder_cls(cls, vllm_config: "VllmConfig") -> str:
+        """Resolve the fully-qualified class path of the platform's KV cache
+        config builder.
+
+        .. note::
+            Experimental, like the ``KVCacheConfigBuilder`` interface it selects.
+
+        The builder supplies grouping (``get_kv_cache_groups``) and tensor
+        placement (``get_kv_cache_config_from_groups``). Vendors may override
+        this to return a platform-specific builder. The default builder honors a
+        model implementing
+        :class:`~vllm.model_executor.models.interfaces.SupportsKVCacheGrouping`;
+        a builder that overrides ``get_kv_cache_groups`` owns grouping and
+        bypasses that model hook unless it calls ``super()``.
+
+        Returns:
+            Fully-qualified class path of a ``KVCacheConfigBuilder`` subclass.
+
+        """
+        return "vllm.v1.core.kv_cache_planning.DefaultKVCacheConfigBuilder"
 
 
 class UnspecifiedPlatform(Platform):
