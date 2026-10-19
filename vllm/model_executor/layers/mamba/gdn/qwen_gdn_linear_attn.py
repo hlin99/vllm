@@ -12,7 +12,7 @@ from typing import Literal
 import torch
 from einops import rearrange
 from torch import nn
-from transformers import Qwen3NextConfig
+from transformers import PreTrainedConfig, Qwen3NextConfig
 
 from vllm import _custom_ops as ops
 from vllm import envs
@@ -126,6 +126,7 @@ def _aiter_flydsl_unsupported_reasons(
 
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
+    config: PreTrainedConfig | None = None,
 ) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "aiter_flydsl"]]:
     """Resolve GDN prefill backend.
 
@@ -154,12 +155,9 @@ def _resolve_gdn_prefill_backend(
     )
     backend = str(backend_cfg).strip().lower()
 
-    head_k_dim = getattr(
-        vllm_config.model_config.hf_text_config, "linear_key_head_dim", None
-    )
-    head_v_dim = getattr(
-        vllm_config.model_config.hf_text_config, "linear_value_head_dim", None
-    )
+    config = config if config is not None else vllm_config.model_config.hf_text_config
+    head_k_dim = getattr(config, "linear_key_head_dim", None)
+    head_v_dim = getattr(config, "linear_value_head_dim", None)
 
     if current_platform.is_rocm():
         if backend == "aiter_flydsl":
@@ -234,11 +232,11 @@ def _log_gdn_backend_decision(
     vllm_config: VllmConfig,
     requested_backend: str,
     active_backend: str,
+    config: PreTrainedConfig | None = None,
 ) -> None:
     """Log the GDN prefill backend choice in the attention-selector style."""
-    head_k_dim = getattr(
-        vllm_config.model_config.hf_text_config, "linear_key_head_dim", None
-    )
+    config = config if config is not None else vllm_config.model_config.hf_text_config
+    head_k_dim = getattr(config, "linear_key_head_dim", None)
 
     if current_platform.is_cpu():
         logger.info_once(
@@ -345,10 +343,10 @@ def _checkpoint_grid(cache_config: CacheConfig) -> int:
 
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
-    def __init__(self) -> None:
+    def __init__(self, config: PreTrainedConfig | None = None) -> None:
         super().__init__()
         vllm_config = get_current_vllm_config()
-        backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
+        backend, active_backend = _resolve_gdn_prefill_backend(vllm_config, config)
         self.gdn_prefill_backend = active_backend
 
         if backend in ("flashinfer", "cutedsl") and active_backend != backend:
@@ -357,7 +355,7 @@ class ChunkGatedDeltaRule(CustomOp):
                 "kernel on the current platform. Falling back to Triton/FLA.",
                 backend,
             )
-        _log_gdn_backend_decision(vllm_config, backend, active_backend)
+        _log_gdn_backend_decision(vllm_config, backend, active_backend, config)
 
         if active_backend == "flashinfer":
             self._forward_method = self.forward_cuda
@@ -648,7 +646,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.out_proj",
         )
 
-        self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
+        self.chunk_gated_delta_rule = ChunkGatedDeltaRule(config)
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
         # FlashInfer's prefill emits mid-prefill states, so an align-mode

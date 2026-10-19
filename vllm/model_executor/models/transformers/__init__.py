@@ -35,6 +35,7 @@ from vllm.model_executor.models.transformers.pooling import (
     EmbeddingMixin,
     SequenceClassificationMixin,
 )
+from vllm.model_executor.models.transformers.state import HybridMixin, TextPositionMixin
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 if TYPE_CHECKING:
@@ -126,10 +127,18 @@ ALL_ATTENTION_FUNCTIONS.register("vllm_mla", vllm_mla_attention_forward)
 
 
 # Text only models
-class TransformersForCausalLM(CausalMixin): ...
+class TransformersForCausalLM(TextPositionMixin, CausalMixin): ...
 
 
-class TransformersMoEForCausalLM(MoEMixin, CausalMixin): ...
+class TransformersMoEForCausalLM(TextPositionMixin, MoEMixin, CausalMixin): ...
+
+
+class TransformersHybridForCausalLM(HybridMixin, TextPositionMixin, CausalMixin): ...
+
+
+class TransformersHybridMoEForCausalLM(
+    HybridMixin, TextPositionMixin, MoEMixin, CausalMixin
+): ...
 
 
 # Multimodal models
@@ -147,6 +156,26 @@ class TransformersMultiModalForCausalLM(MultiModalMixin, CausalMixin): ...
     dummy_inputs=MultiModalDummyInputsBuilder,
 )
 class TransformersMultiModalMoEForCausalLM(MoEMixin, MultiModalMixin, CausalMixin): ...
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    MultiModalProcessor,
+    info=MultiModalProcessingInfo,
+    dummy_inputs=MultiModalDummyInputsBuilder,
+)
+class TransformersMultiModalHybridForCausalLM(
+    HybridMixin, MultiModalMixin, CausalMixin
+): ...
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    MultiModalProcessor,
+    info=MultiModalProcessingInfo,
+    dummy_inputs=MultiModalDummyInputsBuilder,
+)
+class TransformersMultiModalHybridMoEForCausalLM(
+    HybridMixin, MoEMixin, MultiModalMixin, CausalMixin
+): ...
 
 
 # Embedding models

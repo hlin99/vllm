@@ -49,6 +49,7 @@ MINIMAL_MODEL_ARCH_LIST = [
     "InternVLChatModel",
     "InternLM2ForRewardModel",
     "TransformersMultiModalForCausalLM",
+    "TransformersMultiModalHybridForCausalLM",
     "Terratorch",
     "UltravoxModel",
     "DeepSeekMTPModel",

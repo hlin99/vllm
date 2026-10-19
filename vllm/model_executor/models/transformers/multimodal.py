@@ -857,17 +857,9 @@ class MultiModalMixin(SupportsMultiModal, SupportsMRoPE, Base):
     def _find_encoder_classes(
         self, model: "PreTrainedModel"
     ) -> dict[str, type["PreTrainedModel"]]:
-        """Modalities whose encoder cannot be told apart from the model itself are
-        omitted, as are those `get_encoder` rejects."""
-        encoder_classes: dict[str, type[PreTrainedModel]] = {}
-        for modality in _MODALITY_TO_TOKEN_TYPE_ID:
-            try:
-                encoder_cls = type(model.get_encoder(modality=modality))
-            except (TypeError, ValueError):
-                continue
-            if encoder_cls is not type(model):
-                encoder_classes[modality] = encoder_cls
-        return encoder_classes
+        from vllm.transformers_utils.hybrid import find_encoder_classes
+
+        return find_encoder_classes(model)
 
     @contextmanager
     def _mark_model_components(self, vllm_config: "VllmConfig"):

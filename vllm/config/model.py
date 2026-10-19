@@ -1116,9 +1116,13 @@ class ModelConfig:
     def _get_transformers_backend_cls(self) -> str:
         """Determine which Transformers modeling backend class will be used if
         `model_impl` is set to `transformers` or `auto`."""
+        from vllm.transformers_utils.hybrid import get_state_operators
+
+        has_state = bool(get_state_operators(self.hf_config, self.trust_remote_code))
         cls = "Transformers"
         # If 'hf_config is not hf_text_config' it's a nested config, i.e. multimodal
         cls += "MultiModal" if self.hf_config is not self.hf_text_config else ""
+        cls += "Hybrid" if has_state else ""
         cls += "MoE" if self.is_moe else ""
         # Check if the architecture we're wrapping has defaults
         runner = None
@@ -1146,6 +1150,8 @@ class ModelConfig:
     def using_transformers_backend(self) -> bool:
         """Check if the model is using the Transformers modeling backend class."""
         used_cls = self._model_info.architecture
+        if not used_cls.startswith("Transformers"):
+            return False
         transformers_backend_cls = self._get_transformers_backend_cls()
         return used_cls == transformers_backend_cls
 
@@ -2017,12 +2023,22 @@ class ModelConfig:
 
     @property
     def is_attention_free(self) -> bool:
+        if self._model_info.is_hybrid and self._model_info.architecture.startswith(
+            "Transformers"
+        ):
+            from vllm.transformers_utils.hybrid import inspect_model_structure
+
+            return not inspect_model_structure(
+                self.hf_config, self.trust_remote_code
+            ).attention_paths
         return self._model_info.is_attention_free
 
     @property
     def is_hybrid(self) -> bool:
         if not self._model_info.is_hybrid:
             return False
+        if self._model_info.architecture.startswith("Transformers"):
+            return True
         # Handle granite-4.0-micro case which uses hybrid config but does not
         # actually contain any non-attention layers.
         layer_types = getattr(self.hf_config, "layer_types", None)

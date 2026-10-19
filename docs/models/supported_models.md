@@ -23,6 +23,45 @@ Currently, the Transformers modeling backend works for the following:
 - Architectures: encoder-only, decoder-only, mixture-of-experts
 - Attention types: full attention and/or sliding attention
 
+With `model_impl="transformers"`, state operators are adapted individually while
+the original Transformers model forward is retained. Qwen3.5/Qwen3.8 and OLMo
+Hybrid Gated DeltaNet (GDN) operators use vLLM kernels, checkpoint mappings, and
+managed recurrent caches. Full attention and sliding attention retain the
+existing attention interface. Supported operators may occur in any order,
+including GDN-only decoders; no model-family dispatch or layer-period inference
+is used to select the hybrid wrapper.
+
+Qwen3.5/Qwen3.8 dense multimodal models retain their Transformers vision encoder,
+image/video processing, and MRoPE. State geometry is inspected once on the meta
+device per configuration and cached per process; each runtime operator is checked
+against that description before cache allocation. Distinct layer geometries get
+their own state specifications. Inspection obeys `trust_remote_code` and executes
+trusted model constructors, so it does not make remote code side-effect free.
+Checkpoint exclusions (including Qwen's auxiliary `mtp.*` weights) follow the HF
+model's declared unexpected-key rules.
+
+The GDN adapters support causal depthwise convolutions without bias, SiLU output
+gating, and the native TP head-sharding requirements. The OLMo adapter supports
+both values of `linear_allow_neg_eigval` and its HF output norm epsilon of `1e-5`.
+Unsupported mixers and semantic options raise errors rather than falling back to
+an unmanaged HF cache. Mamba1, Mamba2, standalone short convolutions, and shared
+stateful execution sites do not yet have Transformers adapters.
+Structural inspection also cannot prove the semantics of repeated calls to the
+same module inside an opaque remote-code forward; those execution graphs are
+outside the current support boundary.
+
+Numerical regressions use seeded tiny checkpoints and HF FP32 logprobs with
+`atol=0.04, rtol=0`. They cover irregular GDN/full layouts, GDN-only execution,
+mixed Qwen/OLMo GDN plus sliding/full attention with different per-layer state
+geometries, whole/chunked prefill, decode, and reverse-order request reuse.
+Qwen regressions additionally cover TP2 eager and TP1 compiled execution.
+These checks are not a quality evaluation of the original pretrained checkpoints
+or a guarantee of bitwise-identical BF16 greedy tokens near logit ties.
+Hybrid MoE wrappers have initialization coverage, not model-quality coverage.
+Different recurrent algorithm/cache types, prefix caching, speculative decoding,
+pipeline parallelism, quantized GDN weights, and non-CUDA platforms have not been
+validated by these hybrid-backend regressions.
+
 If the Transformers model implementation follows all the steps in [writing a custom model](#writing-custom-models) then, when used with the Transformers modeling backend, it will be compatible with the following features of vLLM:
 
 - All the features listed in the [compatibility matrix](../features/README.md#feature-x-feature)

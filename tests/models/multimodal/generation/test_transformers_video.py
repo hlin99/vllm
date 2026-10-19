@@ -50,6 +50,74 @@ VIDEO_MODEL_SETTINGS: dict[str, dict[str, Any]] = {
 }
 
 
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.8-27B"])
+def test_qwen3_5_transformers_dummy_multimodal_generation(vllm_runner, model_id):
+    """Hybrid recurrent states work for text, image and video prefill/decode."""
+    import numpy as np
+    from PIL import Image
+
+    from vllm import SamplingParams
+    from vllm.inputs import TextPrompt
+
+    prompts: list[TextPrompt] = [
+        {"prompt": "Hello"},
+        {
+            "prompt": "<|vision_start|><|image_pad|><|vision_end|> Describe.",
+            "multi_modal_data": {"image": Image.new("RGB", (64, 64))},
+        },
+        {
+            "prompt": "<|vision_start|><|video_pad|><|vision_end|> Describe.",
+            "multi_modal_data": {
+                "video": (
+                    np.zeros((2, 64, 64, 3), dtype=np.uint8),
+                    {
+                        "fps": 1.0,
+                        "total_num_frames": 2,
+                        "frames_indices": [0, 1],
+                        "do_sample_frames": False,
+                    },
+                ),
+            },
+        },
+    ]
+    with vllm_runner(
+        model_id,
+        model_impl="transformers",
+        load_format="dummy",
+        dtype="bfloat16",
+        enforce_eager=True,
+        enable_chunked_prefill=True,
+        max_model_len=1024,
+        max_num_seqs=3,
+        limit_mm_per_prompt={"image": 1, "video": 1},
+        mm_processor_kwargs={"size": {"shortest_edge": 1024, "longest_edge": 4096}},
+        hf_overrides={
+            "text_config": {
+                "num_hidden_layers": 4,
+                "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+                "hidden_size": 512,
+                "intermediate_size": 1024,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 2,
+            },
+            "vision_config": {"depth": 1, "out_hidden_size": 512},
+        },
+    ) as model:
+        outputs = model.get_llm().generate(
+            prompts, SamplingParams(temperature=0, max_tokens=3, ignore_eos=True)
+        )
+        chat_outputs = model.get_llm().chat(
+            [{"role": "user", "content": "Hello"}],
+            SamplingParams(temperature=0, max_tokens=3, ignore_eos=True),
+        )
+    assert len(outputs) == len(prompts)
+    assert all(len(output.outputs[0].token_ids) == 3 for output in outputs)
+    assert len(chat_outputs) == 1
+    assert len(chat_outputs[0].outputs[0].token_ids) == 3
+
+
 @pytest.fixture(autouse=True)
 def use_spawn_for_video_models(monkeypatch):
     """Single-process workaround for V1 fork safety deadlock issue

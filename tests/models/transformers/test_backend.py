@@ -148,6 +148,425 @@ def test_hybrid_attention(vllm_runner: type[VllmRunner]) -> None:
     )
 
 
+@pytest.fixture(scope="module")
+def tiny_qwen3_5_path(tmp_path_factory):
+    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+    config = Qwen3_5TextConfig(
+        vocab_size=256,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        max_position_embeddings=128,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.25,
+            "mrope_section": [2, 1, 1],
+        },
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        model = Qwen3_5ForCausalLM(config)
+    path = tmp_path_factory.mktemp("tiny_qwen3_5")
+    model.save_pretrained(
+        path,
+        state_dict={**model.state_dict(), "mtp.aux.weight": torch.zeros(1)},
+    )
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "enforce_eager"), [(1, True), (2, True), (1, False)]
+)
+def test_qwen3_5_recurrent_cache_matches_transformers(
+    vllm_runner: type[VllmRunner],
+    tiny_qwen3_5_path,
+    tp_size,
+    enforce_eager,
+    monkeypatch,
+):
+    """Loaded GDN weights and cached chunked prefill/decode match HF logits."""
+    outputs, repeated = _check_recurrent_cache(
+        vllm_runner, tiny_qwen3_5_path, tp_size, enforce_eager, monkeypatch
+    )
+    assert [o.outputs[0].token_ids for o in outputs] == [
+        o.outputs[0].token_ids for o in repeated[::-1]
+    ]
+
+
+@pytest.fixture(scope="module")
+def tiny_hybrid_path(request, tmp_path_factory):
+    from transformers import (
+        OlmoHybridConfig,
+        OlmoHybridForCausalLM,
+        Qwen3_5ForCausalLM,
+        Qwen3_5TextConfig,
+    )
+
+    kind, layer_types, allow_neg_eigval = request.param
+    kwargs = dict(
+        vocab_size=256,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=len(layer_types),
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        layer_types=layer_types,
+        max_position_embeddings=128,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+    )
+    if kind == "olmo":
+        config = OlmoHybridConfig(
+            **kwargs,
+            linear_allow_neg_eigval=allow_neg_eigval,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000},
+        )
+        model_cls = OlmoHybridForCausalLM
+    else:
+        config = Qwen3_5TextConfig(
+            **kwargs,
+            head_dim=32,
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 10000,
+                "partial_rotary_factor": 0.25,
+                "mrope_section": [2, 1, 1],
+            },
+        )
+        model_cls = Qwen3_5ForCausalLM
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        model = model_cls(config)
+    path = tmp_path_factory.mktemp(f"tiny_hybrid_{kind}")
+    model.save_pretrained(path, save_original_format=False)
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    "tiny_hybrid_path",
+    [
+        pytest.param(
+            (
+                "qwen",
+                [
+                    "full_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "full_attention",
+                    "linear_attention",
+                ],
+                False,
+            ),
+            id="irregular-qwen",
+        ),
+        pytest.param(("qwen", ["linear_attention"] * 3, False), id="state-only-qwen"),
+        pytest.param(
+            ("olmo", ["linear_attention", "full_attention", "linear_attention"], True),
+            id="olmo-negative-eigenvalues",
+        ),
+        pytest.param(
+            ("olmo", ["full_attention", "linear_attention", "linear_attention"], False),
+            id="olmo-positive-eigenvalues",
+        ),
+    ],
+    indirect=True,
+)
+def test_hybrid_recurrent_cache_matches_transformers(
+    vllm_runner, tiny_hybrid_path, monkeypatch
+):
+    """Operator order and HF projection layout do not select a model wrapper."""
+    _check_recurrent_cache(vllm_runner, tiny_hybrid_path, 1, True, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "tiny_hybrid_path",
+    [("qwen", ["full_attention"] * 3, False)],
+    indirect=True,
+)
+def test_full_attention_still_uses_stateless_transformers_backend(
+    vllm_runner, tiny_hybrid_path, monkeypatch
+):
+    _check_recurrent_cache(
+        vllm_runner, tiny_hybrid_path, 1, True, monkeypatch, has_state=False
+    )
+
+
+@pytest.fixture(scope="module")
+def tiny_mixed_operator_path(tmp_path_factory):
+    from .hybrid_test_model import (
+        HybridTestConfig,
+        HybridTestForCausalLM,
+    )
+
+    config = HybridTestConfig(
+        vocab_size=256,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=6,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        sliding_window=8,
+        attention_layer_index=-1,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        auto_map={"AutoModel": "hybrid_test_model.HybridTestModel"},
+        operator_specs=[
+            {"kind": "qwen_gdn"},
+            {"kind": "sliding_attention"},
+            {"kind": "olmo_gdn", "linear_conv_kernel_dim": 3},
+            {"kind": "full_attention"},
+            {
+                "kind": "qwen_gdn",
+                "linear_num_value_heads": 2,
+                "linear_conv_kernel_dim": 5,
+            },
+            {"kind": "sliding_attention"},
+        ],
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        model = HybridTestForCausalLM(config)
+    path = tmp_path_factory.mktemp("tiny_mixed_operators")
+    model.save_pretrained(path, save_original_format=False)
+    return str(path)
+
+
+@pytest.mark.parametrize("max_num_batched_tokens", [32, 128])
+def test_mixed_state_geometry_and_sliding_cache_matches_transformers(
+    vllm_runner, tiny_mixed_operator_path, monkeypatch, max_num_batched_tokens
+):
+    """Real GDN expressions, different state specs and sliding compose per site."""
+    _check_recurrent_cache(
+        vllm_runner,
+        tiny_mixed_operator_path,
+        1,
+        True,
+        monkeypatch,
+        max_num_batched_tokens=max_num_batched_tokens,
+    )
+
+
+def _check_recurrent_cache(
+    vllm_runner,
+    checkpoint_path,
+    tp_size,
+    enforce_eager,
+    monkeypatch,
+    max_num_batched_tokens=32,
+    has_state=True,
+):
+    from transformers import AutoModelForCausalLM
+
+    from vllm import SamplingParams
+
+    if torch.accelerator.device_count() < tp_size:
+        pytest.skip(f"Requires {tp_size} GPUs")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    prompts = [list(range(3, 15)), list(range(30, 113))]
+    params = SamplingParams(
+        temperature=0,
+        max_tokens=4,
+        ignore_eos=True,
+        detokenize=False,
+        logprobs=5,
+    )
+    with vllm_runner(
+        checkpoint_path,
+        model_impl="transformers",
+        dtype="bfloat16",
+        tensor_parallel_size=tp_size,
+        enforce_eager=enforce_eager,
+        skip_tokenizer_init=True,
+        max_model_len=128,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=2,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        gpu_memory_utilization=0.2,
+    ) as runner:
+        config = runner.llm.llm_engine.model_config
+        assert config.using_transformers_backend()
+        assert config.is_hybrid == has_state
+        assert config.has_inner_state == has_state
+        inputs = [{"prompt_token_ids": prompt} for prompt in prompts]
+        outputs = runner.llm.generate(inputs, params, use_tqdm=False)
+        repeated = runner.llm.generate(inputs[::-1], params, use_tqdm=False)
+
+    reference = AutoModelForCausalLM.from_pretrained(
+        checkpoint_path,
+        dtype=torch.float32,
+        attn_implementation="eager",
+        trust_remote_code=True,
+    ).eval()
+    for prompt, output in zip(prompts * 2, outputs + repeated[::-1]):
+        generated = output.outputs[0]
+        assert len(generated.token_ids) == 4
+        tokens = torch.tensor([prompt + list(generated.token_ids)])
+        with torch.no_grad():
+            logits = reference(tokens, use_cache=False).logits[0].float()
+        expected = logits[len(prompt) - 1 : -1].log_softmax(-1)
+        for step, logprobs in enumerate(generated.logprobs):
+            token_ids = list(logprobs)
+            actual = torch.tensor([logprobs[t].logprob for t in token_ids])
+            torch.testing.assert_close(
+                actual, expected[step, token_ids], atol=0.04, rtol=0
+            )
+    return outputs, repeated
+
+
+def test_state_metadata_uses_each_actual_operator_geometry(tiny_mixed_operator_path):
+    from vllm.model_executor.models.transformers.state import HybridMixin, state_spec
+    from vllm.transformers_utils.hybrid import (
+        get_state_operators,
+        inspect_model_structure,
+    )
+
+    config = AutoConfig.from_pretrained(
+        tiny_mixed_operator_path, trust_remote_code=True
+    )
+    rng = torch.get_rng_state().clone()
+    structure = inspect_model_structure(config, True)
+    assert inspect_model_structure(config, True) is structure
+    assert torch.equal(torch.get_rng_state(), rng)
+    operators = get_state_operators(config, True)
+    assert [operator.path for operator in operators] == [
+        "layers.0.mixer",
+        "layers.2.mixer",
+        "layers.4.mixer",
+    ]
+    fake_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16, hf_config=config, trust_remote_code=True
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        cache_config=SimpleNamespace(
+            mamba_cache_dtype="auto", mamba_ssm_cache_dtype="auto"
+        ),
+        num_speculative_tokens=0,
+    )
+    specs = [state_spec(operator, fake_config) for operator in operators]
+    assert len({spec.shapes for spec in specs}) == 3
+    assert HybridMixin.get_mamba_specs_from_config(fake_config) == tuple(specs)
+
+
+def test_state_prefill_kernels_do_not_share_incompatible_metadata(
+    tiny_qwen3_5_path, monkeypatch
+):
+    from vllm.model_executor.models.transformers.state import state_attention_backend
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    triton = state_attention_backend("triton")
+    flashinfer = state_attention_backend("flashinfer")
+    assert triton is state_attention_backend("triton")
+    assert triton is not flashinfer
+    assert triton.get_builder_cls() is not flashinfer.get_builder_cls()
+    config = VllmConfig(
+        model_config=ModelConfig(
+            model=str(tiny_qwen3_5_path),
+            model_impl="transformers",
+            dtype="bfloat16",
+            skip_tokenizer_init=True,
+        ),
+        additional_config={"gdn_prefill_backend": "auto", "keep_option": True},
+    )
+    text_config = config.model_config.hf_text_config
+    original_dims = (
+        text_config.linear_key_head_dim,
+        text_config.linear_value_head_dim,
+    )
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((256, 3), (2, 64, 32)),
+        dtypes=(torch.bfloat16, torch.float32),
+    )
+
+    def resolve_backend(local_config):
+        local_text = local_config.model_config.hf_text_config
+        assert (local_text.linear_key_head_dim, local_text.linear_value_head_dim) == (
+            32,
+            64,
+        )
+        assert local_config.additional_config["keep_option"]
+        backend = local_config.additional_config["gdn_prefill_backend"]
+        return backend, backend
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
+        "_resolve_gdn_prefill_backend",
+        resolve_backend,
+    )
+    for backend, expected in ((triton, "triton"), (flashinfer, "flashinfer")):
+        builder = backend.get_builder_cls()(
+            spec, ["state"], config, torch.device("cpu")
+        )
+        assert builder.gdn_prefill_backend == expected
+        assert builder.vllm_config is not config
+        assert builder.vllm_config.model_config is not config.model_config
+        assert builder.vllm_config.model_config.hf_text_config is not text_config
+    assert config.additional_config == {
+        "gdn_prefill_backend": "auto",
+        "keep_option": True,
+    }
+    assert (text_config.linear_key_head_dim, text_config.linear_value_head_dim) == (
+        original_dims
+    )
+
+
+@pytest.mark.parametrize("failure", ["unknown", "unknown-conv", "activation", "shared"])
+def test_unadapted_state_semantics_fail_explicitly(failure):
+    from transformers import JambaConfig
+
+    from vllm.transformers_utils.hybrid import describe_state_operators
+
+    if failure == "unknown":
+        with torch.device("meta"):
+            model = AutoModel.from_config(JambaConfig(num_hidden_layers=2))
+        match = "layers.0.mamba.*JambaMambaMixer.*no vLLM state adapter"
+    elif failure == "unknown-conv":
+        from transformers import Lfm2Config
+
+        with torch.device("meta"):
+            model = AutoModel.from_config(
+                Lfm2Config(num_hidden_layers=2, layer_types=["conv", "full_attention"])
+            )
+        match = "layers.0.*Lfm2ShortConv.*no vLLM state adapter"
+    else:
+        from transformers import Qwen3_5TextConfig
+
+        with torch.device("meta"):
+            model = AutoModel.from_config(Qwen3_5TextConfig(num_hidden_layers=2))
+        if failure == "activation":
+            model.layers[0].linear_attn.activation = "relu"
+            match = "layers.0.linear_attn.*unsupported convolution activation"
+        else:
+            model.layers[1].linear_attn = model.layers[0].linear_attn
+            match = "layers.1.linear_attn.*shares weights"
+    with pytest.raises(ValueError, match=match):
+        describe_state_operators(model)
+
+
 def get_sinks(model) -> dict[int, torch.Tensor]:
     """The sink tensor each attention layer was handed, keyed by layer index."""
     sinks = {}
@@ -712,6 +1131,7 @@ def test_attention_dispatch_is_required(monkeypatch: pytest.MonkeyPatch):
         lambda *_: (0, 1),
     )
     model = SimpleNamespace(
+        model=nn.Identity(),
         text_config=SimpleNamespace(num_hidden_layers=1),
         pp_group=SimpleNamespace(rank_in_group=0, world_size=1),
         attention_fusers={},
