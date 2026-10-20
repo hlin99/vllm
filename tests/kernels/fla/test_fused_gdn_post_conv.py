@@ -16,10 +16,50 @@ from vllm.third_party.flash_linear_attention.ops import (
 )
 from vllm.third_party.flash_linear_attention.ops.fused_gdn_prefill_post_conv import (
     fused_post_conv_prep,
+    fused_qkv_l2norm,
 )
+from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
     rmsnorm_fn,
 )
+
+
+@pytest.mark.parametrize(
+    "heads,value_heads,key_dim,value_dim",
+    [
+        (4, 8, 64, 128),
+        (4, 4, 128, 64),
+        (3, 6, 7, 9),
+    ],
+)
+@pytest.mark.parametrize("tokens", [1, 17, 257])
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("expand_query_heads", [False, True])
+def test_strided_qkv_preparation_preserves_normalization_and_values(
+    heads, value_heads, key_dim, value_dim, tokens, offset, dtype, expand_query_heads
+):
+    """Packing keeps the primitive's epsilon, even for small/zero strided vectors."""
+    torch.manual_seed(0)
+    sizes = [heads * key_dim] * 2 + [value_heads * value_dim]
+    storage = torch.randn(1, tokens, sum(sizes) + 3, device="cuda", dtype=dtype)
+    q, k, v = storage[..., offset : offset + sum(sizes)].split(sizes, dim=-1)
+    q = q.view(1, tokens, heads, key_dim)
+    k = k.view(1, tokens, heads, key_dim)
+    v = v.view(1, tokens, value_heads, value_dim)
+    q[0, 0, 0] = 1e-7
+    k[0, 0, 0] = 0
+    if expand_query_heads:
+        q = q.repeat_interleave(value_heads // heads, dim=2)
+        k = k.repeat_interleave(value_heads // heads, dim=2)
+    expected_q = l2norm_fwd(q.contiguous())
+    expected_k = l2norm_fwd(k.contiguous())
+    actual_q, actual_k, actual_v = fused_qkv_l2norm(q, k, v)
+    tolerance = 1e-3 if dtype == torch.bfloat16 else 1e-6
+    torch.testing.assert_close(actual_q, expected_q, atol=tolerance, rtol=tolerance)
+    torch.testing.assert_close(actual_k, expected_k, atol=tolerance, rtol=tolerance)
+    torch.testing.assert_close(actual_v, v, atol=0, rtol=0)
+    assert all(x.is_contiguous() for x in (actual_q, actual_k, actual_v))
 
 
 def reference_post_conv(

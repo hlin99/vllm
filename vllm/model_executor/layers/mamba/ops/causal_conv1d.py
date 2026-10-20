@@ -380,6 +380,15 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+def _validate_conv_output(x: torch.Tensor, out: torch.Tensor) -> None:
+    if out.shape != x.shape:
+        raise ValueError(
+            f"`out` shape {tuple(out.shape)} must match `x` shape {tuple(x.shape)}."
+        )
+    if out.dtype != x.dtype or out.device != x.device:
+        raise ValueError("`out` must have the same dtype and device as the input `x`.")
+
+
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -393,6 +402,7 @@ def causal_conv1d_fn(
     null_block_id: int = NULL_BLOCK_ID,
     metadata=None,
     validate_data=False,
+    out: torch.Tensor | None = None,
 ):
     """Support varlen + continuous batching when x is 2D tensor.
 
@@ -433,16 +443,20 @@ def causal_conv1d_fn(
         for example: cache_indices = [pad_slot_id, 1, 20, pad_slot_id]
         in this case, the kernel will not process entries at
         indices 0 and 3
-    out: same shape as `x`
+    out: optional output buffer matching `x`'s shape, dtype and device;
+        must not overlap `x`.
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
     args = None
+    if out is not None:
+        _validate_conv_output(x, out)
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
-    out = torch.empty_like(x)
+    if out is None:
+        out = torch.empty_like(x)
     if metadata is not None:
         nums_dict = metadata.nums_dict
         args = nums_dict
@@ -1008,19 +1022,12 @@ def causal_conv1d_update(
     elif activation is not None:
         assert activation in ["silu", "swish"]
 
+    if out is not None:
+        _validate_conv_output(x, out)
     original_x_dtype = x.dtype
     x = x.to(conv_state.dtype)
     if out is None:
         out = x
-    else:
-        if out.shape != x.shape:
-            raise ValueError(
-                f"`out` shape {tuple(out.shape)} must match `x` shape {tuple(x.shape)}."
-            )
-        if out.dtype != original_x_dtype or out.device != x.device:
-            raise ValueError(
-                "`out` must have the same dtype and device as the input `x`."
-            )
     unsqueeze = query_start_loc is None and x.dim() == 2
     if unsqueeze:
         # make it (batch, dim, seqlen) with seqlen == 1

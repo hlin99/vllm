@@ -19,6 +19,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("strided_mixed_qkv", [False, True])
+@pytest.mark.parametrize("use_output_buffer", [False, True])
 @pytest.mark.parametrize(
     "batch,num_key_heads,num_value_heads,dtype,state_dtype",
     [
@@ -37,6 +38,7 @@ def test_fused_recurrent_packed_decode_matches_reference(
     num_key_heads: int,
     num_value_heads: int,
     state_dtype: torch.dtype,
+    use_output_buffer: bool,
 ):
     generator = torch.Generator(device=DEVICE).manual_seed(0)
 
@@ -98,6 +100,7 @@ def test_fused_recurrent_packed_decode_matches_reference(
     g = (-torch.exp(A_log.float()) * softplus_x).unsqueeze(1)
     beta = torch.sigmoid(b.float()).unsqueeze(1)
 
+    output_buffer = torch.empty_like(v) if use_output_buffer else None
     out_ref, state_ref = fused_recurrent_gated_delta_rule(
         q=q,
         k=k,
@@ -110,7 +113,10 @@ def test_fused_recurrent_packed_decode_matches_reference(
         cu_seqlens=None,
         ssm_state_indices=ssm_state_indices,
         use_qk_l2norm_in_kernel=True,
+        out=output_buffer,
     )
+    if output_buffer is not None:
+        assert out_ref.data_ptr() == output_buffer.data_ptr()
 
     # Packed path: fused gating + recurrent directly from packed mixed_qkv.
     fused_recurrent_gated_delta_rule_packed_decode(

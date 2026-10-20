@@ -189,6 +189,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -199,7 +200,19 @@ def fused_recurrent_gated_delta_rule_fwd(
     num_stages = 3
     num_warps = 1
 
-    o = q.new_empty(NK, *v.shape)
+    if out is None:
+        o = q.new_empty(NK, *v.shape)
+    else:
+        if (
+            out.shape != v.shape
+            or out.dtype != q.dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "`out` must be contiguous with v's shape and q's dtype and device."
+            )
+        o = out.unsqueeze(0)
     if inplace_final_state:
         final_state = initial_state
     else:
@@ -513,6 +526,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         ssm_state_indices: torch.Tensor | None = None,
         num_accepted_tokens: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
+        out: torch.Tensor | None = None,
     ):
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
             q=q.contiguous(),
@@ -527,6 +541,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
             ssm_state_indices=ssm_state_indices,
             num_accepted_tokens=num_accepted_tokens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            out=out,
         )
 
         return o, final_state
@@ -545,6 +560,7 @@ def fused_recurrent_gated_delta_rule(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -576,6 +592,8 @@ def fused_recurrent_gated_delta_rule(
             Indices to map the input sequences to the initial/final states.
         num_accepted_tokens (Optional[torch.Tensor]):
             Number of accepted tokens for each sequence during decoding.
+        out (Optional[torch.Tensor]):
+            Contiguous inference output buffer with v's shape and q's dtype/device.
 
     Returns:
         o (torch.Tensor):
@@ -634,5 +652,6 @@ def fused_recurrent_gated_delta_rule(
         ssm_state_indices,
         num_accepted_tokens,
         use_qk_l2norm_in_kernel,
+        out,
     )
     return o, final_state

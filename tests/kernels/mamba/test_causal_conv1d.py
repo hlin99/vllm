@@ -250,9 +250,20 @@ def test_causal_conv1d_update_with_batch_gather(
 @pytest.mark.parametrize("dim", [64, 4096])
 @pytest.mark.parametrize("with_padding", [True, False])
 @pytest.mark.parametrize("batch", [4, 10])
+@pytest.mark.parametrize("use_output_buffer", [False, True])
 def test_causal_conv1d_varlen(
-    batch, with_padding, dim, seqlen, width, has_bias, silu_activation, itype
+    batch,
+    with_padding,
+    dim,
+    seqlen,
+    width,
+    has_bias,
+    silu_activation,
+    itype,
+    use_output_buffer,
 ):
+    if use_output_buffer and current_platform.is_cpu():
+        pytest.skip("Preallocated causal convolution outputs require Triton.")
     device = DEVICE
     if not current_platform.is_cpu():
         torch.accelerator.empty_cache()
@@ -315,6 +326,12 @@ def test_causal_conv1d_varlen(
         ],
         dim=-1,
     )
+    output_kwargs = {}
+    if use_output_buffer:
+        output_buffer = torch.empty(seqlen, dim + 16, device=device, dtype=itype).T[
+            :dim
+        ]
+        output_kwargs["out"] = output_buffer
     out = causal_conv1d_fn(
         x.squeeze(0),
         weight,
@@ -324,7 +341,11 @@ def test_causal_conv1d_varlen(
         cache_indices=padded_state_indices,
         has_initial_state=has_initial_states,
         activation=activation,
+        **output_kwargs,
     )
+    if use_output_buffer:
+        assert out.data_ptr() == output_buffer.data_ptr()
+        torch.testing.assert_close(x, x_ref)
 
     out_ref = []
     out_ref_b = []

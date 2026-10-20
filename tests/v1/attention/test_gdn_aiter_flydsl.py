@@ -35,7 +35,9 @@ def _make_config(
     )
 
 
-def _resolve_on_rocm(config, *, kernels_available: bool = True, mi3xx: bool = True):
+def _resolve_on_rocm(
+    config, *, kernels_available: bool = True, mi3xx: bool = True, layer_config=None
+):
     with (
         patch.object(
             qwen_gdn_linear_attn.current_platform, "is_rocm", return_value=True
@@ -47,7 +49,24 @@ def _resolve_on_rocm(config, *, kernels_available: bool = True, mi3xx: bool = Tr
         ),
         patch("vllm.platforms.rocm.on_mi3xx", return_value=mi3xx),
     ):
-        return _resolve_gdn_prefill_backend(config)
+        return _resolve_gdn_prefill_backend(config, layer_config)
+
+
+@pytest.mark.parametrize(
+    "model_dim,operator_dim,expected", [(128, 64, "triton"), (64, 128, "aiter_flydsl")]
+)
+def test_prefill_backend_uses_actual_operator_geometry(
+    model_dim, operator_dim, expected
+):
+    """Choose kernels from this operator, not the model-wide geometry."""
+    config = _make_config(head_k_dim=model_dim, head_v_dim=model_dim)
+    layer_config = SimpleNamespace(
+        linear_key_head_dim=operator_dim, linear_value_head_dim=operator_dim
+    )
+    assert _resolve_on_rocm(config, layer_config=layer_config) == (
+        "aiter_flydsl",
+        expected,
+    )
 
 
 @pytest.mark.parametrize(

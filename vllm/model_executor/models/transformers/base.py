@@ -49,6 +49,8 @@ from vllm.model_executor.layers.attention import (
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import MoERunner
+from vllm.model_executor.layers.linear import QKVParallelLinear
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.models.interfaces import (
     SupportsEagle,
     SupportsEagle3,
@@ -147,10 +149,8 @@ class Base(
         self.fusers: dict[str, list[BaseFuser]] = {}
         """Module qualname -> the fusers applied to it, populated
         by `recursive_replace` for `_create_attention_instances`."""
-        self.attention_fusers: dict[int, tuple[str, AttentionFuser]] = {}
-        """`layer_idx` -> the qualname and fuser of the module computing that
-        layer's attention, populated by `recursive_replace` for
-        `_create_attention_instances`."""
+        self.attention_fusers: dict[int | str, tuple[str, AttentionFuser]] = {}
+        """Execution-site identity -> attention module qualname and fuser."""
 
         # Attrs for Eagle3 (see self.set_aux_hidden_state_layers)
         self._target_class: type[nn.Module] = nn.Module
@@ -231,10 +231,6 @@ class Base(
     def _find_encoder_classes(
         self, model: "PreTrainedModel"
     ) -> dict[str, type["PreTrainedModel"]]:
-        """Find the encoder class of each modality `model` has one for.
-
-        Text models have none. Multi-modal ones override this.
-        """
         return {}
 
     @cached_property
@@ -243,13 +239,12 @@ class Base(
 
         Both come from a single throwaway model, since building one is not cheap.
         """
-        with torch.device("meta"):
-            model: PreTrainedModel = AutoModel.from_config(**self._from_config_kwargs)
-        model_classes = PreTrainedModelClasses(
-            decoder=type(model.get_decoder()),
-            encoders=self._find_encoder_classes(model),
+        from vllm.transformers_utils.hybrid import inspect_model_structure
+
+        structure = inspect_model_structure(
+            self.config, self.model_config.trust_remote_code
         )
-        del model
+        model_classes = PreTrainedModelClasses(structure.decoder, structure.encoders)
 
         logger.debug("Identified model classes as: %s", model_classes)
         return model_classes
@@ -509,17 +504,15 @@ class Base(
             """Register a fused layer's mappings just before it is built."""
             self.fusers.setdefault(prefix, []).append(fuser)
 
-            if (
-                isinstance(fuser, AttentionFuser)
-                and (index := fuser.layer_index(module)) is not None
-            ):
-                if index in self.attention_fusers:
-                    other, _ = self.attention_fusers[index]
-                    raise ValueError(
-                        f"Layer {index} dispatches attention from more than one "
-                        f"module ({other} and {prefix}), which one vLLM attention "
-                        "layer cannot serve."
-                    )
+            if isinstance(fuser, AttentionFuser):
+                declared_index = fuser.layer_index(module)
+                index: int | str = (
+                    declared_index
+                    if declared_index is not None
+                    and declared_index >= 0
+                    and declared_index not in self.attention_fusers
+                    else prefix
+                )
                 self.attention_fusers[index] = (prefix, fuser)
 
             orig_to_new_stacked.update(fuser.orig_to_new_stacked(prefix))
@@ -531,6 +524,8 @@ class Base(
 
         def _recursive_replace(module: nn.Module, prefix: str):
             for child_name, child_module in module.named_children():
+                if isinstance(child_module, MambaBase):
+                    continue
                 new_module = child_module
                 qual_name = maybe_prefix(prefix, child_name)
                 if (
@@ -613,28 +608,75 @@ class Base(
         pp_rank = self.pp_group.rank_in_group
         pp_size = self.pp_group.world_size
         start, end = get_pp_indices(text_config.num_hidden_layers, pp_rank, pp_size)
+        supported = {
+            id(module)
+            for module in self.model.modules()
+            if isinstance(module, MambaBase)
+        }
+        supported.update(
+            id(self.get_submodule(name)) for name, _ in self.attention_fusers.values()
+        )
+        if start < end and not supported:
+            raise ValueError(
+                f"Layer {start} does not dispatch through the Transformers attention "
+                f"interface; decoder {type(self.model).__name__} also has no "
+                "registered vLLM state adapter."
+            )
+        # Validate real decoder blocks, rather than inferring state sites from
+        # path digits or a layer-type string (which does not identify an algorithm).
+        for name, module in self.model.get_decoder().named_modules():
+            if (
+                isinstance(module, nn.ModuleList)
+                and len(module) == text_config.num_hidden_layers
+            ):
+                for i in range(start, end):
+                    block = module[i]
+                    if not any(id(child) in supported for child in block.modules()):
+                        raise ValueError(
+                            f"Unsupported state/attention operator at {name}.{i} "
+                            f"({type(block).__name__}); module types "
+                            f"{[type(child).__name__ for child in block.children()]}. "
+                            "No vLLM state adapter or attention interface was found."
+                        )
 
-        for i in range(start, end):
-            if i not in self.attention_fusers:
-                layer = (
-                    f"{i} ({layer_types[i]})"
-                    if layer_types and i < len(layer_types)
-                    else str(i)
-                )
-                raise ValueError(
-                    f"Layer {layer} does not dispatch through the Transformers "
-                    "attention interface and vLLM has no other way to handle it."
-                )
-            attn_prefix, attn_fuser = self.attention_fusers[i]
+        for identity, (attn_prefix, attn_fuser) in self.attention_fusers.items():
             attn_module = self.get_submodule(attn_prefix)
+            declared_index = attn_fuser.layer_index(attn_module)
+            has_layer_index = (
+                declared_index is not None
+                and 0 <= declared_index < text_config.num_hidden_layers
+            )
 
-            # `[i]` is the whole-model config unless the checkpoint is
-            # heterogeneous, in which case it is this layer's own geometry.
-            arch_config = self.model_config.model_arch_config[i]
+            arch_config = self.model_config.model_arch_config
+            if has_layer_index:
+                assert declared_index is not None
+                arch_config = arch_config[declared_index]
+            qkv = next(
+                (m for m in attn_module.children() if isinstance(m, QKVParallelLinear)),
+                None,
+            )
+            if (
+                not has_layer_index
+                and arch_config.per_layer_overrides is not None
+                and qkv is None
+            ):
+                raise ValueError(
+                    f"Attention {attn_prefix} has no reliable layer index or fused "
+                    "QKV geometry for this heterogeneous configuration."
+                )
             num_heads = self.model_config.get_num_attention_heads(
                 self.parallel_config, arch_config
             )
             head_size = arch_config.head_size
+            num_kv_heads = self.model_config.get_num_kv_heads(
+                self.parallel_config, arch_config
+            )
+            if not has_layer_index and qkv is not None:
+                num_heads, num_kv_heads, head_size = (
+                    qkv.num_heads,
+                    qkv.num_kv_heads,
+                    qkv.head_size,
+                )
             if (scale := attn_fuser.scale(attn_module)) is None:
                 # Default to Llama scale if AttentionFuser couldn't identify it
                 scale = head_size**-0.5
@@ -654,8 +696,9 @@ class Base(
                 )
                 if mla_fuser is None:
                     raise ValueError(
-                        f"Layer {i} ({attn_prefix}) did not fuse as MLA, but the rest "
-                        "of the model did, so its latent KV cache cannot be allocated."
+                        f"Layer {identity} ({attn_prefix}) did not fuse as MLA, "
+                        "but the rest of the model did, so its latent KV cache "
+                        "cannot be allocated."
                     )
                 dims = get_mla_dims(self.model_config)
                 kwargs.update(
@@ -669,15 +712,22 @@ class Base(
             else:
                 kwargs.update(
                     head_size=head_size,
-                    num_kv_heads=self.model_config.get_num_kv_heads(
-                        self.parallel_config, arch_config
-                    ),
+                    num_kv_heads=num_kv_heads,
                     logits_soft_cap=logits_soft_cap,
                 )
 
                 # Handle interleaved sliding window attention
-                if layer_types and layer_types[i] == "sliding_attention":
-                    kwargs["per_layer_sliding_window"] = text_config.sliding_window
+                if hasattr(attn_module, "sliding_window"):
+                    kwargs["per_layer_sliding_window"] = attn_module.sliding_window
+                elif has_layer_index and layer_types:
+                    assert declared_index is not None
+                    if layer_types[declared_index] == "sliding_attention":
+                        kwargs["per_layer_sliding_window"] = text_config.sliding_window
+                elif layer_types and "sliding_attention" in layer_types:
+                    raise ValueError(
+                        f"Attention {attn_prefix} has no per-site sliding window "
+                        "or reliable layer index; cannot infer its mask semantics."
+                    )
                 # Handle attention sinks
                 if (sinks := attn_fuser.sinks(attn_module)) is not None:
                     kwargs["sinks"] = sinks
@@ -784,6 +834,9 @@ class Base(
         if positions.ndim == 1:
             # [seq_len] -> [1, seq_len]
             positions = positions[None, ...]
+        elif positions.ndim == 2 and self.model_config.uses_mrope:
+            # Keep the runner's stable buffer for CUDA graph replay.
+            positions = positions[:, None]
 
         # Transformers models expect either input_ids or inputs_embeds, but not both
         if input_ids is not None and inputs_embeds is not None:

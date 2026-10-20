@@ -1836,6 +1836,18 @@ _TRANSFORMERS_BACKEND_MODELS = {
     ),
     "TransformersMultiModalForCausalLM": _HfExamplesInfo("BAAI/Emu3-Chat-hf"),
     "TransformersMoEForCausalLM": _HfExamplesInfo("allenai/OLMoE-1B-7B-0924"),
+    "TransformersHybridForCausalLM": _HfExamplesInfo(
+        "codecho/Qwen3.5-0.8B-text-only",
+    ),
+    "TransformersHybridMoEForCausalLM": _HfExamplesInfo(
+        "codecho/Qwen3.5-35B-A3B-text-only",
+    ),
+    "TransformersMultiModalHybridForCausalLM": _HfExamplesInfo(
+        "Qwen/Qwen3.8-27B",
+    ),
+    "TransformersMultiModalHybridMoEForCausalLM": _HfExamplesInfo(
+        "Qwen/Qwen3.5-35B-A3B",
+    ),
     "TransformersMultiModalMoEForCausalLM": _HfExamplesInfo(
         "Qwen/Qwen3-VL-30B-A3B-Instruct"
     ),

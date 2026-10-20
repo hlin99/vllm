@@ -3,6 +3,7 @@
 """Fuser for parallel linear projections."""
 
 import ast
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -90,6 +91,10 @@ class MergedColumnParallelFuser(StackedFuser):
 
     def update_forward(self, module: nn.Module) -> None:
         """Replace the parallel calls with one merged call and split."""
+        self.fused_forward = compile_forward(*self.rewrite_forward(module))
+
+    def rewrite_forward(self, module: nn.Module) -> tuple[ast.FunctionDef, Callable]:
+        """Return the projection rewrite for composition with local kernel fusions."""
         funcdef, fn = recover_forward(type(module))
         calls = self._unguarded_calls(funcdef, self.linear_names)
         if len(set(ast.dump(call.args[0]) for call in calls)) != 1:
@@ -108,7 +113,7 @@ class MergedColumnParallelFuser(StackedFuser):
 
         # l1(x), l2(x), ... -> merged(x).split(merged.output_sizes / merged.tp_size, -1)
         self._splice_merged_split(funcdef, calls, block, index)
-        self.fused_forward = compile_forward(funcdef, fn)
+        return funcdef, fn
 
     def validate(self, module: nn.Module, vllm_config: "VllmConfig") -> bool:
         """Check that the parallel linears are compatible for merging."""

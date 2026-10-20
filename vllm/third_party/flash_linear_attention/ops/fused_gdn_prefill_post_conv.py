@@ -13,7 +13,106 @@ from __future__ import annotations
 
 import torch
 
+from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 from vllm.triton_utils import tl, triton
+
+
+@triton.jit(do_not_specialize=["T"])
+def _fused_qkv_l2norm_kernel(
+    Q,
+    K,
+    V,
+    Q_out,
+    K_out,
+    V_out,
+    T,
+    Q_STRIDES: tl.constexpr,
+    K_STRIDES: tl.constexpr,
+    V_STRIDES: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    DK: tl.constexpr,
+    DV: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    rows = tl.program_id(0).to(tl.int64) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    cols = tl.arange(0, BLOCK_D).to(tl.int64)
+    qk_rows = (rows // H)[:, None]
+    qk_heads = (rows % H)[:, None]
+    qk_mask = (rows[:, None] < T * H) & (cols[None, :] < DK)
+    q_offsets = (
+        qk_rows * Q_STRIDES[0]
+        + qk_heads * Q_STRIDES[1]
+        + cols[None, :] * Q_STRIDES[2]
+    )
+    k_offsets = (
+        qk_rows * K_STRIDES[0]
+        + qk_heads * K_STRIDES[1]
+        + cols[None, :] * K_STRIDES[2]
+    )
+    q = tl.load(Q + q_offsets, qk_mask, other=0).to(tl.float32)
+    k = tl.load(K + k_offsets, qk_mask, other=0).to(tl.float32)
+    q *= tl.rsqrt(tl.sum(q * q, axis=1) + 1e-6)[:, None]
+    k *= tl.rsqrt(tl.sum(k * k, axis=1) + 1e-6)[:, None]
+    out_offsets = rows[:, None] * DK + cols[None, :]
+    tl.store(Q_out + out_offsets, q, qk_mask)
+    tl.store(K_out + out_offsets, k, qk_mask)
+
+    v_mask = (rows[:, None] < T * HV) & (cols[None, :] < DV)
+    v_offsets = (
+        (rows // HV)[:, None] * V_STRIDES[0]
+        + (rows % HV)[:, None] * V_STRIDES[1]
+        + cols[None, :] * V_STRIDES[2]
+    )
+    v = tl.load(V + v_offsets, v_mask, other=0)
+    tl.store(V_out + rows[:, None] * DV + cols[None, :], v, v_mask)
+
+
+def fused_qkv_l2norm(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Normalize strided Q/K and pack Q/K/V without computing or changing gates."""
+    if (
+        any(x.ndim != 4 or x.shape[0] != 1 for x in (q, k, v))
+        or q.shape != k.shape
+        or q.shape[1] != v.shape[1]
+        or min(*q.shape[2:], *v.shape[2:]) <= 0
+        or q.device != k.device
+        or q.device != v.device
+    ):
+        raise ValueError("Q/K/V preparation requires compatible packed [1,T,H,D] inputs.")
+    tokens, heads, key_dim = q.shape[1:]
+    value_heads, value_dim = v.shape[2:]
+    # Already-contiguous Q/K do not benefit from fused packing.
+    contiguous_strides = (heads * key_dim, key_dim, 1)
+    if q.stride()[1:] == k.stride()[1:] == contiguous_strides:
+        return l2norm_fwd(q), l2norm_fwd(k), v.contiguous()
+    q_out, k_out, v_out = (
+        torch.empty(x.shape, device=x.device, dtype=x.dtype) for x in (q, k, v)
+    )
+    block_rows = 8
+    grid = (triton.cdiv(tokens * max(heads, value_heads), block_rows),)
+    _fused_qkv_l2norm_kernel[grid](
+        q,
+        k,
+        v,
+        q_out,
+        k_out,
+        v_out,
+        tokens,
+        q.stride()[1:],
+        k.stride()[1:],
+        v.stride()[1:],
+        heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        block_rows,
+        triton.next_power_of_2(max(key_dim, value_dim)),
+        num_warps=4,
+    )
+    return q_out, k_out, v_out
 
 
 @triton.jit
