@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """XPU-only batch-invariance tests for norm, collectives, and sampler behavior."""
 
+import os
+import random
+
 import pytest
 import torch
 
@@ -151,6 +154,95 @@ def test_residual_norm_preserves_batch_invariance(
 
     assert torch.equal(single_output, batch_output[position : position + 1])
     assert torch.equal(single_residual, batch_residual[position : position + 1])
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("strided", [False, True])
+def test_rsqrt_preserves_batch_invariance(dtype: torch.dtype, strided: bool) -> None:
+    """Identical values must not change with vectorized/tail kernel placement."""
+    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+
+    init_batch_invariance()
+    short = torch.full((762, 2), 0.004544191062450409, dtype=dtype, device="xpu")
+    long = torch.full((2048, 2), 0.004544191062450409, dtype=dtype, device="xpu")
+    short = short[:, 0] if strided else short[:, 0].contiguous()
+    long = long[:, 0] if strided else long[:, 0].contiguous()
+
+    torch.testing.assert_close(
+        torch.rsqrt(short), torch.rsqrt(long)[:762], rtol=0, atol=0
+    )
+    torch.testing.assert_close(torch.rsqrt(short), torch.rsqrt(short.cpu()).to("xpu"))
+
+
+def test_rsqrt_preserves_empty_input() -> None:
+    """The invariant override must retain empty tensor shape and dtype."""
+    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+
+    init_batch_invariance()
+    result = torch.rsqrt(torch.empty((0, 3), dtype=torch.float32, device="xpu"))
+    assert result.shape == (0, 3)
+    assert result.dtype == torch.float32
+
+
+def test_rsqrt_preserves_integer_promotion() -> None:
+    """Integer inputs must still produce default-dtype floating-point results."""
+    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+
+    init_batch_invariance()
+    result = torch.rsqrt(torch.tensor([1, 4, 16, 64], device="xpu"))
+    expected = torch.tensor(
+        [1.0, 0.5, 0.25, 0.125], dtype=torch.get_default_dtype(), device="xpu"
+    )
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_dense_prefill_preserves_batch_invariant_logprobs() -> None:
+    """Residual normalization must preserve logits for 762 vs. 2048 prefill rows."""
+    from vllm import LLM, SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    llm = LLM(
+        model=os.getenv("VLLM_TEST_MODEL", "Qwen/Qwen3-1.7B"),
+        dtype="bfloat16",
+        enforce_eager=True,
+        attention_config={"backend": "TRITON_ATTN"},
+        block_size=16,
+        max_model_len=2048,
+        max_num_batched_tokens=2048,
+        max_num_seqs=2,
+        enable_prefix_caching=False,
+        gpu_memory_utilization=float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.85")),
+    )
+    try:
+        tokenizer = llm.get_tokenizer()
+        filler_tokens = tokenizer.encode(
+            "Describe how a computer executes unrelated work.",
+            add_special_tokens=False,
+        )
+        filler = TokensPrompt(prompt_token_ids=(filler_tokens * 1286)[:1286])
+        params = SamplingParams(
+            temperature=0, max_tokens=16, logprobs=5, ignore_eos=True
+        )
+        for seed in range(4):
+            needle = TokensPrompt(
+                prompt_token_ids=random.Random(seed).choices(
+                    range(1000, tokenizer.vocab_size - 100), k=762
+                )
+            )
+            single = llm.generate([needle], params, use_tqdm=False)[0].outputs[0]
+            batched = llm.generate([filler, needle], params, use_tqdm=False)[1].outputs[
+                0
+            ]
+
+            assert single.token_ids == batched.token_ids
+            assert single.logprobs is not None and batched.logprobs is not None
+            for token_id, left, right in zip(
+                single.token_ids, single.logprobs, batched.logprobs, strict=True
+            ):
+                assert left is not None and right is not None
+                assert left[token_id].logprob == right[token_id].logprob
+    finally:
+        llm.llm_engine.engine_core.shutdown()
 
 
 @pytest.mark.parametrize(

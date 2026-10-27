@@ -26,6 +26,8 @@ Batch invariance is supported on the following platforms:
 ### Attention Backend Selection for XPU
 
 On XPU, Triton Attention backend is required for batch invariance.
+Batch-invariant mode also uses a fixed Triton reciprocal square root in residual
+normalization to avoid native XPU vectorized/tail rounding differences.
 Select this backend using Qwen/Qwen3-1.7B model as an example:
 
 ```python

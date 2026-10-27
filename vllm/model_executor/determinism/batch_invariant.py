@@ -986,6 +986,31 @@ def softmax_batch_invariant(input, dim, half_to_float=False):
     return exp_x / sum_exp_x
 
 
+@triton.jit
+def _rsqrt_batch_invariant_kernel(
+    input_ptr, output_ptr, numel, BLOCK_SIZE: tl.constexpr
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    values = tl.load(input_ptr + offsets, mask=offsets < numel, other=1.0)
+    if values.dtype == tl.float16 or values.dtype == tl.bfloat16:
+        values = values.to(tl.float32)
+    tl.store(output_ptr + offsets, tl.rsqrt(values), mask=offsets < numel)
+
+
+def rsqrt_batch_invariant(input: torch.Tensor) -> torch.Tensor:
+    """Compute floating-point reciprocal square root with fixed per-element math."""
+    if not input.is_floating_point() and not input.is_complex():
+        input = input.to(torch.get_default_dtype())
+    input = input.contiguous()
+    output = torch.empty_like(input)
+    numel = input.numel()
+    if numel:
+        _rsqrt_batch_invariant_kernel[(triton.cdiv(numel, 256),)](
+            input, output, numel, BLOCK_SIZE=256
+        )
+    return output
+
+
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
 
@@ -1350,6 +1375,8 @@ def enable_batch_invariant_mode():
         _batch_invariant_LIB.impl("aten::addmm.out", addmm_out_batch_invariant, key)
         _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant, key)
         _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant, key)
+        # Native XPU rsqrt rounds differently in vectorized and tail kernels.
+        _batch_invariant_LIB.impl("aten::rsqrt", rsqrt_batch_invariant, key)
 
         _fp16_block_size_n = 128
 
