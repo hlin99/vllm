@@ -666,9 +666,13 @@ def sparse_attn_indexer(
         # Layout switches between FP8 (head_dim bytes + 4-byte fp32 scale) and
         # MXFP4 (head_dim/2 bytes packed + head_dim/MXFP4_BLOCK_SIZE ue8m0
         # scales) based on use_fp4_cache.
+        # No chunks exist before the first compressed token.
         workspace_manager = current_workspace_manager()
         values_spec, scales_spec = _gather_workspace_shapes(
-            max(c.max_local_total_seq_lens for c in prefill_metadata.chunks),
+            max(
+                (c.max_local_total_seq_lens for c in prefill_metadata.chunks),
+                default=0,
+            ),
             head_dim,
             fp8_dtype,
             use_fp4_cache,
