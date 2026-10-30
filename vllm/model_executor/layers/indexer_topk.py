@@ -48,6 +48,16 @@ def canonicalize_topk_indices(indices: torch.Tensor) -> None:
     indices.copy_(ordered.masked_fill(ordered == sentinel, IDX_OOB_FILL_VALUE))
 
 
+def stable_topk(logits: torch.Tensor, out: torch.Tensor) -> None:
+    """Select by score, breaking cutoff ties by logical position."""
+    count = min(out.shape[1], logits.shape[1])
+    out.fill_(IDX_OOB_FILL_VALUE)
+    if count:
+        indices = torch.argsort(logits, dim=-1, descending=True, stable=True)[:, :count]
+        valid = logits.gather(1, indices) != -float("inf")
+        out[:, :count].copy_(indices.masked_fill(~valid, IDX_OOB_FILL_VALUE))
+
+
 try:
     import vllm._deepselect_C  # noqa: F401  (registers torch.ops.deep_select)
 
