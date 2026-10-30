@@ -27,6 +27,10 @@ from vllm.platforms import current_platform
 @skip_unsupported
 def test_raw_logits_bs1_vs_bsN_chunking_and_prefix_cache():
     """Compare every vocabulary logit across batching, cache hits and chunk sizes."""
+    num_fillers = int(os.getenv("VLLM_TEST_NUM_FILLERS", "15"))
+    max_tokens = int(os.getenv("VLLM_TEST_MAX_TOKENS", "512"))
+    assert num_fillers > 0, "VLLM_TEST_NUM_FILLERS must be positive"
+    assert max_tokens > 0, "VLLM_TEST_MAX_TOKENS must be positive"
     generator = torch.Generator().manual_seed(42)
     needle = TokensPrompt(
         prompt_token_ids=torch.randint(10, 20000, (2177,), generator=generator).tolist()
@@ -34,14 +38,28 @@ def test_raw_logits_bs1_vs_bsN_chunking_and_prefix_cache():
     fillers = [
         TokensPrompt(
             prompt_token_ids=torch.randint(
-                10, 20000, (n,), generator=generator
+                10, 20000, (129 * n,), generator=generator
             ).tolist()
         )
-        for n in (129, 387, 785)
+        for n in range(1, num_fillers + 1)
     ]
-    sampling = SamplingParams(temperature=0, max_tokens=3, ignore_eos=True, logprobs=-1)
+    sampling = SamplingParams(
+        temperature=0,
+        max_tokens=max_tokens,
+        ignore_eos=True,
+        logprobs=-1,
+        detokenize=False,
+    )
+    filler_sampling = SamplingParams(
+        temperature=0, max_tokens=max_tokens, ignore_eos=True, detokenize=False
+    )
     baseline = None
-    for chunk_size, eager in ((256, True), (257, False), (8192, False)):
+    # 2177 = 8 * 272 + 1 forces a single-token prefill tail onto the decode path.
+    for chunk_size, eager in ((256, True), (257, False), (272, True), (8192, False)):
+        print(
+            f"\n[E2E] Loading model: chunk={chunk_size}, eager={eager}",
+            flush=True,
+        )
         with contextlib.ExitStack() as cleanup:
             llm = LLM(
                 TEST_MODEL,
@@ -51,7 +69,7 @@ def test_raw_logits_bs1_vs_bsN_chunking_and_prefix_cache():
                 hf_overrides=json.loads(os.getenv("VLLM_TEST_HF_OVERRIDES", "{}")),
                 max_model_len=8192,
                 max_num_batched_tokens=chunk_size,
-                max_num_seqs=4,
+                max_num_seqs=num_fillers + 1,
                 enforce_eager=eager,
                 gpu_memory_utilization=float(
                     os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.75")
@@ -66,14 +84,22 @@ def test_raw_logits_bs1_vs_bsN_chunking_and_prefix_cache():
                 ("alone", [needle], 0, False),
                 ("prefix-hit", [needle], 0, False),
                 ("batch-first-cold", [needle, *fillers], 0, True),
-                ("batch-last-cold", [*fillers, needle], 3, True),
-                ("mixed-cached", [fillers[0], needle], 1, False),
+                ("batch-last-cold", [*fillers, needle], len(fillers), True),
+                ("mixed-cached", [fillers[0], needle, *fillers[1:]], 1, False),
             ):
+                print(f"[E2E] Running {case}: batch={len(prompts)}", flush=True)
                 if reset:
                     llm.reset_prefix_cache()
-                output = llm.generate(prompts, sampling, use_tqdm=False)[row]
-                result = output.outputs[0]
+                # Only retain full-vocabulary logits for the target request.
+                params = [filler_sampling] * len(prompts)
+                params[row] = sampling
+                outputs = llm.generate(prompts, params, use_tqdm=False)
+                assert all(
+                    len(out.outputs[0].token_ids) == max_tokens for out in outputs
+                )
+                result = outputs[row].outputs[0]
                 assert result.logprobs is not None
+                assert len(result.logprobs) == max_tokens
                 vocab_size = llm.llm_engine.vllm_config.model_config.get_vocab_size()
                 assert all(len(step) == vocab_size for step in result.logprobs)
                 logits = torch.tensor(
@@ -86,6 +112,10 @@ def test_raw_logits_bs1_vs_bsN_chunking_and_prefix_cache():
                 logit_bits = logits.view(torch.int32)
                 if baseline is None:
                     baseline = (result.token_ids, logit_bits)
+                    print(
+                        f"[E2E] Baseline recorded: {logits.numel()} logits",
+                        flush=True,
+                    )
                 else:
                     assert result.token_ids == baseline[0]
                     assert torch.equal(logit_bits, baseline[1]), (
@@ -94,6 +124,8 @@ def test_raw_logits_bs1_vs_bsN_chunking_and_prefix_cache():
                         f"row={row}, reset_cache={reset}, "
                         f"different_logits={(logit_bits != baseline[1]).sum().item()}"
                     )
+                    print(f"[E2E] PASS {case}: identical logit bits", flush=True)
+                del outputs, result, logits, logit_bits
 
 
 @skip_unsupported

@@ -165,19 +165,31 @@ default path and are not intended to reproduce its batch-dependent logits.
 
 Validation on a six-layer DeepSeek-V4-Flash checkpoint compares every vocabulary
 logit across singleton and mixed batches, request order, prefix-cache hits, and
-256-, 257-, and 8192-token prefill budgets, with eager execution and CUDA graphs.
+256-, 257-, 272-, and 8192-token prefill budgets, with eager execution and CUDA
+graphs. The 272-token budget forces a single-token prefill tail to exercise the
+transition to paged indexer scoring.
 This is not a model-quality evaluation of the full checkpoint.
 
 Run the six-layer regression with one command after installing the development
 environment and test dependencies:
 
 ```bash
-sh tests/v1/determinism/run_dsv4_e2e.sh /path/to/DeepSeek-V4-Flash-6layers
+sh tests/v1/determinism/run_dsv4_e2e_light.sh /path/to/DeepSeek-V4-Flash-6layers
+sh tests/v1/determinism/run_dsv4_e2e_heavy.sh /path/to/DeepSeek-V4-Flash-6layers
 ```
 
-The script defaults to `../DeepSeek-V4-Flash-6layers` relative to the repository.
-It runs the readable test cases in `test_batch_invariance.py`, compares all
-logit bits (including signed zero), and exits nonzero on a mismatch.
+| Runner | Filler requests | Generated tokens per request |
+| ------ | --------------- | ---------------------------- |
+| Light | 3 | 3 |
+| Heavy | 15 | 512 |
+
+Both runners use the same five scenarios and four execution configurations.
+They default to `../DeepSeek-V4-Flash-6layers` relative to the repository and
+stream model startup logs and per-case progress to the terminal.
+Only the target's full-vocabulary logits are retained for comparison.
+The readable test cases in `test_batch_invariance.py` compare all
+logit bits (including signed zero). Both runners exit nonzero on a mismatch.
+The shared `run_dsv4_e2e.sh` entrypoint is retained and defaults to heavy.
 
 The underlying regression uses the existing `VLLM_TEST_MODEL` override.
 `VLLM_TEST_HF_OVERRIDES` optionally supplies a JSON object for partial checkpoints:
