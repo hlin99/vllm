@@ -761,7 +761,17 @@ def init_fp8_linear_kernel(
     )
 
     if activation_quant_key.scale.group_shape.is_per_group():
-        if envs.VLLM_BATCH_INVARIANT and current_platform.is_rocm():
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        is_dsv4 = (
+            vllm_config is not None
+            and vllm_config.model_config is not None
+            and vllm_config.model_config.hf_text_config.model_type == "deepseek_v4"
+        )
+        if envs.VLLM_BATCH_INVARIANT and (
+            current_platform.is_rocm() or (current_platform.is_cuda() and is_dsv4)
+        ):
             force_kernel = _batch_invariant_fp8_kernel(
                 TritonFp8BlockScaledMMKernel,
                 scaled_mm_linear_kernel_config,

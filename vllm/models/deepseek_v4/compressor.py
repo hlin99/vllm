@@ -7,6 +7,7 @@ from typing import Any, ClassVar, cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -76,6 +77,12 @@ class CompressorBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["CompressorMetadataBuilder"]:
         return CompressorMetadataBuilder
+
+
+class BatchInvariantCompressorBackend(CompressorBackend):
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        return True
 
 
 @dataclass
@@ -149,7 +156,13 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         self.dtype = dtype
         self.prefix = prefix
         self.kv_cache = torch.tensor([])
-        compilation_config = get_current_vllm_config().compilation_config
+        config = get_current_vllm_config()
+        self.batch_invariant = (
+            envs.VLLM_BATCH_INVARIANT
+            and config.model_config.hf_text_config.model_type == "deepseek_v4"
+            and current_platform.is_device_capability_family(120)
+        )
+        compilation_config = config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
@@ -194,6 +207,8 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
+        if self.batch_invariant:
+            return BatchInvariantCompressorBackend
         return CompressorBackend
 
 
@@ -318,7 +333,11 @@ class DeepseekCompressor(nn.Module):
                 head_dim=self.head_dim,
                 compress_ratio=self.compress_ratio,
             )
-            if current_platform.is_cuda() and self.head_dim == 512:
+            if (
+                current_platform.is_cuda()
+                and self.head_dim == 512
+                and not self.state_cache.batch_invariant
+            ):
                 from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (  # noqa: E501
                     _SPARSE_ATTN_COMPRESS_C128_BLOCK8_KERNEL,
                     _SPARSE_ATTN_COMPRESS_NORM_ROPE_STORE_C4_KERNEL,
@@ -469,7 +488,11 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if (
+            current_platform.is_cuda()
+            and self.head_dim == 512
+            and not self.state_cache.batch_invariant
+        ):
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 _SPARSE_ATTN_COMPRESSOR_CUTEDSL_KERNEL,
             )

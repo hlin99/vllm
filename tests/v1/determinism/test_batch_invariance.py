@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import json
 import os
 import random
 
@@ -21,6 +22,78 @@ import vllm.envs as envs
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
 from vllm.platforms import current_platform
+
+
+@skip_unsupported
+def test_raw_logits_bs1_vs_bsN_chunking_and_prefix_cache():
+    """Compare every vocabulary logit across batching, cache hits and chunk sizes."""
+    generator = torch.Generator().manual_seed(42)
+    needle = TokensPrompt(
+        prompt_token_ids=torch.randint(10, 20000, (2177,), generator=generator).tolist()
+    )
+    fillers = [
+        TokensPrompt(
+            prompt_token_ids=torch.randint(
+                10, 20000, (n,), generator=generator
+            ).tolist()
+        )
+        for n in (129, 387, 785)
+    ]
+    sampling = SamplingParams(temperature=0, max_tokens=3, ignore_eos=True, logprobs=-1)
+    baseline = None
+    for chunk_size, eager in ((256, True), (257, False), (8192, False)):
+        with contextlib.ExitStack() as cleanup:
+            llm = LLM(
+                TEST_MODEL,
+                tensor_parallel_size=int(os.getenv("VLLM_TEST_TP_SIZE", "1")),
+                disable_custom_all_reduce=os.getenv("VLLM_TEST_DISABLE_CUSTOM_AR")
+                == "1",
+                hf_overrides=json.loads(os.getenv("VLLM_TEST_HF_OVERRIDES", "{}")),
+                max_model_len=8192,
+                max_num_batched_tokens=chunk_size,
+                max_num_seqs=4,
+                enforce_eager=eager,
+                gpu_memory_utilization=float(
+                    os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.75")
+                ),
+                max_logprobs=-1,
+                logprobs_mode="raw_logits",
+                enable_prefix_caching=True,
+                enable_chunked_prefill=True,
+            )
+            cleanup.callback(llm.llm_engine.engine_core.shutdown)
+            for case, prompts, row, reset in (
+                ("alone", [needle], 0, False),
+                ("prefix-hit", [needle], 0, False),
+                ("batch-first-cold", [needle, *fillers], 0, True),
+                ("batch-last-cold", [*fillers, needle], 3, True),
+                ("mixed-cached", [fillers[0], needle], 1, False),
+            ):
+                if reset:
+                    llm.reset_prefix_cache()
+                output = llm.generate(prompts, sampling, use_tqdm=False)[row]
+                result = output.outputs[0]
+                assert result.logprobs is not None
+                vocab_size = llm.llm_engine.vllm_config.model_config.get_vocab_size()
+                assert all(len(step) == vocab_size for step in result.logprobs)
+                logits = torch.tensor(
+                    [
+                        [step[token].logprob for token in range(vocab_size)]
+                        for step in result.logprobs
+                    ]
+                )
+                assert torch.isfinite(logits).all()
+                logit_bits = logits.view(torch.int32)
+                if baseline is None:
+                    baseline = (result.token_ids, logit_bits)
+                else:
+                    assert result.token_ids == baseline[0]
+                    assert torch.equal(logit_bits, baseline[1]), (
+                        f"case={case}, chunk={chunk_size}, eager={eager}, "
+                        f"batch={len(prompts)}, "
+                        f"row={row}, reset_cache={reset}, "
+                        f"different_logits={(logit_bits != baseline[1]).sum().item()}"
+                    )
 
 
 @skip_unsupported

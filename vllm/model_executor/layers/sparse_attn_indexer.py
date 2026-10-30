@@ -37,6 +37,7 @@ from vllm.model_executor.layers.indexer_topk import (
     deep_select_topk,
     get_indexer_topk,
     is_deep_select_supported,
+    stable_topk,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
@@ -585,6 +586,21 @@ def sparse_attn_indexer(
     else:
         assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
 
+    if envs.VLLM_BATCH_INVARIANT:
+        if (
+            use_fp4_cache
+            or use_pcp
+            or dcp_world_size != 1
+            or candidate_blocks is not None
+        ):
+            raise NotImplementedError(
+                "Batch-invariant sparse indexing requires FP8 cache without "
+                "context parallelism or candidate filtering."
+            )
+        from vllm.model_executor.kernels.attention.dsa.batch_invariant import (
+            indexer_logits,
+        )
+
     # During speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens. Truncate k to avoid
     # out-of-bounds reads in the kernel.
@@ -750,7 +766,18 @@ def sparse_attn_indexer(
                     k_scale_cast = k_scale.view(
                         torch.int32 if mqa_logits_use_mx_scales() else torch.float32
                     ).squeeze(-1)
-                if current_platform.is_xpu():
+                if envs.VLLM_BATCH_INVARIANT:
+                    row_ends = cu_seqlen_ke - cu_seqlen_ks
+                    logits = indexer_logits(
+                        q_slice,
+                        k_quant,
+                        weights[row_start:row_end],
+                        cu_seqlen_ke,
+                        chunk.max_seqlen_k,
+                        scales=k_scale.view(torch.float32).squeeze(-1),
+                        starts=cu_seqlen_ks,
+                    )
+                elif current_platform.is_xpu():
                     if q_scale_slice is not None:
                         raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
                     logits = torch.ops.vllm.xpu_fp8_mqa_logits(
@@ -811,7 +838,9 @@ def sparse_attn_indexer(
                             chunk_candidates,
                             candidate_block_size,
                         )
-                if use_deep_select:
+                if envs.VLLM_BATCH_INVARIANT:
+                    stable_topk(logits, topk_indices)
+                elif use_deep_select:
                     deep_select_topk(
                         logits, topk_tokens, end=row_ends, output_idx=topk_indices
                     )
@@ -918,7 +947,20 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if current_platform.is_xpu():
+        if envs.VLLM_BATCH_INVARIANT:
+            if next_n != 1:
+                raise NotImplementedError(
+                    "Batch-invariant sparse indexing requires single-token decode."
+                )
+            logits = indexer_logits(
+                padded_q_quant_cast[:, 0],
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens.reshape(-1),
+                max_model_len,
+                block_table=decode_metadata.block_table,
+            )
+        elif current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
@@ -984,14 +1026,17 @@ def sparse_attn_indexer(
 
         # The backend comes from the layer (config is only readable at model
         # construction); dispatchers are cached per backend.
-        get_indexer_topk(topk_backend)(
-            logits,
-            seq_lens,
-            next_n,
-            topk_indices,
-            topk_tokens,
-            attn_metadata_narrowed.max_seq_len,
-        )
+        if envs.VLLM_BATCH_INVARIANT:
+            stable_topk(logits, topk_indices)
+        else:
+            get_indexer_topk(topk_backend)(
+                logits,
+                seq_lens,
+                next_n,
+                topk_indices,
+                topk_tokens,
+                attn_metadata_narrowed.max_seq_len,
+            )
 
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(

@@ -149,6 +149,48 @@ Other models may also work, but these have been explicitly validated. If you enc
 
 ## Implementation Details
 
+### DeepSeek V4 on SM120
+
+The single-GPU DeepSeek V4 FP8 path uses fixed-reduction Triton sparse attention
+for both prefill and decode, FP8 indexer scoring with stable cutoff tie-breaking,
+and fixed-reduction mHC projections. It also uses the existing Triton compressor
+and batch-invariant linear kernels. MXFP4 experts use the batch-invariant Humming
+backend; their weights remain quantized.
+
+This path requires `fp8_ds_mla` KV cache (the default), FP8 indexer cache, TP=DP=1,
+and no context parallelism or speculative decoding. It is selected automatically
+with `VLLM_BATCH_INVARIANT=1` on SM120. Other DeepSeek V4 configurations are not
+covered. The reference-oriented kernels can be substantially slower than the
+default path and are not intended to reproduce its batch-dependent logits.
+
+Validation on a six-layer DeepSeek-V4-Flash checkpoint compares every vocabulary
+logit across singleton and mixed batches, request order, prefix-cache hits, and
+256-, 257-, and 8192-token prefill budgets, with eager execution and CUDA graphs.
+This is not a model-quality evaluation of the full checkpoint.
+
+Run the six-layer regression with one command after installing the development
+environment and test dependencies:
+
+```bash
+sh tests/v1/determinism/run_dsv4_e2e.sh /path/to/DeepSeek-V4-Flash-6layers
+```
+
+The script defaults to `../DeepSeek-V4-Flash-6layers` relative to the repository.
+It runs the readable test cases in `test_batch_invariance.py`, compares all
+logit bits (including signed zero), and exits nonzero on a mismatch.
+
+The underlying regression uses the existing `VLLM_TEST_MODEL` override.
+`VLLM_TEST_HF_OVERRIDES` optionally supplies a JSON object for partial checkpoints:
+
+```bash
+VLLM_TEST_MODEL=/path/to/DeepSeek-V4-Flash-6layers \
+VLLM_TEST_HF_OVERRIDES='{"num_hidden_layers":6,"num_nextn_predict_layers":0,"compress_ratios":[0,0,4,128,4,128]}' \
+.venv/bin/python -m pytest tests/v1/determinism/test_batch_invariance.py \
+    -k test_raw_logits_bs1_vs_bsN_chunking_and_prefix_cache
+```
+
+### Shared implementation
+
 When batch invariance is enabled, vLLM:
 
 1. Uses deterministic kernel implementations for attention and other operations
@@ -158,7 +200,7 @@ When batch invariance is enabled, vLLM:
 5. On CUDA devices with tuned matmul table entries for the model's bf16 unquantized forward linear layers (Ada, Hopper, Blackwell),
    runs without `torch.compile` using breakable CUDA graphs so tile configs follow the runtime batch size; set `VLLM_USE_BREAKABLE_CUDAGRAPH=0` to opt out.
 6. Splits the LoRA shrink reduction into 8 fixed K chunks that are summed in a fixed order instead of with atomics
-7. Sorts the shared sparse attention indexer's selected logical KV indices before attention, keeping invalid entries at the end. This removes reduction-order differences when the selected set is identical; it does not resolve selection ties at the top-k cutoff.
+7. Sorts the shared sparse attention indexer's selected logical KV indices before attention, keeping invalid entries at the end. Sorting alone does not resolve selection ties at the top-k cutoff; the DeepSeek V4 path additionally uses stable selection to break ties by logical position.
 
 !!! warning
     Batch invariance under tensor parallelism is not yet supported for all-reduces whose size isn't a multiple of 16 bytes, for example a hidden size that isn't a multiple of 8 in fp16/bf16. Such tensors can switch between NCCL and custom all-reduce depending on batch size. All validated models meet this requirement.

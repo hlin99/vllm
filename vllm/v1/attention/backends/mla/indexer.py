@@ -333,6 +333,13 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
 
 class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
     @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        return (
+            cls is DeepseekV4IndexerBackend
+            and current_platform.is_device_capability_family(120)
+        )
+
+    @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         # ROCm runs adaptive verification through the per-token flattened
         # indexer path, which derives row ownership from device decode lengths.

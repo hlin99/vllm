@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -116,6 +117,12 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
         "fp8_ds_mla",
     ]
 
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        from vllm.platforms import current_platform
+
+        return current_platform.is_device_capability_family(120)
+
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         return [256]
@@ -193,6 +200,10 @@ class DeepseekSparseSWAFlashInferMetadataBuilder(DeepseekSparseSWAMetadataBuilde
 
 
 class DeepseekSparseSWAFlashInferBackend(DeepseekSparseSWABackend):
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        return DeepseekV4FlashInferMLASparseBackend.supports_batch_invariance()
+
     @staticmethod
     def get_builder_cls() -> type[DeepseekSparseSWAFlashInferMetadataBuilder]:
         return DeepseekSparseSWAFlashInferMetadataBuilder
@@ -623,6 +634,16 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     swa_backend_cls = DeepseekSparseSWAFlashInferBackend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
 
+    def _run_sparse_attention(self, **kwargs) -> None:
+        if envs.VLLM_BATCH_INVARIANT:
+            from .ops.batch_invariant import sparse_attention
+
+            kwargs.pop("workspace_buffer")
+            kwargs.pop("kv_layout")
+            sparse_attention(**kwargs)
+        else:
+            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(**kwargs)
+
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:
         return _get_flashinfer_dsv4_workspace(device)
@@ -851,7 +872,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
-        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+        self._run_sparse_attention(
             query=q,
             swa_kv_cache=swa_cache,
             workspace_buffer=self._get_workspace(q.device),
@@ -970,7 +991,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+            self._run_sparse_attention(
                 query=q_chunk,
                 swa_kv_cache=swa_kv_paged,
                 workspace_buffer=self._get_workspace(q.device),

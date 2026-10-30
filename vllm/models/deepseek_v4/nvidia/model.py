@@ -546,6 +546,25 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
+    if envs.VLLM_BATCH_INVARIANT:
+        pc = vllm_config.parallel_config
+        if (
+            device_capability is None
+            or device_capability.major != 12
+            or pc.world_size != 1
+            or pc.data_parallel_size != 1
+            or pc.decode_context_parallel_size != 1
+            or pc.prefill_context_parallel_size != 1
+            or vllm_config.speculative_config is not None
+            or vllm_config.cache_config.cache_dtype not in ("auto", "fp8", "fp8_ds_mla")
+        ):
+            raise ValueError(
+                "DeepSeek V4 batch invariance currently requires a single SM120 "
+                "GPU, fp8_ds_mla cache, and no speculative decoding."
+            )
+        if backend not in (None, AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4):
+            raise ValueError("DeepSeek V4 batch invariance requires the SM120 path.")
+        return DeepseekV4FlashInferSM120Attention
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,

@@ -25,6 +25,22 @@ DEVICE_TYPE = current_platform.device_type
 
 
 @skip_unsupported
+def test_matmul_fp32_output_preserves_precision_and_batch_invariance():
+    torch.manual_seed(42)
+    # Dyadic inputs isolate output rounding from FP32 accumulation error.
+    a = torch.randint(-4, 5, (17, 4096), device=DEVICE_TYPE).to(torch.bfloat16) / 16
+    b = (
+        torch.randint(-4, 5, (1024, 4096), device=DEVICE_TYPE).to(torch.bfloat16).t()
+        / 16
+    )
+    output = bi.matmul_persistent(a, b, out_dtype=torch.float32)
+    reference = (a.cpu().double() @ b.cpu().double()).float()
+    torch.testing.assert_close(output.cpu(), reference, rtol=0, atol=0)
+    single = bi.matmul_persistent(a[3:4], b, out_dtype=torch.float32)
+    assert torch.equal(output[3:4], single)
+
+
+@skip_unsupported
 @pytest.mark.parametrize(
     "a_shape,b_shape",
     [

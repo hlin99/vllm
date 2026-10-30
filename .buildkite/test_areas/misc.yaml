@@ -988,6 +988,8 @@ steps:
     - vllm/distributed/device_communicators/
     - vllm/model_executor/determinism
     - vllm/model_executor/layers
+    - vllm/models/deepseek_v4/
+    - vllm/model_executor/kernels/mhc/
     - vllm/v1/attention
     - tests/v1/determinism/
   commands:
