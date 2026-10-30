@@ -4,6 +4,66 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize("extra_len", [0, 1, 33, 64])
+def test_dsv4_triton_attention_batch_invariance(extra_len):
+    from vllm.models.deepseek_v4.nvidia.ops.batch_invariant import sparse_attention
+
+    torch.manual_seed(7)
+    block_size = 64
+    # Leave padding between pages, as in the shared MLA/compressor allocation.
+    backing = torch.zeros((2, block_size * 584 + 576), dtype=torch.uint8, device="cuda")
+    cache = backing[:, : block_size * 584].view(2, block_size, 1, 584)
+    values = torch.randint(-4, 5, (128, 512), device="cuda").to(torch.bfloat16)
+    for page in range(2):
+        data = backing[page, : block_size * 576].view(block_size, 576)
+        data[:, :448] = (
+            values[page * 64 : (page + 1) * 64, :448]
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+        )
+        data[:, 448:] = values[page * 64 : (page + 1) * 64, 448:].view(torch.uint8)
+        backing[page, block_size * 576 : block_size * 584] = 127
+    q = torch.randn((3, 4, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    sinks = torch.randn(4, device="cuda")
+    indices = torch.arange(64, device="cuda", dtype=torch.int32).expand(3, -1).clone()
+    lengths = torch.tensor([0, 31, 64], device="cuda", dtype=torch.int32)
+    extra = indices + 64
+    extra_lengths = torch.full_like(lengths, extra_len)
+    out = torch.empty_like(q)
+
+    def run(query, indices, lengths, extra, extra_lengths, out):
+        sparse_attention(
+            query=query,
+            swa_kv_cache=cache,
+            sparse_indices=indices,
+            swa_topk_lens=lengths,
+            sinks=sinks,
+            out=out,
+            bmm1_scale=512**-0.5,
+            compressed_kv_cache=cache if extra_len else None,
+            extra_sparse_indices=extra if extra_len else None,
+            extra_sparse_topk_lens=extra_lengths if extra_len else None,
+        )
+
+    run(q, indices, lengths, extra, extra_lengths, out)
+    for i, length in enumerate(lengths.cpu().tolist()):
+        kv = torch.cat([values[:length], values[64 : 64 + extra_len]]).float()
+        scores = q[i].float() @ kv.T * 512**-0.5
+        probs = torch.softmax(torch.cat([scores, sinks[:, None]], dim=1), dim=1)
+        reference = probs[:, :-1] @ kv
+        torch.testing.assert_close(out[i].float(), reference, atol=0.008, rtol=0.008)
+        single = torch.empty_like(q[i : i + 1])
+        run(
+            q[i : i + 1],
+            indices[i : i + 1],
+            lengths[i : i + 1],
+            extra[i : i + 1],
+            extra_lengths[i : i + 1],
+            single,
+        )
+        assert torch.equal(single[0], out[i])
+
+
 def test_dsv4_triton_indexer_prefill_decode_batch_invariance():
     """Score the real indexer cache identically through gather and paged reads."""
     from vllm import _custom_ops as ops
