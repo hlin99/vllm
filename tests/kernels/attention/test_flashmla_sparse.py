@@ -4,6 +4,53 @@ import pytest
 import torch
 
 
+def test_dsv4_triton_indexer_prefill_decode_batch_invariance():
+    """Score the real indexer cache identically through gather and paged reads."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.kernels.attention.dsa.batch_invariant import (
+        indexer_logits,
+    )
+
+    torch.manual_seed(9)
+    q = torch.randn((3, 64, 128), device="cuda").to(torch.float8_e4m3fn)
+    unquantized_k = torch.randn((128, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.empty((128, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    scales = torch.empty(128, device="cuda", dtype=torch.float32)
+    weights = torch.rand((3, 64), device="cuda")
+    starts = torch.zeros(3, device="cuda", dtype=torch.int32)
+    ends = torch.tensor([0, 33, 128], device="cuda", dtype=torch.int32)
+    storage = torch.zeros((2, 64 * 132 + 256), device="cuda", dtype=torch.uint8)
+    cache = storage[:, : 64 * 132].view(2, 64, 1, 132)
+    slots = (torch.arange(128, device="cuda", dtype=torch.int64) + 64) % 128
+    ops.indexer_k_quant_and_cache(unquantized_k, cache.squeeze(2), slots, 128, "ue8m0")
+    table = torch.tensor([[1, 0]] * 3, device="cuda", dtype=torch.int32)
+    ops.cp_gather_indexer_k_quant_cache(
+        cache.squeeze(2),
+        k,
+        scales.view(torch.uint8).view(128, 4),
+        table[:1],
+        torch.tensor([0, 128], device="cuda", dtype=torch.int32),
+    )
+    dense = indexer_logits(q, k, weights, ends, 128, scales=scales, starts=starts)
+    paged = indexer_logits(q, cache, weights, ends, 128, block_table=table)
+    assert torch.equal(dense, paged)
+    reference = torch.einsum("mhd,nd->mhn", q.float(), k.float()).clamp_min(0)
+    reference = (reference * weights[:, :, None]).sum(1) * scales
+    for row, end in enumerate(ends.cpu().tolist()):
+        torch.testing.assert_close(
+            dense[row, :end], reference[row, :end], atol=1e-4, rtol=1e-5
+        )
+        single = indexer_logits(
+            q[row : row + 1],
+            cache,
+            weights[row : row + 1],
+            ends[row : row + 1],
+            128,
+            block_table=table[row : row + 1],
+        )
+        assert torch.equal(single[0], paged[row])
+
+
 @pytest.mark.parametrize("sm120", [False, True])
 def test_deepseek_v4_c128a_adaptive_width_has_capture_stable_stride(
     monkeypatch: pytest.MonkeyPatch,
