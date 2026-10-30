@@ -87,6 +87,36 @@ def test_sparse_topk_batch_invariance(
             assert torch.equal(results, expected.expand_as(results))
 
 
+def test_stable_topk_cutoff_ties_and_canonical_order(monkeypatch):
+    from vllm.model_executor.layers.indexer_topk import (
+        canonicalize_topk_indices,
+        stable_topk,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    device = current_platform.device_type
+    logits = torch.zeros((3, 604), device=device)
+    logits[:, 515] = 2
+    logits[:, 17] = 1
+    logits[1, 300:] = -float("inf")
+    logits[2] = -float("inf")
+    out = torch.empty((3, 512), device=device, dtype=torch.int32)
+    stable_topk(logits, out)
+    assert out[0, :2].tolist() == [515, 17]
+    single = torch.empty_like(out[1:2])
+    stable_topk(logits[1:2], single)
+    assert torch.equal(single[0], out[1])
+
+    canonicalize_topk_indices(out)
+    expected = torch.cat(
+        [torch.arange(511, device=device), torch.tensor([515], device=device)]
+    )
+    assert torch.equal(out[0], expected)
+    assert torch.equal(out[1, :300], torch.arange(300, device=device))
+    assert (out[1, 300:] == -1).all()
+    assert (out[2] == -1).all()
+
+
 def _has_device_capability(major: int) -> bool:
     return current_platform.is_cuda() and current_platform.has_device_capability(major)
 
