@@ -78,7 +78,10 @@ def test_dsv4_triton_attention_batch_invariance(extra_len):
         assert torch.equal(single[0], out[i])  # 同一 query 单独/混批计算必须完全相同。
 
 
-def test_dsv4_triton_indexer_prefill_decode_batch_invariance():
+@pytest.mark.parametrize(
+    "weights_dtype", [torch.float32, torch.float16, torch.bfloat16]
+)
+def test_dsv4_triton_indexer_prefill_decode_batch_invariance(weights_dtype):
     """Score the real indexer cache identically through gather and paged reads."""
     # e426be8173：用真实缓存写入与 gather，验证两种读取布局和 batch 变化。
     from vllm import _custom_ops as ops  # 调用生产环境的 indexer 缓存操作。
@@ -95,7 +98,8 @@ def test_dsv4_triton_indexer_prefill_decode_batch_invariance():
         (128, 128), device="cuda", dtype=torch.float8_e4m3fn
     )  # gather 目标。
     scales = torch.empty(128, device="cuda", dtype=torch.float32)  # gather 出的比例。
-    weights = torch.rand((3, 64), device="cuda")  # 各 query 的头合并权重。
+    # 输入精度独立于累加精度。
+    weights = torch.rand((3, 64), device="cuda").to(weights_dtype)
     starts = torch.zeros(3, device="cuda", dtype=torch.int32)  # 同一个请求从零开始。
     ends = torch.tensor(
         [0, 33, 128], device="cuda", dtype=torch.int32
@@ -114,13 +118,18 @@ def test_dsv4_triton_indexer_prefill_decode_batch_invariance():
         table[:1],  # gather 只需该请求的一份块表。
         torch.tensor([0, 128], device="cuda", dtype=torch.int32),  # 请求拼接范围。
     )
+    # prefill 使用连续布局；不传 acc_dtype 与显式 FP32 必须完全一致。
     dense = indexer_logits(q, k, weights, ends, 128, scales=scales, starts=starts)
-    # 上一行模拟 prefill 的连续布局，下一行模拟 decode 的分页布局。
+    explicit = indexer_logits(
+        q, k, weights, ends, 128, scales=scales, starts=starts, acc_dtype=torch.float32
+    )
+    assert torch.equal(dense, explicit)
+    # decode 使用分页布局，候选内容与连续布局相同。
     paged = indexer_logits(q, cache, weights, ends, 128, block_table=table)
     assert torch.equal(dense, paged)  # 两种布局对相同 query 必须得到相同分数。
     reference = torch.einsum("mhd,nd->mhn", q.float(), k.float()).clamp_min(0)
     # FP32 参考：每头 QK 点积先做 ReLU。
-    reference = (reference * weights[:, :, None]).sum(1) * scales  # 加权合头并反量化。
+    reference = (reference * weights.float()[:, :, None]).sum(1) * scales
     for row, end in enumerate(ends.cpu().tolist()):  # 只比较各行可见范围。
         torch.testing.assert_close(
             dense[row, :end],
@@ -138,6 +147,52 @@ def test_dsv4_triton_indexer_prefill_decode_batch_invariance():
             block_table=table[row : row + 1],  # 保持相同物理映射。
         )
         assert torch.equal(single[0], paged[row])  # 单独/混批打分结果完全一致。
+
+
+@pytest.mark.parametrize("acc_dtype", [torch.float16, torch.bfloat16])
+def test_indexer_logits_requested_accumulation_rounds_each_step(acc_dtype):
+    """Small terms must round during accumulation, not only at output storage."""
+    from vllm.model_executor.kernels.attention.dsa.batch_invariant import (
+        indexer_logits,
+    )
+
+    q = torch.ones((3, 16, 128), device="cuda").to(torch.float8_e4m3fn)
+    k = torch.full((64, 128), 1 / 512, device="cuda").to(torch.float8_e4m3fn)
+    k[:, 0] = 8
+    weights = torch.ones((3, 16), device="cuda", dtype=acc_dtype)
+    starts = torch.zeros(3, device="cuda", dtype=torch.int32)
+    ends = torch.tensor([0, 33, 64], device="cuda", dtype=torch.int32)
+    scales = torch.ones(64, device="cuda", dtype=torch.float32)
+    storage = torch.zeros((1, 64 * 132 + 256), device="cuda", dtype=torch.uint8)
+    cache = storage[:, : 64 * 132].view(1, 64, 1, 132)
+    storage[0, : 64 * 128] = k.view(torch.uint8).flatten()
+    storage[0, 64 * 128 : 64 * 132] = scales.view(torch.uint8)
+    table = torch.zeros((3, 1), device="cuda", dtype=torch.int32)
+
+    default = indexer_logits(q, k, weights, ends, 64, scales=scales, starts=starts)
+    dense = indexer_logits(
+        q, k, weights, ends, 64, scales=scales, starts=starts, acc_dtype=acc_dtype
+    )
+    paged = indexer_logits(
+        q, cache, weights, ends, 64, block_table=table, acc_dtype=acc_dtype
+    )
+    assert dense.dtype == torch.float32
+    assert torch.equal(dense, paged)
+    for row, end in enumerate(ends.cpu().tolist()):
+        # After adding 8, each 1/512 term rounds away in FP16 and BF16.
+        assert (dense[row, :end] == 128).all()
+        assert (default[row, :end] == (8 + 127 / 512) * 16).all()
+        assert torch.isneginf(dense[row, end:]).all()
+        single = indexer_logits(
+            q[row : row + 1],
+            cache,
+            weights[row : row + 1],
+            ends[row : row + 1],
+            64,
+            block_table=table[row : row + 1],
+            acc_dtype=acc_dtype,
+        )
+        assert torch.equal(single[0], paged[row])
 
 
 @pytest.mark.parametrize("sm120", [False, True])

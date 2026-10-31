@@ -159,6 +159,15 @@ and fixed-reduction mHC projections. It also uses the existing Triton compressor
 and batch-invariant linear kernels. MXFP4 experts use the batch-invariant Humming
 backend; their weights remain quantized.
 
+The internal `indexer_logits` helper accepts FP32, FP16 or BF16 head weights.
+Its optional `acc_dtype` argument defaults to `torch.float32`; callers can request
+`torch.float16` or `torch.bfloat16` accumulation independently of the input dtype.
+Scores remain FP32 for Top-K compatibility. Low-precision accumulation uses a
+slower fixed-order implementation and can change scores and selected positions.
+Existing model callers keep the default FP32 accumulation.
+
+<!-- 可选 acc_dtype 由调用方控制累加精度；未传参的现有模型路径保持不变。 -->
+
 <!--
 逐行解释：prefill/decode 共用固定归约的稀疏 attention；
 FP8 indexer 使用稳定的 cutoff 同分规则；mHC 投影也固定归约形状。

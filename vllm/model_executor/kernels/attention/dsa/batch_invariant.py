@@ -7,6 +7,11 @@ import torch  # e426be8173：使用 PyTorch 张量描述输入、输出与数据
 from vllm.triton_utils import tl, triton  # Triton 负责 GPU 编译、索引和固定形状归约。
 
 
+@triton.jit
+def _sum_in_dtype(left, right):
+    return (left + right).to(left.dtype)
+
+
 # e426be8173：一个 program 计算一个 query 对 32 个 key 的分数。
 # prefill 连续缓存和 decode 分页缓存共用计算形状，避免随 batch 改变归约顺序。
 @triton.jit
@@ -31,6 +36,7 @@ def _indexer_logits(
     PAGED: tl.constexpr,  # 编译期选择分页读取或连续读取。
     PAGE_SIZE: tl.constexpr,  # 每个物理页容纳的 key 数。
     PAGE_STRIDE: tl.constexpr,  # 物理页间的字节跨度，保留分配中的 padding。
+    ACC_DTYPE: tl.constexpr,  # 调用方选择的累加精度，默认 FP32。
 ):
     row = tl.program_id(0).to(tl.int64)  # 当前 query；64 位地址运算防止大缓存溢出。
     col = tl.program_id(1) * 32 + tl.arange(0, 32)  # 本 program 的 32 个 key。
@@ -63,10 +69,29 @@ def _indexer_logits(
         h[:, None] < HEADS,  # padding 头不访问输入。
         0.0,  # padding 头填零，不影响点积。
     )
-    scores = tl.dot(q, tl.trans(kval), out_dtype=tl.float32)  # [H,32] 点积分数。
-    weights = tl.load(W + row * ws + h, h < HEADS, 0).to(tl.float32)
-    # 每头先 ReLU，再按学习权重沿头维归约；最后乘对应 key 的量化 scale。
-    scores = tl.sum(tl.maximum(scores, 0.0) * weights[:, None], 0) * scale
+    weights = tl.load(W + row * ws + h, h < HEADS, 0).to(ACC_DTYPE)
+    if tl.float32 == ACC_DTYPE:
+        scores = tl.dot(q, tl.trans(kval), out_dtype=tl.float32)
+        # 默认路径保留原来的点积和归约顺序，避免改变已有 FP32 结果。
+        scores = tl.sum(tl.maximum(scores, 0.0) * weights[:, None], 0) * scale
+    else:
+        # FP8 dot 不提供 BF16 累加；逐特征计算，避免仅在 FP32 累加后转换结果。
+        q = q.to(ACC_DTYPE)
+        kval = kval.to(ACC_DTYPE)
+        scores = tl.full((H, 32), 0, ACC_DTYPE)
+        for feature in range(128):
+            q_feature = tl.gather(
+                q, tl.full((H, 1), feature, tl.int32), axis=1
+            ).reshape((H,))
+            k_feature = tl.gather(
+                kval, tl.full((32, 1), feature, tl.int32), axis=1
+            ).reshape((32,))
+            product = (q_feature[:, None] * k_feature[None, :]).to(ACC_DTYPE)
+            scores = (scores + product).to(ACC_DTYPE)
+        weighted = (tl.maximum(scores, 0.0) * weights[:, None]).to(ACC_DTYPE)
+        # 每个归约节点都舍入到指定精度，防止 tl.sum 隐式使用 FP32 累加。
+        scores = tl.reduce(weighted, 0, _sum_in_dtype)
+        scores = (scores * scale.to(ACC_DTYPE)).to(ACC_DTYPE)
     tl.store(
         OUT + row * width + col,
         tl.where(valid, scores, -float("inf")),
@@ -78,18 +103,57 @@ def _indexer_logits(
 def indexer_logits(
     q: torch.Tensor,  # [M, heads, 128] FP8 query。
     k: torch.Tensor,  # 连续 key 或分页缓存。
-    weights: torch.Tensor,  # [M, heads] FP32 合并权重。
+    weights: torch.Tensor,  # [M, heads] 浮点合并权重，输入类型不限定为 FP32。
     ends: torch.Tensor,  # [M] 各 query 可见 key 终点。
     width: int,  # 需要分配、计算的每行候选宽度。
     *,
     scales: torch.Tensor | None = None,  # 连续布局必需的 key scale。
     starts: torch.Tensor | None = None,  # 连续布局必需的请求起始下标。
     block_table: torch.Tensor | None = None,  # 非空时选择分页布局。
+    acc_dtype: torch.dtype = torch.float32,  # 可选累加精度，不传时保持 FP32。
 ) -> torch.Tensor:
-    """Score identical FP8 queries with the same reduction in either cache layout."""
+    """Score FP8 queries with batch-invariant reductions in either cache layout.
+
+    Args:
+        q: FP8 queries of shape [M, heads, 128].
+        k: Contiguous FP8 keys or a paged byte cache.
+        weights: Head weights of shape [M, heads], in float32, float16 or bfloat16.
+        ends: Exclusive visible key endpoints for each query.
+        width: Number of output score columns.
+        scales: FP32 key scales for the contiguous layout.
+        starts: Request key offsets for the contiguous layout.
+        block_table: Logical-to-physical page mapping for the paged layout.
+        acc_dtype: Accumulation dtype, independent of the weights' input dtype.
+            Supports float32 (default), float16 and bfloat16. Low-precision
+            accumulation uses a slower, fixed-order feature loop and rounds
+            each product and accumulation to the requested dtype.
+
+    Returns:
+        FP32 scores for the shared Top-K interface, including when accumulation
+        uses a lower precision.
+
+    Raises:
+        ValueError: If the requested accumulation dtype is unsupported.
+        TypeError: If weights do not use a supported floating-point dtype.
+
+    """
     assert q.ndim == 3 and q.shape[-1] == 128  # 内核固定支持 128 维 indexer。
     assert q.dtype == torch.float8_e4m3fn  # 不支持 FP4 query。
-    assert weights.dtype == torch.float32  # 头权重以 FP32 参与归约。
+    acc_types = {
+        torch.float32: tl.float32,
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16,
+    }
+    if acc_dtype not in acc_types:
+        raise ValueError(
+            f"Unsupported indexer accumulation dtype: {acc_dtype}. "
+            "Expected float32, float16 or bfloat16."
+        )
+    if weights.dtype not in acc_types:
+        raise TypeError(
+            f"Unsupported indexer weights dtype: {weights.dtype}. "
+            "Expected float32, float16 or bfloat16."
+        )
     assert ends.numel() == q.shape[0] and ends.is_contiguous()  # 每行一个终点。
     paged = block_table is not None  # 是否需要逻辑页到物理页映射。
     if paged:
@@ -120,6 +184,7 @@ def indexer_logits(
             PAGED=paged,  # 编译期消除另一套缓存读取分支。
             PAGE_SIZE=k.shape[1] if paged else 1,  # 分页缓存每页 token 数。
             PAGE_STRIDE=k.stride(0) if paged else 0,  # 保留真实物理页间隔。
+            ACC_DTYPE=acc_types[acc_dtype],  # 显式传入累加精度，供编译期分派。
             num_warps=4,  # 固定执行配置，不按 batch 大小选择。
             enable_fp_fusion=False,  # 禁止融合浮点运算引入不同舍入路径。
         )
