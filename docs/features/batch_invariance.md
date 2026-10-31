@@ -165,6 +165,20 @@ When batch invariance is enabled, vLLM:
 !!! note
     Enabling batch invariance may impact performance compared to the default non-deterministic mode. This trade-off is intentional to guarantee reproducibility.
 
+### DeepSeek V4 FP8 linear and output projection
+
+With `VLLM_BATCH_INVARIANT=1`, CUDA DeepSeek V4 block-FP8 linear layers select
+the existing Triton block-scaled GEMM. The FP8 attention output projection runs
+each group with that same fixed-reduction implementation instead of DeepGEMM
+einsum, retaining quantized weights and using FP32 activation and weight scales.
+The output projection requires 128x128 weight blocks and a rank divisible by
+128; packed RopeQuant activation scales are not supported.
+
+This covers linear and output projections only. It does not include compressor
+KV/gate projections or enable full-model BI support. Non-BI kernel selection
+and output projection remain unchanged. The reference-oriented GEMMs can be
+slower than the default path.
+
 ## Future Improvements
 
 The batch invariance feature is under active development. Planned improvements include:

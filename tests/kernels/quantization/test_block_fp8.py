@@ -70,6 +70,57 @@ def setup_cuda():
     torch.set_default_device("cuda")
 
 
+def test_dsv4_bi_linear_selects_triton_and_preserves_rows(monkeypatch, tmp_path):
+    """DSv4 BI dispatch must keep quantized weights and identical per-row outputs."""
+    from transformers import DeepseekV4Config
+
+    from vllm.config import ModelConfig, set_current_vllm_config
+    from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
+    from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+        TritonFp8BlockScaledMMKernel,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Dynamic128Sym,
+        kFp8Static128BlockSym,
+    )
+
+    DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        num_hidden_layers=1,
+        layer_types=["sliding_attention"],
+    ).save_pretrained(tmp_path)
+    model_config = ModelConfig(
+        model=str(tmp_path), skip_tokenizer_init=True, dtype="bfloat16"
+    )
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    cfg = VllmConfig(model_config=model_config)
+    with set_current_vllm_config(cfg):
+        kernel = init_fp8_linear_kernel(
+            kFp8Dynamic128Sym,
+            kFp8Static128BlockSym,
+            torch.bfloat16,
+            torch.bfloat16,
+            (256, 256),
+        )
+        assert isinstance(kernel, TritonFp8BlockScaledMMKernel)
+        torch.manual_seed(17)
+        layer = torch.nn.Linear(256, 256, bias=False, dtype=torch.bfloat16)
+        layer.weight = torch.nn.Parameter(
+            torch.randn((256, 256)).to(torch.float8_e4m3fn), requires_grad=False
+        )
+        layer.register_parameter(
+            "weight_scale_inv",
+            torch.nn.Parameter(torch.rand((2, 2)), requires_grad=False),
+        )
+        kernel.process_weights_after_loading(layer)
+        x = torch.randn((129, 256), dtype=torch.bfloat16)
+        reference = kernel.apply_weights(layer, x)
+        for row in (0, 16, 64, 128):
+            single = kernel.apply_weights(layer, x[row : row + 1])
+            assert torch.equal(single[0], reference[row])
+        assert layer.weight.dtype == torch.float8_e4m3fn
+
+
 @pytest.mark.skipif(
     current_platform.is_fp8_fnuz(),
     reason="This platform supports e4m3fnuz, not e4m3fn.",
