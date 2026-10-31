@@ -31,6 +31,11 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     select_candidate_blocks as _select_candidate_blocks,
 )
+from vllm.model_executor.kernels.attention.dsa.selector import (
+    IndexerKernel,
+    IndexerSelectionConfig,
+    select_indexer_kernel,
+)
 from vllm.model_executor.layers.indexer_topk import (
     RADIX_TOPK_WORKSPACE_SIZE,
     canonicalize_topk_indices,
@@ -71,6 +76,47 @@ logger = init_logger(__name__)
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _select_indexer_kernel(
+    head_dim: int,
+    quant_block_size: int,
+    use_fp4_cache: bool,
+    use_pcp: bool,
+    dcp_world_size: int,
+    candidate_filtering: bool,
+    *,
+    query_dtype: torch.dtype | None = None,
+    weights_dtype: torch.dtype = torch.float32,
+    decode_query_len: int = 1,
+) -> IndexerKernel:
+    capability = current_platform.get_device_capability()
+    platform = (
+        "cuda"
+        if current_platform.is_cuda()
+        else "xpu"
+        if current_platform.is_xpu()
+        else "rocm"
+        if current_platform.is_rocm()
+        else "cpu"
+    )
+    return select_indexer_kernel(
+        IndexerSelectionConfig(
+            platform=platform,
+            device_capability=capability.major if capability is not None else 0,
+            use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
+            head_dim=head_dim,
+            query_dtype=query_dtype or current_platform.fp8_dtype(),
+            weights_dtype=weights_dtype,
+            quant_block_size=quant_block_size,
+            use_fp4_cache=use_fp4_cache,
+            use_pcp=use_pcp,
+            dcp_world_size=dcp_world_size,
+            candidate_filtering=candidate_filtering,
+            decode_query_len=decode_query_len,
+            deep_gemm_available=has_deep_gemm(),
+        )
+    )
 
 
 def _assert_cutedsl_dcp_merge_supported(
@@ -586,18 +632,18 @@ def sparse_attn_indexer(
     else:
         assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
 
-    if envs.VLLM_BATCH_INVARIANT:  # e33d190dd5：对未实现的组合显式报错。
-        if (
-            use_fp4_cache  # 固定归约 indexer 当前只实现 FP8。
-            or use_pcp  # 不支持 prefill context parallelism。
-            or dcp_world_size != 1  # 不支持 decode context parallelism。
-            or candidate_blocks is not None  # 不支持两级候选块过滤。
-        ):
-            raise NotImplementedError(
-                "Batch-invariant sparse indexing requires FP8 cache without "
-                "context parallelism or candidate filtering."
-                # 不悄悄退回非确定性实现，以免错误承诺逐位一致。
-            )
+    # 算子级候选筛选，不读取模型名称；不支持的契约会汇总各候选的拒绝原因。
+    kernel = _select_indexer_kernel(
+        head_dim,
+        quant_block_size,
+        use_fp4_cache,
+        use_pcp,
+        dcp_world_size,
+        candidate_blocks is not None,
+        query_dtype=q_quant.dtype,
+        weights_dtype=weights.dtype,
+    )
+    if kernel.name == "triton":
         from vllm.model_executor.kernels.attention.dsa.batch_invariant import (
             indexer_logits,  # 加载 prefill/decode 共用的固定归约打分实现。
         )
@@ -773,7 +819,7 @@ def sparse_attn_indexer(
                     k_scale_cast = k_scale.view(
                         torch.int32 if mqa_logits_use_mx_scales() else torch.float32
                     ).squeeze(-1)
-                if envs.VLLM_BATCH_INVARIANT:  # e33d190dd5：prefill 固定归约分支。
+                if kernel.name == "triton":  # 由候选筛选结果选择固定归约打分。
                     row_ends = cu_seqlen_ke - cu_seqlen_ks  # 请求内可见 key 数。
                     logits = indexer_logits(
                         q_slice,  # 当前 chunk 的 FP8 query。
@@ -781,10 +827,11 @@ def sparse_attn_indexer(
                         weights[row_start:row_end],  # 当前 query 对应的头权重。
                         cu_seqlen_ke,  # 拼接缓存中的因果终点。
                         chunk.max_seqlen_k,  # 以请求最大 key 长度作为输出宽度。
-                        scales=k_scale.view(torch.float32).squeeze(-1),  # 解读 scale。
+                        scales=k_scale_cast,
                         starts=cu_seqlen_ks,  # 每个 query 所属请求的拼接起点。
+                        use_mx_scales=mqa_logits_use_mx_scales(),
                     )
-                elif current_platform.is_xpu():  # 非确定性模式保留原 XPU 分派。
+                elif kernel.name == "xpu":  # 常规 XPU 候选。
                     if q_scale_slice is not None:
                         raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
                     logits = torch.ops.vllm.xpu_fp8_mqa_logits(
@@ -845,7 +892,7 @@ def sparse_attn_indexer(
                             chunk_candidates,
                             candidate_block_size,
                         )
-                if envs.VLLM_BATCH_INVARIANT:  # e33d190dd5：打分后仍需稳定处理同分。
+                if kernel.supports_batch_invariance:  # BI 打分配套稳定的 Top-K。
                     stable_topk(logits, topk_indices)  # 先按分数，再按逻辑位置选 K 项。
                 elif use_deep_select:  # 常规模式保留原高性能选择器。
                     deep_select_topk(
@@ -954,12 +1001,19 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if envs.VLLM_BATCH_INVARIANT:  # e33d190dd5：decode 直接读取分页 key。
-            if next_n != 1:  # 当前内核一行仅对应一个解码 query。
-                raise NotImplementedError(
-                    "Batch-invariant sparse indexing requires single-token decode."
-                    # 推测解码的多 token 路径尚未实现，不允许隐式降级。
-                )
+        # 使用本次实际的 decode query 数重新筛选，避免误用仅支持单 token 的内核。
+        kernel = _select_indexer_kernel(
+            head_dim,
+            quant_block_size,
+            use_fp4_cache,
+            use_pcp,
+            dcp_world_size,
+            candidate_blocks is not None,
+            query_dtype=q_quant.dtype,
+            weights_dtype=weights.dtype,
+            decode_query_len=next_n,
+        )
+        if kernel.name == "triton":
             logits = indexer_logits(
                 padded_q_quant_cast[:, 0],  # 去掉 next_n=1 的维度。
                 kv_cache,  # 直接使用分页 FP8 indexer 缓存。
@@ -967,8 +1021,9 @@ def sparse_attn_indexer(
                 seq_lens.reshape(-1),  # 每行的可见 key 数，展平成连续接口。
                 max_model_len,  # 固定输出宽度，短序列尾部写负无穷。
                 block_table=decode_metadata.block_table,  # 逻辑页到物理页映射。
+                use_mx_scales=mqa_logits_use_mx_scales(),
             )
-        elif current_platform.is_xpu():  # 常规模式沿用已有平台内核。
+        elif kernel.name == "xpu":  # 常规模式沿用已有平台内核。
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
@@ -1034,9 +1089,7 @@ def sparse_attn_indexer(
 
         # The backend comes from the layer (config is only readable at model
         # construction); dispatchers are cached per backend.
-        if (
-            envs.VLLM_BATCH_INVARIANT
-        ):  # e33d190dd5：decode 与 prefill 使用同一选择规则。
+        if kernel.supports_batch_invariance:
             stable_topk(logits, topk_indices)  # 同分优先较小位置，无效项填哨兵。
         else:
             get_indexer_topk(topk_backend)(  # 原后端仅在未开启批次不变性时调用。
@@ -1175,10 +1228,16 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
+        if current_platform.is_cuda() or current_platform.is_xpu():
+            # 构造阶段检查静态契约；BI Triton 候选不要求安装 DeepGEMM。
+            _select_indexer_kernel(
+                head_dim,
+                quant_block_size,
+                use_fp4_cache,
+                self.use_pcp,
+                self.dcp_world_size,
+                candidate_blocks is not None,
+                decode_query_len=1 + vllm_config.num_speculative_tokens,
             )
 
         if vllm_config.kernel_config.enable_jit_warmup:

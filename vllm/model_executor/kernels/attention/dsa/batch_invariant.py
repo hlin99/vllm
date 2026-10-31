@@ -18,7 +18,7 @@ def _sum_in_dtype(left, right):
 def _indexer_logits(
     Q,  # FP8 query，逻辑形状为 [query 数, 头数, 128]。
     K,  # 连续 FP8 key 或包含量化数据与 scale 的分页字节缓存。
-    KS,  # 连续布局的 FP32 key scale；分页布局直接从 K 读取。
+    KS,  # 连续布局的 FP32 或 packed-UE8M0 key scale；分页布局直接从 K 读取。
     W,  # 每个 query、每个 indexer head 的合并权重。
     START,  # 连续布局中，每个 query 所属请求的 key 起始下标。
     END,  # 每个 query 可见的 key 终点，不包含该位置。
@@ -37,6 +37,7 @@ def _indexer_logits(
     PAGE_SIZE: tl.constexpr,  # 每个物理页容纳的 key 数。
     PAGE_STRIDE: tl.constexpr,  # 物理页间的字节跨度，保留分配中的 padding。
     ACC_DTYPE: tl.constexpr,  # 调用方选择的累加精度，默认 FP32。
+    MX_SCALES: tl.constexpr,  # SM100 的 FP8 scale 以四个相同 UE8M0 字节存放。
 ):
     row = tl.program_id(0).to(tl.int64)  # 当前 query；64 位地址运算防止大缓存溢出。
     col = tl.program_id(1) * 32 + tl.arange(0, 32)  # 本 program 的 32 个 key。
@@ -49,21 +50,31 @@ def _indexer_logits(
         block = tl.load(BT + row * bts + pos // PAGE_SIZE, valid, 0).to(tl.int64)
         # 上一行通过块表得到物理页号；下面使用真实页 stride，而非假设页紧邻。
         page = block * PAGE_STRIDE
-        # Each page stores all FP8 keys first, then all FP32 scales.
+        # Each page stores all FP8 keys first, then all four-byte scales.
         offset = page + pos % PAGE_SIZE * 128  # 页内先连续存放所有 FP8 key。
         raw = tl.load(K + offset[:, None] + d[None, :], valid[:, None], 0)
         kval = raw.to(
             tl.float8e4nv, bitcast=True
         )  # 把原始字节解释为 FP8，不做数值转换。
         scale_offset = page + PAGE_SIZE * 128 + pos % PAGE_SIZE * 4
-        # key 数据之后是每 token 4 字节的 FP32 scale；无效位置不读取。
-        scale = tl.load((K + scale_offset).to(tl.pointer_type(tl.float32)), valid, 0)
+        # key 数据之后是每 token 4 字节的 scale；无效位置不读取。
+        if MX_SCALES:
+            packed = tl.load(
+                (K + scale_offset).to(tl.pointer_type(tl.uint32)), valid, 0
+            )
+            scale = tl.exp2((packed & 255).to(tl.float32) - 127.0)
+        else:
+            scale = tl.load(
+                (K + scale_offset).to(tl.pointer_type(tl.float32)), valid, 0
+            )
     else:
         start = tl.load(START + row)  # gather 后多个请求的 key 拼接存放。
         pos = col + start  # 将请求内位置转换为拼接缓存下标。
         valid = (pos < end) & (col < width)  # 只读当前 query 的可见历史。
         kval = tl.load(K + pos[:, None] * ks + d[None, :], valid[:, None], 0.0)
         scale = tl.load(KS + pos * kss, valid, 0)  # 读取同一位置的反量化比例。
+        if MX_SCALES:
+            scale = tl.exp2((scale.to(tl.uint32) & 255).to(tl.float32) - 127.0)
     q = tl.load(
         Q + row * qs + h[:, None] * qhs + d[None, :],  # 当前 query 的全部头。
         h[:, None] < HEADS,  # padding 头不访问输入。
@@ -111,6 +122,7 @@ def indexer_logits(
     starts: torch.Tensor | None = None,  # 连续布局必需的请求起始下标。
     block_table: torch.Tensor | None = None,  # 非空时选择分页布局。
     acc_dtype: torch.dtype = torch.float32,  # 可选累加精度，不传时保持 FP32。
+    use_mx_scales: bool = False,  # 可选的 SM100 FP8 packed-UE8M0 scale 布局。
 ) -> torch.Tensor:
     """Score FP8 queries with batch-invariant reductions in either cache layout.
 
@@ -120,13 +132,16 @@ def indexer_logits(
         weights: Head weights of shape [M, heads], in float32, float16 or bfloat16.
         ends: Exclusive visible key endpoints for each query.
         width: Number of output score columns.
-        scales: FP32 key scales for the contiguous layout.
+        scales: FP32 or packed-UE8M0 int32 key scales for the contiguous layout.
         starts: Request key offsets for the contiguous layout.
         block_table: Logical-to-physical page mapping for the paged layout.
         acc_dtype: Accumulation dtype, independent of the weights' input dtype.
             Supports float32 (default), float16 and bfloat16. Low-precision
             accumulation uses a slower, fixed-order feature loop and rounds
             each product and accumulation to the requested dtype.
+        use_mx_scales: Whether key scales use four equal UE8M0 bytes per token
+            instead of a single FP32 value. Contiguous scales must be int32
+            in this layout, as in the SM100 FP8 indexer cache.
 
     Returns:
         FP32 scores for the shared Top-K interface, including when accumulation
@@ -159,7 +174,8 @@ def indexer_logits(
     if paged:
         assert k.dtype == torch.uint8 and k.shape[-1] == 132  # 128 字节 key + 4 scale。
     else:
-        assert scales is not None and scales.dtype == torch.float32  # 连续 scale。
+        scale_dtype = torch.int32 if use_mx_scales else torch.float32
+        assert scales is not None and scales.dtype == scale_dtype  # 连续 scale 编码。
         assert starts is not None  # 连续缓存必须说明各请求起点。
     out = torch.empty((q.shape[0], width), dtype=torch.float32, device=q.device)
     if q.shape[0] and width:  # 空 query 或空候选集不启动零维 GPU grid。
@@ -185,6 +201,7 @@ def indexer_logits(
             PAGE_SIZE=k.shape[1] if paged else 1,  # 分页缓存每页 token 数。
             PAGE_STRIDE=k.stride(0) if paged else 0,  # 保留真实物理页间隔。
             ACC_DTYPE=acc_types[acc_dtype],  # 显式传入累加精度，供编译期分派。
+            MX_SCALES=use_mx_scales,  # 两种缓存布局采用相同的 scale 解码规则。
             num_warps=4,  # 固定执行配置，不按 batch 大小选择。
             enable_fp_fusion=False,  # 禁止融合浮点运算引入不同舍入路径。
         )

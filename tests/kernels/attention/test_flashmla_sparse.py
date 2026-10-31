@@ -4,6 +4,91 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize(
+    "platform,capability,batch_invariant,deep_gemm_available,expected",
+    [
+        ("cuda", 9, True, False, "triton"),
+        ("cuda", 10, True, False, "triton"),
+        ("cuda", 12, True, True, "triton"),
+        ("cuda", 9, False, True, "deep_gemm"),
+        ("cuda", 10, False, True, "deep_gemm"),
+        ("cuda", 12, False, True, "deep_gemm"),
+        ("xpu", 0, False, False, "xpu"),
+    ],
+)
+def test_indexer_selector_preserves_priority_and_filters_bi_capability(
+    platform, capability, batch_invariant, deep_gemm_available, expected
+):
+    """BI selects a capable scorer/Top-K pair even without DeepGEMM."""
+    from vllm.model_executor.kernels.attention.dsa.selector import (
+        IndexerSelectionConfig,
+        select_indexer_kernel,
+        supports_indexer_batch_invariance,
+    )
+
+    config = IndexerSelectionConfig(
+        platform=platform,
+        device_capability=capability,
+        use_batch_invariant=batch_invariant,
+        deep_gemm_available=deep_gemm_available,
+    )
+    kernel = select_indexer_kernel(config)
+    assert kernel.name == expected
+    assert kernel.supports_batch_invariance == batch_invariant
+    assert supports_indexer_batch_invariance(platform, capability) == (
+        platform == "cuda"
+    )
+
+
+@pytest.mark.parametrize(
+    "options,reason",
+    [
+        ({"use_fp4_cache": True}, "FP4 cache"),
+        ({"use_pcp": True}, "context parallelism"),
+        ({"dcp_world_size": 2}, "context parallelism"),
+        ({"candidate_filtering": True}, "candidate filtering"),
+        ({"decode_query_len": 2}, "multi-token decode"),
+        ({"head_dim": 64}, "head size"),
+        ({"quant_block_size": 64}, "quantization block size"),
+        ({"query_dtype": torch.bfloat16}, "query dtype"),
+        ({"weights_dtype": torch.int32}, "weights dtype"),
+        ({"device_capability": 8}, "device capability"),
+        ({"platform": "xpu"}, "platform"),
+        ({"platform": "rocm"}, "platform"),
+    ],
+)
+def test_indexer_selector_rejects_unsupported_bi_without_fallback(options, reason):
+    from vllm.model_executor.kernels.attention.dsa.selector import (
+        IndexerSelectionConfig,
+        select_indexer_kernel,
+    )
+
+    kwargs = dict(platform="cuda", device_capability=9, use_batch_invariant=True)
+    kwargs.update(options)
+    with pytest.raises(NotImplementedError, match=reason) as exc:
+        select_indexer_kernel(IndexerSelectionConfig(**kwargs))
+    assert "deep_gemm:" in str(exc.value)
+    assert "xpu:" in str(exc.value)
+    assert "triton:" in str(exc.value)
+    assert "batch invariance not supported" in str(exc.value)
+
+
+def test_indexer_selector_keeps_missing_deep_gemm_error_for_non_bi():
+    from vllm.model_executor.kernels.attention.dsa.selector import (
+        IndexerSelectionConfig,
+        select_indexer_kernel,
+        supports_indexer_batch_invariance,
+    )
+
+    with pytest.raises(NotImplementedError, match="DeepGEMM is unavailable"):
+        select_indexer_kernel(
+            IndexerSelectionConfig(
+                platform="cuda", device_capability=9, deep_gemm_available=False
+            )
+        )
+    assert not supports_indexer_batch_invariance("cuda", 8)
+
+
 # caf5d70e2b31772b81dd85a82d590708baa89ccc
 # 分别覆盖无压缩 KV、单项、跨 32 项 tile 边界和整 tile。
 @pytest.mark.parametrize("extra_len", [0, 1, 33, 64])
@@ -81,7 +166,10 @@ def test_dsv4_triton_attention_batch_invariance(extra_len):
 @pytest.mark.parametrize(
     "weights_dtype", [torch.float32, torch.float16, torch.bfloat16]
 )
-def test_dsv4_triton_indexer_prefill_decode_batch_invariance(weights_dtype):
+@pytest.mark.parametrize("use_mx_scales", [False, True])
+def test_dsv4_triton_indexer_prefill_decode_batch_invariance(
+    weights_dtype, use_mx_scales
+):
     """Score the real indexer cache identically through gather and paged reads."""
     # e426be8173：用真实缓存写入与 gather，验证两种读取布局和 batch 变化。
     from vllm import _custom_ops as ops  # 调用生产环境的 indexer 缓存操作。
@@ -97,7 +185,9 @@ def test_dsv4_triton_indexer_prefill_decode_batch_invariance(weights_dtype):
     k = torch.empty(
         (128, 128), device="cuda", dtype=torch.float8_e4m3fn
     )  # gather 目标。
-    scales = torch.empty(128, device="cuda", dtype=torch.float32)  # gather 出的比例。
+    scales = torch.empty(
+        128, device="cuda", dtype=torch.int32 if use_mx_scales else torch.float32
+    )
     # 输入精度独立于累加精度。
     weights = torch.rand((3, 64), device="cuda").to(weights_dtype)
     starts = torch.zeros(3, device="cuda", dtype=torch.int32)  # 同一个请求从零开始。
@@ -108,7 +198,13 @@ def test_dsv4_triton_indexer_prefill_decode_batch_invariance(weights_dtype):
     cache = storage[:, : 64 * 132].view(2, 64, 1, 132)  # 页间额外保留 256 字节。
     slots = (torch.arange(128, device="cuda", dtype=torch.int64) + 64) % 128
     # 上一行交换两页的物理位置，防止错误地按逻辑页直接读取却通过测试。
-    ops.indexer_k_quant_and_cache(unquantized_k, cache.squeeze(2), slots, 128, "ue8m0")
+    ops.indexer_k_quant_and_cache(
+        unquantized_k,
+        cache.squeeze(2),
+        slots,
+        128,
+        "mxfp8" if use_mx_scales else "ue8m0",
+    )
     # 使用真实量化写入，验证 scale 区编码，而不是伪造缓存对象。
     table = torch.tensor([[1, 0]] * 3, device="cuda", dtype=torch.int32)  # 反向页映射。
     ops.cp_gather_indexer_k_quant_cache(
@@ -119,17 +215,45 @@ def test_dsv4_triton_indexer_prefill_decode_batch_invariance(weights_dtype):
         torch.tensor([0, 128], device="cuda", dtype=torch.int32),  # 请求拼接范围。
     )
     # prefill 使用连续布局；不传 acc_dtype 与显式 FP32 必须完全一致。
-    dense = indexer_logits(q, k, weights, ends, 128, scales=scales, starts=starts)
+    dense = indexer_logits(
+        q,
+        k,
+        weights,
+        ends,
+        128,
+        scales=scales,
+        starts=starts,
+        use_mx_scales=use_mx_scales,
+    )
     explicit = indexer_logits(
-        q, k, weights, ends, 128, scales=scales, starts=starts, acc_dtype=torch.float32
+        q,
+        k,
+        weights,
+        ends,
+        128,
+        scales=scales,
+        starts=starts,
+        acc_dtype=torch.float32,
+        use_mx_scales=use_mx_scales,
     )
     assert torch.equal(dense, explicit)
     # decode 使用分页布局，候选内容与连续布局相同。
-    paged = indexer_logits(q, cache, weights, ends, 128, block_table=table)
+    paged = indexer_logits(
+        q,
+        cache,
+        weights,
+        ends,
+        128,
+        block_table=table,
+        use_mx_scales=use_mx_scales,
+    )
     assert torch.equal(dense, paged)  # 两种布局对相同 query 必须得到相同分数。
     reference = torch.einsum("mhd,nd->mhn", q.float(), k.float()).clamp_min(0)
     # FP32 参考：每头 QK 点积先做 ReLU。
-    reference = (reference * weights.float()[:, :, None]).sum(1) * scales
+    decoded_scales = (
+        torch.exp2(((scales & 255) - 127).float()) if use_mx_scales else scales
+    )
+    reference = (reference * weights.float()[:, :, None]).sum(1) * decoded_scales
     for row, end in enumerate(ends.cpu().tolist()):  # 只比较各行可见范围。
         torch.testing.assert_close(
             dense[row, :end],
@@ -145,6 +269,7 @@ def test_dsv4_triton_indexer_prefill_decode_batch_invariance(weights_dtype):
             ends[row : row + 1],  # 保持相同因果边界。
             128,  # 保持候选宽度。
             block_table=table[row : row + 1],  # 保持相同物理映射。
+            use_mx_scales=use_mx_scales,
         )
         assert torch.equal(single[0], paged[row])  # 单独/混批打分结果完全一致。
 

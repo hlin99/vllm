@@ -149,6 +149,26 @@ Other models may also work, but these have been explicitly validated. If you enc
 
 ## Implementation Details
 
+### Shared sparse indexer selection
+
+The shared `SparseAttnIndexer` selects its scorer and Top-K path from an
+operator-level candidate list, without checking model names. Normal execution
+keeps the existing DeepGEMM (CUDA) and XPU paths. With `VLLM_BATCH_INVARIANT=1`,
+candidates that do not support batch invariance are rejected, and the compatible
+fixed-reduction Triton scorer is paired with stable Top-K. This BI path does not
+require DeepGEMM.
+
+The BI indexer requires CUDA SM90 or newer, 128-dimensional FP8 queries, an FP8
+key cache with 128-element quantization blocks, and single-token decode. It
+supports both FP32 key scales and SM100 packed UE8M0 key scales. FP4 caches,
+context parallelism and candidate-block filtering are unsupported; selection
+reports the rejection reasons rather than falling back to a non-BI path.
+
+Indexer cache backends using this shared operator declare its platform-level BI
+availability; individual configurations are validated separately. This does not
+make a model's main attention or its entire inference pipeline batch invariant.
+The DeepSeek V4 end-to-end restrictions below remain unchanged.
+
 ### DeepSeek V4 on SM120
 
 <!-- e33d190dd5：新增的说明限定为单卡 SM120；不是所有 DeepSeek V4 配置的通用保证。 -->
