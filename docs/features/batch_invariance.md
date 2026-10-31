@@ -165,6 +165,20 @@ When batch invariance is enabled, vLLM:
 !!! note
     Enabling batch invariance may impact performance compared to the default non-deterministic mode. This trade-off is intentional to guarantee reproducibility.
 
+### DeepSeek V4 sparse attention on SM120
+
+With `VLLM_BATCH_INVARIANT=1`, the SM120 DeepSeek V4 attention path uses a
+fixed-reduction Triton kernel for prefill and decode over the SWA and compressed
+KV caches, including attention sinks. It requires BF16 queries with head
+dimension 512, RoPE dimension 64 and the packed `fp8_ds_mla` cache layout,
+without context parallelism or speculative decoding. The main attention and
+SWA backends declare their own BI support on CUDA SM120.
+
+This is sparse-attention-only support, not full-model batch invariance.
+Indexer, compressor, mHC and linear support must be integrated separately.
+Non-BI execution is unchanged. The reference-oriented kernel can be
+substantially slower than the default FlashInfer path.
+
 ## Future Improvements
 
 The batch invariance feature is under active development. Planned improvements include:

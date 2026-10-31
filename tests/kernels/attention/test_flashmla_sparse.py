@@ -5,9 +5,12 @@ import torch
 
 
 @pytest.mark.parametrize("extra_len", [0, 1, 33, 64])
-def test_dsv4_triton_attention_batch_invariance(extra_len):
-    from vllm.models.deepseek_v4.nvidia.ops.batch_invariant import sparse_attention
+def test_dsv4_triton_attention_batch_invariance(extra_len, monkeypatch):
+    from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+        DeepseekV4FlashInferSM120Attention,
+    )
 
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     torch.manual_seed(7)
     block_size = 64
     # Leave padding between pages, as in the shared MLA/compressor allocation.
@@ -32,7 +35,7 @@ def test_dsv4_triton_attention_batch_invariance(extra_len):
     out = torch.empty_like(q)
 
     def run(query, indices, lengths, extra, extra_lengths, out):
-        sparse_attention(
+        DeepseekV4FlashInferSM120Attention._run_sparse_attention(
             query=query,
             swa_kv_cache=cache,
             sparse_indices=indices,
@@ -43,6 +46,8 @@ def test_dsv4_triton_attention_batch_invariance(extra_len):
             compressed_kv_cache=cache if extra_len else None,
             extra_sparse_indices=extra if extra_len else None,
             extra_sparse_topk_lens=extra_lengths if extra_len else None,
+            workspace_buffer=None,
+            kv_layout="NHD",
         )
 
     run(q, indices, lengths, extra, extra_lengths, out)

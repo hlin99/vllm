@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -27,6 +28,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4SparseMLABackend,
     DeepseekV4SparseMLAMetadataBuilder,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
 from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
@@ -116,6 +118,33 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
         "fp8_ds_mla",
     ]
 
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        return (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        )
+
+    @classmethod
+    def validate_batch_invariant_config(cls, vllm_config: VllmConfig) -> None:
+        config = vllm_config.model_config.hf_config
+        parallel = vllm_config.parallel_config
+        if (
+            not cls.supports_batch_invariance()
+            or config.head_dim != 512
+            or config.qk_rope_head_dim != 64
+            or vllm_config.cache_config.cache_dtype
+            not in ("auto", "fp8", "fp8_e4m3", "fp8_ds_mla")
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or vllm_config.speculative_config is not None
+        ):
+            raise NotImplementedError(
+                "Batch-invariant DeepSeek V4 sparse attention requires SM120, "
+                "512-dimensional fp8_ds_mla cache, RoPE dimension 64, and "
+                "no context parallelism or speculative decoding."
+            )
+
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         return [256]
@@ -165,6 +194,8 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
         if device_capability.major == 12:
             if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
                 return "kv_cache_dtype not supported"
+            if envs.VLLM_BATCH_INVARIANT:
+                return None
             from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
             if not has_flashinfer_sparse_mla_sm120():
@@ -193,6 +224,10 @@ class DeepseekSparseSWAFlashInferMetadataBuilder(DeepseekSparseSWAMetadataBuilde
 
 
 class DeepseekSparseSWAFlashInferBackend(DeepseekSparseSWABackend):
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        return DeepseekV4FlashInferMLASparseBackend.supports_batch_invariance()
+
     @staticmethod
     def get_builder_cls() -> type[DeepseekSparseSWAFlashInferMetadataBuilder]:
         return DeepseekSparseSWAFlashInferMetadataBuilder
@@ -624,6 +659,17 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     use_fp8_ds_mla_layout: ClassVar[bool] = True
 
     @staticmethod
+    def _run_sparse_attention(**kwargs) -> None:
+        if envs.VLLM_BATCH_INVARIANT:
+            from .ops.batch_invariant import sparse_attention
+
+            kwargs.pop("workspace_buffer")
+            kwargs.pop("kv_layout")
+            sparse_attention(**kwargs)
+        else:
+            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(**kwargs)
+
+    @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:
         return _get_flashinfer_dsv4_workspace(device)
 
@@ -656,11 +702,15 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         )
 
     def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
+        if envs.VLLM_BATCH_INVARIANT:
+            self.backend_cls.validate_batch_invariant_config(vllm_config)
         super().__init__(vllm_config, *args, **kwargs)
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120_config
 
         required_topk = _required_sm120_sparse_topk(vllm_config, self.window_size)
-        if not has_flashinfer_sparse_mla_sm120_config(self.padded_heads, required_topk):
+        if not envs.VLLM_BATCH_INVARIANT and not has_flashinfer_sparse_mla_sm120_config(
+            self.padded_heads, required_topk
+        ):
             raise RuntimeError(
                 "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires a FlashInfer "
                 "DSV4 sparse MLA decode specialization for "
@@ -851,7 +901,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
-        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+        self._run_sparse_attention(
             query=q,
             swa_kv_cache=swa_cache,
             workspace_buffer=self._get_workspace(q.device),
@@ -970,7 +1020,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+            self._run_sparse_attention(
                 query=q_chunk,
                 swa_kv_cache=swa_kv_paged,
                 workspace_buffer=self._get_workspace(q.device),

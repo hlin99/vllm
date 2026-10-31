@@ -139,11 +139,13 @@ def sparse_attention(
     assert query.dtype == torch.bfloat16 and query.shape[-1] == 512
     assert query.stride(-1) == out.stride(-1) == 1
     assert swa_kv_cache.dtype == torch.uint8
+    assert swa_kv_cache.shape[-1] == 584
     assert out.shape == query.shape
     extra_width, extra_indices_stride = 0, 0
     extra_block, extra_stride = 1, 0
     if compressed_kv_cache is not None:
         assert compressed_kv_cache.dtype == torch.uint8
+        assert compressed_kv_cache.shape[-1] == 584
         assert extra_sparse_indices is not None
         assert extra_sparse_topk_lens is not None
         extra_width = extra_sparse_indices.shape[-1]
