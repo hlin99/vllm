@@ -37,6 +37,7 @@ from vllm.model_executor.layers.indexer_topk import (
     deep_select_topk,
     get_indexer_topk,
     is_deep_select_supported,
+    stable_topk,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
@@ -59,6 +60,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV4IndexerBackend,
     DeepseekV32IndexerMetadata,
     tp_prefill_row_sharding_supported,
 )
@@ -469,6 +471,7 @@ def sparse_attn_indexer(
     candidate_block_size: int = 0,
     candidate_write: bool = False,
     topk_backend: str = "auto",
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
@@ -570,12 +573,16 @@ def sparse_attn_indexer(
             candidate_blocks=candidate_blocks,
             candidate_block_size=candidate_block_size,
             candidate_write=candidate_write,
+            batch_invariant=batch_invariant,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
     slot_mapping = attn_metadata_narrowed.slot_mapping
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
+    if has_prefill:
+        assert attn_metadata_narrowed.prefill is not None
+        has_prefill = bool(attn_metadata_narrowed.prefill.chunks)
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
@@ -584,6 +591,11 @@ def sparse_attn_indexer(
         assert q_scale is not None, "use_fp4_cache=True requires q_scale"
     else:
         assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
+
+    if batch_invariant:
+        from vllm.model_executor.kernels.attention.dsa.batch_invariant import (
+            indexer_logits,
+        )
 
     # During speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens. Truncate k to avoid
@@ -750,7 +762,18 @@ def sparse_attn_indexer(
                     k_scale_cast = k_scale.view(
                         torch.int32 if mqa_logits_use_mx_scales() else torch.float32
                     ).squeeze(-1)
-                if current_platform.is_xpu():
+                if batch_invariant:
+                    row_ends = cu_seqlen_ke - cu_seqlen_ks
+                    logits = indexer_logits(
+                        q_slice,
+                        k_quant,
+                        weights[row_start:row_end],
+                        cu_seqlen_ke,
+                        chunk.max_seqlen_k,
+                        scales=k_scale.view(torch.float32).squeeze(-1),
+                        starts=cu_seqlen_ks,
+                    )
+                elif current_platform.is_xpu():
                     if q_scale_slice is not None:
                         raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
                     logits = torch.ops.vllm.xpu_fp8_mqa_logits(
@@ -811,7 +834,9 @@ def sparse_attn_indexer(
                             chunk_candidates,
                             candidate_block_size,
                         )
-                if use_deep_select:
+                if batch_invariant:
+                    stable_topk(logits, topk_indices)
+                elif use_deep_select:
                     deep_select_topk(
                         logits, topk_tokens, end=row_ends, output_idx=topk_indices
                     )
@@ -918,7 +943,20 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if current_platform.is_xpu():
+        if batch_invariant:
+            if next_n != 1:
+                raise NotImplementedError(
+                    "Batch-invariant sparse indexing requires single-token decode."
+                )
+            logits = indexer_logits(
+                padded_q_quant_cast[:, 0],
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens.reshape(-1),
+                max_model_len,
+                block_table=decode_metadata.block_table,
+            )
+        elif current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
@@ -991,14 +1029,17 @@ def sparse_attn_indexer(
 
         # The backend comes from the layer (config is only readable at model
         # construction); dispatchers are cached per backend.
-        get_indexer_topk(topk_backend)(
-            logits,
-            seq_lens,
-            next_n,
-            topk_indices,
-            topk_tokens,
-            attn_metadata_narrowed.max_seq_len,
-        )
+        if batch_invariant:
+            stable_topk(logits, topk_indices)
+        else:
+            get_indexer_topk(topk_backend)(
+                logits,
+                seq_lens,
+                next_n,
+                topk_indices,
+                topk_tokens,
+                attn_metadata_narrowed.max_seq_len,
+            )
 
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
@@ -1055,6 +1096,7 @@ def sparse_attn_indexer_fake(
     candidate_block_size: int = 0,
     candidate_write: bool = False,
     topk_backend: str = "auto",
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -1127,6 +1169,17 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
+        self.batch_invariant = (
+            envs.VLLM_BATCH_INVARIANT
+            and self.k_cache.get_attn_backend() is DeepseekV4IndexerBackend
+        )
+        if self.batch_invariant:
+            DeepseekV4IndexerBackend.validate_config(
+                vllm_config,
+                head_dim=head_dim,
+                use_fp4_cache=use_fp4_cache,
+                has_candidates=candidate_blocks is not None,
+            )
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
@@ -1219,6 +1272,7 @@ class SparseAttnIndexer(CustomOp):
             candidate_block_size=self.candidate_block_size,
             candidate_write=self.candidate_write,
             topk_backend=self.topk_backend,
+            batch_invariant=self.batch_invariant,
         )
 
     def forward_xpu(

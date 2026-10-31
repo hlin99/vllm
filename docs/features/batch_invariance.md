@@ -166,6 +166,18 @@ When batch invariance is enabled, vLLM:
 !!! note
     Enabling batch invariance may impact performance compared to the default non-deterministic mode. This trade-off is intentional to guarantee reproducibility.
 
+### DeepSeek V4 indexer on SM120
+
+The DeepSeek V4 indexer uses fixed-reduction Triton FP8 scoring for contiguous
+prefill and paged decode when `VLLM_BATCH_INVARIANT=1`. Stable selection breaks
+top-k cutoff ties by logical position, then selected indices are canonicalized.
+This requires a 128-dimensional FP8 indexer cache on CUDA SM120, without context
+parallelism, candidate filtering or speculative decoding. Other indexer paths
+are unchanged. This is indexer-only support, not full-model batch invariance;
+compression, sparse attention, mHC and linear layers need independent support.
+The reference-oriented scoring and stable sorting can be slower than the
+default kernels.
+
 ## Future Improvements
 
 The batch invariance feature is under active development. Planned improvements include:

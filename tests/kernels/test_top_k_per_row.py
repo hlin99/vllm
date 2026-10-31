@@ -117,6 +117,95 @@ def test_stable_topk_cutoff_ties_and_canonical_order(monkeypatch):
     assert (out[2] == -1).all()
 
 
+@pytest.mark.parametrize("phase", ["decode", "empty_prefill"])
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120),
+    reason="DeepSeek V4 BI indexer dispatch requires SM120",
+)
+def test_dsv4_indexer_forward_selects_stable_positions(monkeypatch, dist_init, phase):
+    """The real indexer dispatch must retain tie order and handle no compressed K."""
+    from vllm import _custom_ops as ops
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+    from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+    from vllm.models.deepseek_v4.attention import DeepseekV4IndexerCache
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepSeekV32IndexerDecodeMetadata,
+        DeepseekV32IndexerMetadata,
+        DeepseekV32IndexerPrefillMetadata,
+    )
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    cfg = VllmConfig(kernel_config={"enable_jit_warmup": False})
+    init_workspace_manager(torch.device("cuda"))
+    with set_current_vllm_config(cfg):
+        cache = DeepseekV4IndexerCache(
+            132, torch.uint8, "test_indexer", cfg.cache_config
+        )
+        cache.bind_kv_cache(
+            torch.zeros((1, 1, 64, 132), dtype=torch.uint8, device="cuda")
+        )
+        ops.indexer_k_quant_and_cache(
+            torch.ones((64, 128), dtype=torch.bfloat16, device="cuda"),
+            cache.kv_cache,
+            torch.arange(64, dtype=torch.int64, device="cuda"),
+            128,
+            "ue8m0",
+        )
+        buffer = torch.empty((3, 16), dtype=torch.int32, device="cuda")
+        indexer = SparseAttnIndexer(
+            cache,
+            128,
+            "ue8m0",
+            16,
+            128,
+            64,
+            192,
+            buffer,
+            skip_k_cache_insert=True,
+        )
+        for rows in (1, 3):
+            q = torch.ones((rows, 64, 128), device="cuda").to(torch.float8_e4m3fn)
+            lengths = torch.full((rows,), 33, dtype=torch.int32, device="cuda")
+            slots = torch.full_like(lengths, -1)
+            decode = phase == "decode"
+            metadata = DeepseekV32IndexerMetadata(
+                lengths,
+                64,
+                slots,
+                num_decodes=rows if decode else 0,
+                num_decode_tokens=rows if decode else 0,
+                num_prefills=0 if decode else rows,
+                num_prefill_tokens=0 if decode else rows,
+                decode=DeepSeekV32IndexerDecodeMetadata(
+                    block_table=torch.zeros(
+                        (rows, 1), dtype=torch.int32, device="cuda"
+                    ),
+                    seq_lens=lengths[:, None],
+                    decode_lens=torch.ones_like(lengths),
+                    requires_padding=False,
+                    schedule_metadata=torch.empty(0, dtype=torch.int32, device="cuda"),
+                )
+                if decode
+                else None,
+                prefill=None if decode else DeepseekV32IndexerPrefillMetadata([]),
+            )
+            with set_forward_context({cache.prefix: metadata}, cfg):
+                result = indexer(
+                    torch.zeros((rows, 128), device="cuda"),
+                    q,
+                    None,
+                    torch.ones((rows, 64), device="cuda"),
+                )
+            expected = (
+                torch.arange(16, dtype=torch.int32, device="cuda").expand(rows, -1)
+                if decode
+                else torch.full_like(buffer[:rows], -1)
+            )
+            assert torch.equal(result[:rows], expected)
+
+
 def _has_device_capability(major: int) -> bool:
     return current_platform.is_cuda() and current_platform.has_device_capability(major)
 

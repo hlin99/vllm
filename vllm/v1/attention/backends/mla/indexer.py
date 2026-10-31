@@ -333,6 +333,39 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
 
 class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
     @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        return (
+            cls is DeepseekV4IndexerBackend
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        )
+
+    @classmethod
+    def validate_config(
+        cls,
+        vllm_config: VllmConfig,
+        *,
+        head_dim: int,
+        use_fp4_cache: bool,
+        has_candidates: bool,
+    ) -> None:
+        parallel = vllm_config.parallel_config
+        if (
+            not cls.supports_batch_invariance()
+            or head_dim != 128
+            or use_fp4_cache
+            or has_candidates
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or vllm_config.speculative_config is not None
+        ):
+            raise NotImplementedError(
+                "Batch-invariant DeepSeek V4 indexing requires SM120, "
+                "128-dimensional FP8 cache, and no context parallelism, "
+                "candidate filtering or speculative decoding."
+            )
+
+    @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         # ROCm runs adaptive verification through the per-token flattened
         # indexer path, which derives row ownership from device decode lengths.
