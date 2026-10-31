@@ -8,44 +8,53 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+# 69a359f404：每个 token、每个投影通道独立归约完整特征维，不按 batch 拆 K。
 @triton.jit
 def _hc_prenorm_gemm(
     X, FN, OUT, SQ, xs, N: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr
 ):
-    row = tl.program_id(0).to(tl.int64)
-    n = tl.program_id(1)
-    k = tl.arange(0, BLOCK)
-    x = tl.load(X + row * xs + k, k < K, 0).to(tl.float32)
-    fn = tl.load(FN + n * K + k, k < K, 0)
-    tl.store(OUT + row * N + n, tl.sum(x * fn, 0))
-    if n == 0:
-        tl.store(SQ + row, tl.sum(x * x, 0))
+    # X/FN 是输入与投影权重；OUT/SQ 是投影值与平方和；xs 是输入行跨度。
+    # N 是投影通道数，K 是输入宽度，BLOCK 是补齐到二次幂后的归约宽度。
+    row = tl.program_id(0).to(tl.int64)  # 当前 token，地址使用 64 位。
+    n = tl.program_id(1)  # 当前投影输出通道。
+    k = tl.arange(0, BLOCK)  # 固定归约位置，不依赖 token 数量。
+    x = tl.load(X + row * xs + k, k < K, 0).to(tl.float32)  # 输入转 FP32。
+    fn = tl.load(FN + n * K + k, k < K, 0)  # 读取该输出通道的 FP32 权重。
+    tl.store(OUT + row * N + n, tl.sum(x * fn, 0))  # 固定树形归约得到投影值。
+    if n == 0:  # 平方和只需写一次，避免各输出通道重复写同一地址。
+        tl.store(SQ + row, tl.sum(x * x, 0))  # 后续 RMS 归一化所需的输入平方和。
 
 
 def hc_prenorm_gemm_batch_invariant(
     x: torch.Tensor, fn: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Project residual streams and sum their squares without batch-dependent splits."""
-    assert x.ndim == fn.ndim == 2 and x.shape[1] == fn.shape[1]
+    assert x.ndim == fn.ndim == 2 and x.shape[1] == fn.shape[1]  # 共享输入特征维。
     assert x.stride(1) == 1 and fn.is_contiguous() and fn.dtype == torch.float32
+    # 上一行保证内核的连续特征读取与 FP32 权重假设成立。
     out = torch.empty(
-        (1, x.shape[0], fn.shape[0]), dtype=torch.float32, device=x.device
+        (1, x.shape[0], fn.shape[0]),
+        dtype=torch.float32,
+        device=x.device,
+        # 保留长度为 1 的 split 维，与原 mHC 下游接口一致。
     )
-    sq = torch.empty((1, x.shape[0]), dtype=torch.float32, device=x.device)
-    if x.shape[0]:
+    sq = torch.empty(
+        (1, x.shape[0]), dtype=torch.float32, device=x.device
+    )  # 每行平方和。
+    if x.shape[0]:  # 没有 token 时直接返回空结果，不启动内核。
         _hc_prenorm_gemm[(x.shape[0], fn.shape[0])](
-            x,
-            fn,
-            out,
-            sq,
-            x.stride(0),
-            fn.shape[0],
-            x.shape[1],
-            triton.next_power_of_2(x.shape[1]),
-            num_warps=8,
-            enable_fp_fusion=False,
+            x,  # 输入残差流展平后的矩阵。
+            fn,  # mHC 投影权重。
+            out,  # 投影结果。
+            sq,  # 输入平方和。
+            x.stride(0),  # token 行跨度。
+            fn.shape[0],  # 投影输出通道数。
+            x.shape[1],  # 真实输入宽度。
+            triton.next_power_of_2(x.shape[1]),  # 固定归约树的补齐宽度。
+            num_warps=8,  # 固定执行配置。
+            enable_fp_fusion=False,  # 不融合乘加，固定浮点舍入方式。
         )
-    return out, sq
+    return out, sq  # 返回与原 split 接口兼容的投影结果和平方和。
 
 
 @triton.jit

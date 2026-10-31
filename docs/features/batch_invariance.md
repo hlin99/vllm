@@ -151,17 +151,32 @@ Other models may also work, but these have been explicitly validated. If you enc
 
 ### DeepSeek V4 on SM120
 
+<!-- e33d190dd5：新增的说明限定为单卡 SM120；不是所有 DeepSeek V4 配置的通用保证。 -->
+
 The single-GPU DeepSeek V4 FP8 path uses fixed-reduction Triton sparse attention
 for both prefill and decode, FP8 indexer scoring with stable cutoff tie-breaking,
 and fixed-reduction mHC projections. It also uses the existing Triton compressor
 and batch-invariant linear kernels. MXFP4 experts use the batch-invariant Humming
 backend; their weights remain quantized.
 
+<!--
+逐行解释：prefill/decode 共用固定归约的稀疏 attention；
+FP8 indexer 使用稳定的 cutoff 同分规则；mHC 投影也固定归约形状。
+compressor 和线性层复用 Triton 的确定性路径。
+MXFP4 专家交给支持批次不变性的 Humming 后端，权重不会因此全量反量化保存。
+-->
+
 This path requires `fp8_ds_mla` KV cache (the default), FP8 indexer cache, TP=DP=1,
 and no context parallelism or speculative decoding. It is selected automatically
 with `VLLM_BATCH_INVARIANT=1` on SM120. Other DeepSeek V4 configurations are not
 covered. The reference-oriented kernels can be substantially slower than the
 default path and are not intended to reproduce its batch-dependent logits.
+
+<!--
+逐行解释：只支持 fp8_ds_mla 主缓存、FP8 indexer 缓存和 TP=DP=1。
+不支持上下文并行或推测解码；环境变量开启后在 SM120 自动分派。
+这些参考取向内核可能明显更慢；保证自身跨 batch 一致，不保证与原快路径逐位相同。
+-->
 
 Validation on a six-layer DeepSeek-V4-Flash checkpoint compares every vocabulary
 logit across singleton and mixed batches, request order, prefix-cache hits, and
@@ -170,11 +185,21 @@ graphs. The 272-token budget forces a single-token prefill tail to exercise the
 transition to paged indexer scoring.
 This is not a model-quality evaluation of the full checkpoint.
 
+<!--
+e33d190dd5 新增六层真实模型回归；569f3f1de3 补入 272-token 预算。
+逐行解释：比较全词表 logits，覆盖单请求、混批、换序和前缀缓存命中。
+预算 256/272 走 eager，257/8192 允许 CUDA graphs。
+2177-token prompt 在预算 272 下留下单 token 尾块，覆盖分页 indexer 路径切换。
+此处仅说明确定性回归，不代表完整模型的质量评测。
+-->
+
 Run the six-layer regression with one command after installing the development
 environment and test dependencies:
 
 ```bash
+# 569f3f1de3：轻负载使用 3 个 filler，每请求生成 3 步。
 sh tests/v1/determinism/run_dsv4_e2e_light.sh /path/to/DeepSeek-V4-Flash-6layers
+# 同一测试的重负载使用 15 个 filler，每请求生成 512 步。
 sh tests/v1/determinism/run_dsv4_e2e_heavy.sh /path/to/DeepSeek-V4-Flash-6layers
 ```
 
@@ -182,6 +207,8 @@ sh tests/v1/determinism/run_dsv4_e2e_heavy.sh /path/to/DeepSeek-V4-Flash-6layers
 | ------ | --------------- | ---------------------------- |
 | Light | 3 | 3 |
 | Heavy | 15 | 512 |
+
+<!-- 569f3f1de3：两档仅改变负载大小，测试场景与判断标准相同。 -->
 
 Both runners use the same five scenarios and four execution configurations.
 They default to `../DeepSeek-V4-Flash-6layers` relative to the repository and
@@ -191,15 +218,26 @@ The readable test cases in `test_batch_invariance.py` compare all
 logit bits (including signed zero). Both runners exit nonzero on a mismatch.
 The shared `run_dsv4_e2e.sh` entrypoint is retained and defaults to heavy.
 
+<!--
+569f3f1de3 逐行解释：两种入口均运行五场景、四配置。
+默认权重路径相对仓库根目录解析；模型启动和逐场景进度直接输出到终端。
+仅保留目标请求的全词表结果以降低内存；比较原始位模式，连正负零都区分。
+任一不一致使脚本非零退出；原公共入口保留，默认使用 heavy 负载。
+-->
+
 The underlying regression uses the existing `VLLM_TEST_MODEL` override.
 `VLLM_TEST_HF_OVERRIDES` optionally supplies a JSON object for partial checkpoints:
 
 ```bash
+# e33d190dd5：选择六层权重，并用 JSON 覆盖层数、关闭 MTP、设置各层压缩率。
+# 后两行从指定测试文件中只选择新增的 raw-logits 回归。
 VLLM_TEST_MODEL=/path/to/DeepSeek-V4-Flash-6layers \
 VLLM_TEST_HF_OVERRIDES='{"num_hidden_layers":6,"num_nextn_predict_layers":0,"compress_ratios":[0,0,4,128,4,128]}' \
 .venv/bin/python -m pytest tests/v1/determinism/test_batch_invariance.py \
     -k test_raw_logits_bs1_vs_bsN_chunking_and_prefix_cache
 ```
+
+<!-- e33d190dd5：新增此小标题，把上面的 DSV4 专用限制与下方通用机制分开。 -->
 
 ### Shared implementation
 
@@ -213,6 +251,11 @@ When batch invariance is enabled, vLLM:
    runs without `torch.compile` using breakable CUDA graphs so tile configs follow the runtime batch size; set `VLLM_USE_BREAKABLE_CUDAGRAPH=0` to opt out.
 6. Splits the LoRA shrink reduction into 8 fixed K chunks that are summed in a fixed order instead of with atomics
 7. Sorts the shared sparse attention indexer's selected logical KV indices before attention, keeping invalid entries at the end. Sorting alone does not resolve selection ties at the top-k cutoff; the DeepSeek V4 path additionally uses stable selection to break ties by logical position.
+
+<!--
+e33d190dd5：补充第 7 项。选完后按索引排序只能固定读取顺序，不能固定同分时选谁。
+因此 DSV4 还需先稳定选出集合：分数相同的候选按逻辑位置优先。
+-->
 
 !!! warning
     Batch invariance under tensor parallelism is not yet supported for all-reduces whose size isn't a multiple of 16 bytes, for example a hidden size that isn't a multiple of 8 in fp16/bf16. Such tensors can switch between NCCL and custom all-reduce depending on batch size. All validated models meet this requirement.

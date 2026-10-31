@@ -761,16 +761,21 @@ def init_fp8_linear_kernel(
     )
 
     if activation_quant_key.scale.group_shape.is_per_group():
+        # e33d190dd5：CUDA 上仅为 DSV4 扩展此分派，保留其他模型的原有路径。
         from vllm.config import get_current_vllm_config_or_none
 
-        vllm_config = get_current_vllm_config_or_none()
+        vllm_config = (
+            get_current_vllm_config_or_none()
+        )  # 允许无模型配置的独立内核调用。
         is_dsv4 = (
-            vllm_config is not None
-            and vllm_config.model_config is not None
+            vllm_config is not None  # 必须处于有效配置上下文。
+            and vllm_config.model_config is not None  # 上下文中确实存在模型。
             and vllm_config.model_config.hf_text_config.model_type == "deepseek_v4"
+            # 精确限定 V4，不自动扩展到 V4.1 等其他架构。
         )
         if envs.VLLM_BATCH_INVARIANT and (
             current_platform.is_rocm() or (current_platform.is_cuda() and is_dsv4)
+            # 保留 ROCm 原有支持，并让 CUDA DSV4 使用下方固定归约 FP8 内核。
         ):
             force_kernel = _batch_invariant_fp8_kernel(
                 TritonFp8BlockScaledMMKernel,

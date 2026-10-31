@@ -988,8 +988,8 @@ steps:
     - vllm/distributed/device_communicators/
     - vllm/model_executor/determinism
     - vllm/model_executor/layers
-    - vllm/models/deepseek_v4/
-    - vllm/model_executor/kernels/mhc/
+    - vllm/models/deepseek_v4/  # e33d190dd5：模型侧分派变化需运行批次不变性测试。
+    - vllm/model_executor/kernels/mhc/  # e33d190dd5：mHC 归约变化也属于此测试依赖。
     - vllm/v1/attention
     - tests/v1/determinism/
   commands:

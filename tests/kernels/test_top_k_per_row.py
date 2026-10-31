@@ -88,33 +88,37 @@ def test_sparse_topk_batch_invariance(
 
 
 def test_stable_topk_cutoff_ties_and_canonical_order(monkeypatch):
+    # 5183d7ed85：同时检查 K 边界同分、候选不足、全无效以及索引规范顺序。
     from vllm.model_executor.layers.indexer_topk import (
-        canonicalize_topk_indices,
-        stable_topk,
+        canonicalize_topk_indices,  # 选中集合按位置排序，稳定后续 attention 读取顺序。
+        stable_topk,  # 稳定选择集合，解决边界同分时选谁的问题。
     )
 
-    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
-    device = current_platform.device_type
-    logits = torch.zeros((3, 604), device=device)
-    logits[:, 515] = 2
-    logits[:, 17] = 1
-    logits[1, 300:] = -float("inf")
-    logits[2] = -float("inf")
-    out = torch.empty((3, 512), device=device, dtype=torch.int32)
-    stable_topk(logits, out)
-    assert out[0, :2].tolist() == [515, 17]
-    single = torch.empty_like(out[1:2])
-    stable_topk(logits[1:2], single)
-    assert torch.equal(single[0], out[1])
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")  # 让规范化逻辑实际生效。
+    device = current_platform.device_type  # 使用当前测试设备。
+    logits = torch.zeros((3, 604), device=device)  # 大量零分制造 cutoff 同分。
+    logits[:, 515] = 2  # 最高分位置超出前 512 列。
+    logits[:, 17] = 1  # 次高分位于前 512 列内部。
+    logits[1, 300:] = -float("inf")  # 第二行只有 300 个有效候选。
+    logits[2] = -float("inf")  # 第三行没有任何有效候选。
+    out = torch.empty((3, 512), device=device, dtype=torch.int32)  # K=512。
+    stable_topk(logits, out)  # 先按分数稳定选择。
+    assert out[0, :2].tolist() == [515, 17]  # 非同分项必须优先按分数排序。
+    single = torch.empty_like(out[1:2])  # 为第二行准备独立输出。
+    stable_topk(logits[1:2], single)  # 相同行单独计算。
+    assert torch.equal(single[0], out[1])  # 选择结果不依赖混批。
 
-    canonicalize_topk_indices(out)
+    canonicalize_topk_indices(out)  # 再按逻辑位置排列，固定 attention 的归约顺序。
     expected = torch.cat(
         [torch.arange(511, device=device), torch.tensor([515], device=device)]
+        # 前 511 个位置含次高分 17，再加最高分 515，合计 512 项。
     )
-    assert torch.equal(out[0], expected)
-    assert torch.equal(out[1, :300], torch.arange(300, device=device))
-    assert (out[1, 300:] == -1).all()
-    assert (out[2] == -1).all()
+    assert torch.equal(out[0], expected)  # 零分候选优先较小位置，集合与顺序均固定。
+    assert torch.equal(
+        out[1, :300], torch.arange(300, device=device)
+    )  # 有效项完整保留。
+    assert (out[1, 300:] == -1).all()  # 不足 K 的部分必须填无效哨兵。
+    assert (out[2] == -1).all()  # 全无效输入不能选出伪 KV。
 
 
 def _has_device_capability(major: int) -> bool:

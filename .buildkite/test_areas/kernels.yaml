@@ -452,7 +452,9 @@ steps:
   - vllm/v1/attention/backends/mla/flashmla.py
   - vllm/v1/attention/backends/mla/flashmla_sparse.py
   - vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
+  # e426be8173：indexer 固定归约实现变更时，触发稀疏 attention 内核测试。
   - vllm/model_executor/kernels/attention/dsa/batch_invariant.py
+  # caf5d70e2b31772b81dd85a82d590708baa89ccc：DSV4 固定归约 attention 触发同组测试。
   - vllm/models/deepseek_v4/nvidia/ops/batch_invariant.py
   - vllm/utils/flashinfer.py
   - tests/kernels/attention/test_flashinfer_mla_decode.py

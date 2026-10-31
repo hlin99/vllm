@@ -282,11 +282,11 @@ def matmul_descriptor_persistent(
 
 
 def matmul_persistent(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    *,
-    out_dtype: torch.dtype | None = None,
+    a: torch.Tensor,  # e33d190dd5：原有左矩阵参数拆行，保持调用兼容。
+    b: torch.Tensor,  # 原有右矩阵参数。
+    bias: torch.Tensor | None = None,  # 原有可选偏置。
+    *,  # 新增的输出类型只能通过关键字传入。
+    out_dtype: torch.dtype | None = None,  # 可保留 FP32 输出，避免先舍入到 BF16。
 ):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -300,6 +300,7 @@ def matmul_persistent(
     dtype = a.dtype
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=out_dtype or dtype)
+    # e33d190dd5：显式 out_dtype 优先；未指定时仍使用左输入 dtype。
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):

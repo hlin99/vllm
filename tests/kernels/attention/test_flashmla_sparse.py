@@ -4,111 +4,140 @@ import pytest
 import torch
 
 
+# caf5d70e2b31772b81dd85a82d590708baa89ccc
+# 分别覆盖无压缩 KV、单项、跨 32 项 tile 边界和整 tile。
 @pytest.mark.parametrize("extra_len", [0, 1, 33, 64])
 def test_dsv4_triton_attention_batch_invariance(extra_len):
     from vllm.models.deepseek_v4.nvidia.ops.batch_invariant import sparse_attention
 
-    torch.manual_seed(7)
-    block_size = 64
+    torch.manual_seed(7)  # 固定 query、KV 和 sink 的随机输入。
+    block_size = 64  # 每页 64 个物理 token。
     # Leave padding between pages, as in the shared MLA/compressor allocation.
     backing = torch.zeros((2, block_size * 584 + 576), dtype=torch.uint8, device="cuda")
+    # 上一行刻意让页间存在额外空隙，验证内核使用真实 stride 而非紧凑页大小。
     cache = backing[:, : block_size * 584].view(2, block_size, 1, 584)
+    # 584 是每 token 的平均字节数：576 字节数据 + 8 字节 scale。
     values = torch.randint(-4, 5, (128, 512), device="cuda").to(torch.bfloat16)
-    for page in range(2):
-        data = backing[page, : block_size * 576].view(block_size, 576)
+    # 小整数可被 FP8 精确表示，便于排除量化误差干扰缓存读取测试。
+    for page in range(2):  # 手动构造两页真实 fp8_ds_mla 字节布局。
+        data = backing[page, : block_size * 576].view(block_size, 576)  # 页内数据区。
         data[:, :448] = (
-            values[page * 64 : (page + 1) * 64, :448]
-            .to(torch.float8_e4m3fn)
-            .view(torch.uint8)
+            values[page * 64 : (page + 1) * 64, :448]  # 取该页的非 RoPE 特征。
+            .to(torch.float8_e4m3fn)  # 转为 FP8 数值。
+            .view(torch.uint8)  # 以字节形式写入缓存。
         )
         data[:, 448:] = values[page * 64 : (page + 1) * 64, 448:].view(torch.uint8)
-        backing[page, block_size * 576 : block_size * 584] = 127
-    q = torch.randn((3, 4, 512), device="cuda", dtype=torch.bfloat16) * 0.1
-    sinks = torch.randn(4, device="cuda")
+        # RoPE 的 64 个 BF16 元素占 128 字节，直接保留原始精度。
+        backing[page, block_size * 576 : block_size * 584] = 127  # UE8M0 比例设为 1。
+    q = (
+        torch.randn((3, 4, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+    )  # 3 行、4 头。
+    sinks = torch.randn(4, device="cuda")  # 每头一个 sink。
     indices = torch.arange(64, device="cuda", dtype=torch.int32).expand(3, -1).clone()
-    lengths = torch.tensor([0, 31, 64], device="cuda", dtype=torch.int32)
-    extra = indices + 64
-    extra_lengths = torch.full_like(lengths, extra_len)
-    out = torch.empty_like(q)
+    lengths = torch.tensor(
+        [0, 31, 64], device="cuda", dtype=torch.int32
+    )  # 不同滑窗长度。
+    extra = indices + 64  # 第二页作为压缩分支，与滑窗页区分。
+    extra_lengths = torch.full_like(lengths, extra_len)  # 压缩分支有效长度。
+    out = torch.empty_like(q)  # 接收 batch 计算结果。
 
     def run(query, indices, lengths, extra, extra_lengths, out):
+        # batch 与 singleton 都通过完全相同的调用参数路径。
         sparse_attention(
-            query=query,
-            swa_kv_cache=cache,
-            sparse_indices=indices,
-            swa_topk_lens=lengths,
-            sinks=sinks,
-            out=out,
-            bmm1_scale=512**-0.5,
-            compressed_kv_cache=cache if extra_len else None,
-            extra_sparse_indices=extra if extra_len else None,
-            extra_sparse_topk_lens=extra_lengths if extra_len else None,
+            query=query,  # 当前待测 query。
+            swa_kv_cache=cache,  # 使用真实分页缓存。
+            sparse_indices=indices,  # 滑窗物理索引。
+            swa_topk_lens=lengths,  # 滑窗有效长度。
+            sinks=sinks,  # 所有调用共用相同 sink。
+            out=out,  # 调用方提供输出。
+            bmm1_scale=512**-0.5,  # 标准 head_dim 的负二分之一次方缩放。
+            compressed_kv_cache=cache if extra_len else None,  # 0 长时关闭压缩分支。
+            extra_sparse_indices=extra if extra_len else None,  # 压缩位置。
+            extra_sparse_topk_lens=extra_lengths if extra_len else None,  # 有效数目。
         )
 
-    run(q, indices, lengths, extra, extra_lengths, out)
-    for i, length in enumerate(lengths.cpu().tolist()):
+    run(q, indices, lengths, extra, extra_lengths, out)  # 先一次处理三行 query。
+    for i, length in enumerate(lengths.cpu().tolist()):  # 逐行生成数学参考值。
         kv = torch.cat([values[:length], values[64 : 64 + extra_len]]).float()
-        scores = q[i].float() @ kv.T * 512**-0.5
+        # 把该行实际可见的滑窗与压缩 KV 拼接，做联合 attention。
+        scores = q[i].float() @ kv.T * 512**-0.5  # FP32 参考点积。
         probs = torch.softmax(torch.cat([scores, sinks[:, None]], dim=1), dim=1)
+        # sink 参与分母，但其 value 为零，因此下面不把 sink 列乘入 KV。
         reference = probs[:, :-1] @ kv
         torch.testing.assert_close(out[i].float(), reference, atol=0.008, rtol=0.008)
-        single = torch.empty_like(q[i : i + 1])
+        # 上一行验证数学正确性，允许最终 BF16 舍入；下面检查 batch 逐位一致性。
+        single = torch.empty_like(q[i : i + 1])  # 单行输出缓冲区。
         run(
-            q[i : i + 1],
-            indices[i : i + 1],
-            lengths[i : i + 1],
-            extra[i : i + 1],
-            extra_lengths[i : i + 1],
-            single,
+            q[i : i + 1],  # 仅取当前 query，其他输入保持不变。
+            indices[i : i + 1],  # 对应滑窗索引。
+            lengths[i : i + 1],  # 对应滑窗长度。
+            extra[i : i + 1],  # 对应压缩索引。
+            extra_lengths[i : i + 1],  # 对应压缩长度。
+            single,  # 独立输出缓冲区。
         )
-        assert torch.equal(single[0], out[i])
+        assert torch.equal(single[0], out[i])  # 同一 query 单独/混批计算必须完全相同。
 
 
 def test_dsv4_triton_indexer_prefill_decode_batch_invariance():
     """Score the real indexer cache identically through gather and paged reads."""
-    from vllm import _custom_ops as ops
+    # e426be8173：用真实缓存写入与 gather，验证两种读取布局和 batch 变化。
+    from vllm import _custom_ops as ops  # 调用生产环境的 indexer 缓存操作。
     from vllm.model_executor.kernels.attention.dsa.batch_invariant import (
-        indexer_logits,
+        indexer_logits,  # 待测固定归约评分接口。
     )
 
-    torch.manual_seed(9)
-    q = torch.randn((3, 64, 128), device="cuda").to(torch.float8_e4m3fn)
+    torch.manual_seed(9)  # 保证随机测试输入可复现。
+    q = torch.randn((3, 64, 128), device="cuda").to(
+        torch.float8_e4m3fn
+    )  # 3 行、64 头。
     unquantized_k = torch.randn((128, 128), device="cuda", dtype=torch.bfloat16)
-    k = torch.empty((128, 128), device="cuda", dtype=torch.float8_e4m3fn)
-    scales = torch.empty(128, device="cuda", dtype=torch.float32)
-    weights = torch.rand((3, 64), device="cuda")
-    starts = torch.zeros(3, device="cuda", dtype=torch.int32)
-    ends = torch.tensor([0, 33, 128], device="cuda", dtype=torch.int32)
+    k = torch.empty(
+        (128, 128), device="cuda", dtype=torch.float8_e4m3fn
+    )  # gather 目标。
+    scales = torch.empty(128, device="cuda", dtype=torch.float32)  # gather 出的比例。
+    weights = torch.rand((3, 64), device="cuda")  # 各 query 的头合并权重。
+    starts = torch.zeros(3, device="cuda", dtype=torch.int32)  # 同一个请求从零开始。
+    ends = torch.tensor(
+        [0, 33, 128], device="cuda", dtype=torch.int32
+    )  # 覆盖空与跨 tile。
     storage = torch.zeros((2, 64 * 132 + 256), device="cuda", dtype=torch.uint8)
-    cache = storage[:, : 64 * 132].view(2, 64, 1, 132)
+    cache = storage[:, : 64 * 132].view(2, 64, 1, 132)  # 页间额外保留 256 字节。
     slots = (torch.arange(128, device="cuda", dtype=torch.int64) + 64) % 128
+    # 上一行交换两页的物理位置，防止错误地按逻辑页直接读取却通过测试。
     ops.indexer_k_quant_and_cache(unquantized_k, cache.squeeze(2), slots, 128, "ue8m0")
-    table = torch.tensor([[1, 0]] * 3, device="cuda", dtype=torch.int32)
+    # 使用真实量化写入，验证 scale 区编码，而不是伪造缓存对象。
+    table = torch.tensor([[1, 0]] * 3, device="cuda", dtype=torch.int32)  # 反向页映射。
     ops.cp_gather_indexer_k_quant_cache(
-        cache.squeeze(2),
-        k,
-        scales.view(torch.uint8).view(128, 4),
-        table[:1],
-        torch.tensor([0, 128], device="cuda", dtype=torch.int32),
+        cache.squeeze(2),  # 去掉单 KV head 维，匹配生产 gather 接口。
+        k,  # 输出连续 FP8 key。
+        scales.view(torch.uint8).view(128, 4),  # 每个 FP32 scale 对应 4 字节。
+        table[:1],  # gather 只需该请求的一份块表。
+        torch.tensor([0, 128], device="cuda", dtype=torch.int32),  # 请求拼接范围。
     )
     dense = indexer_logits(q, k, weights, ends, 128, scales=scales, starts=starts)
+    # 上一行模拟 prefill 的连续布局，下一行模拟 decode 的分页布局。
     paged = indexer_logits(q, cache, weights, ends, 128, block_table=table)
-    assert torch.equal(dense, paged)
+    assert torch.equal(dense, paged)  # 两种布局对相同 query 必须得到相同分数。
     reference = torch.einsum("mhd,nd->mhn", q.float(), k.float()).clamp_min(0)
-    reference = (reference * weights[:, :, None]).sum(1) * scales
-    for row, end in enumerate(ends.cpu().tolist()):
+    # FP32 参考：每头 QK 点积先做 ReLU。
+    reference = (reference * weights[:, :, None]).sum(1) * scales  # 加权合头并反量化。
+    for row, end in enumerate(ends.cpu().tolist()):  # 只比较各行可见范围。
         torch.testing.assert_close(
-            dense[row, :end], reference[row, :end], atol=1e-4, rtol=1e-5
+            dense[row, :end],
+            reference[row, :end],
+            atol=1e-4,
+            rtol=1e-5,
+            # 数学参考用近似比较；下面的 batch 不变性用精确比较。
         )
         single = indexer_logits(
-            q[row : row + 1],
-            cache,
-            weights[row : row + 1],
-            ends[row : row + 1],
-            128,
-            block_table=table[row : row + 1],
+            q[row : row + 1],  # 单独计算当前 query。
+            cache,  # 保持相同物理缓存。
+            weights[row : row + 1],  # 保持相同头权重。
+            ends[row : row + 1],  # 保持相同因果边界。
+            128,  # 保持候选宽度。
+            block_table=table[row : row + 1],  # 保持相同物理映射。
         )
-        assert torch.equal(single[0], paged[row])
+        assert torch.equal(single[0], paged[row])  # 单独/混批打分结果完全一致。
 
 
 @pytest.mark.parametrize("sm120", [False, True])

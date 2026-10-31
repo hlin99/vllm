@@ -332,11 +332,12 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
 
 
 class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
+    # e33d190dd5：只为本后端的 SM120 实现声明能力，不自动传给所有子类。
     @classmethod
     def supports_batch_invariance(cls) -> bool:
         return (
-            cls is DeepseekV4IndexerBackend
-            and current_platform.is_device_capability_family(120)
+            cls is DeepseekV4IndexerBackend  # 防止继承此方法的其他 indexer 被误标支持。
+            and current_platform.is_device_capability_family(120)  # 限定已接入硬件族。
         )
 
     @classmethod

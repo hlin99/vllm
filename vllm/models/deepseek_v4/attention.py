@@ -696,14 +696,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                if envs.VLLM_BATCH_INVARIANT:
+                if envs.VLLM_BATCH_INVARIANT:  # e33d190dd5：主 KV compressor 投影分流。
                     from vllm.model_executor.determinism.batch_invariant import (
-                        matmul_persistent,
+                        matmul_persistent,  # 使用固定归约矩阵乘，避免 batch 改变结果。
                     )
 
                     return matmul_persistent(
-                        hidden_states,
-                        compressor.fused_wkv_wgate.weight.T,
+                        hidden_states,  # 当前层全部 token 的 hidden states。
+                        compressor.fused_wkv_wgate.weight.T,  # 合并 KV 与 gate 投影。
+                        # 保留 FP32，不能先舍入到 BF16 再转换。
                         out_dtype=torch.float32,
                     )
                 return torch.mm(
@@ -723,15 +724,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
-                if envs.VLLM_BATCH_INVARIANT:
+                if (
+                    envs.VLLM_BATCH_INVARIANT
+                ):  # e33d190dd5：indexer compressor 同样分流。
                     from vllm.model_executor.determinism.batch_invariant import (
-                        matmul_persistent,
+                        matmul_persistent,  # 与主 compressor 共用固定归约实现。
                     )
 
                     return matmul_persistent(
-                        hidden_states,
+                        hidden_states,  # 输入仍是本层 hidden states。
+                        # indexer 自己的权重。
                         indexer.compressor.fused_wkv_wgate.weight.T,
-                        out_dtype=torch.float32,
+                        out_dtype=torch.float32,  # gate 分数和 KV 中间值均保留 FP32。
                     )
                 return torch.mm(
                     hidden_states,

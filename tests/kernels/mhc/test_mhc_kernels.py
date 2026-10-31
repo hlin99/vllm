@@ -52,62 +52,71 @@ from vllm.utils.torch_utils import set_random_seed
 DEVICE = current_platform.device_type
 
 
+# 69a359f404：覆盖普通 hidden 宽度和多个残差流展平后的宽度。
 @pytest.mark.parametrize("width", [4096, 16384])
 def test_hc_prenorm_triton_batch_invariant(width):
     from vllm.model_executor.kernels.mhc.triton import (
-        hc_prenorm_gemm_batch_invariant as hc_prenorm,
+        hc_prenorm_gemm_batch_invariant as hc_prenorm,  # 待测固定归约入口。
     )
 
-    torch.manual_seed(42)
-    x = torch.randn((7, width), device=DEVICE, dtype=torch.bfloat16)
-    fn = torch.randn((24, width), device=DEVICE)
-    mixes, sq = hc_prenorm(x, fn)
-    reference = x.double() @ fn.double().T
+    torch.manual_seed(42)  # 固定输入。
+    x = torch.randn((7, width), device=DEVICE, dtype=torch.bfloat16)  # 7 个 token。
+    fn = torch.randn((24, width), device=DEVICE)  # 24 个 FP32 投影通道。
+    mixes, sq = hc_prenorm(x, fn)  # 同时得到投影值与归一化所需平方和。
+    reference = x.double() @ fn.double().T  # 用 FP64 参考检查 FP32 归约精度。
     torch.testing.assert_close(mixes[0].double(), reference, atol=1e-4, rtol=1e-5)
+    # mixes 首维保留兼容 split 接口的长度 1。
     torch.testing.assert_close(
-        sq[0].double(), x.double().square().sum(-1), atol=0.002, rtol=1e-6
+        sq[0].double(),
+        x.double().square().sum(-1),
+        atol=0.002,
+        rtol=1e-6,
+        # 单独验证平方和，避免投影正确却破坏 RMS 归一化。
     )
-    for i in (0, 3, 6):
-        single_mix, single_sq = hc_prenorm(x[i : i + 1], fn)
-        assert torch.equal(single_mix[0, 0], mixes[0, i])
-        assert torch.equal(single_sq[0, 0], sq[0, i])
+    for i in (0, 3, 6):  # 取批次开头、中间、结尾。
+        single_mix, single_sq = hc_prenorm(x[i : i + 1], fn)  # 原输入单独再算一次。
+        assert torch.equal(single_mix[0, 0], mixes[0, i])  # 投影结果不依赖 batch。
+        assert torch.equal(single_sq[0, 0], sq[0, i])  # 平方和同样逐位一致。
 
 
 def test_mhc_fused_post_pre_batch_invariant(monkeypatch):
     from vllm.model_executor.kernels.mhc.tilelang import mhc_fused_post_pre_tilelang
 
-    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
-    torch.manual_seed(3)
-    x = torch.randn((129, 4096), dtype=torch.bfloat16, device=DEVICE)
-    residual = torch.randn((129, 4, 4096), dtype=torch.bfloat16, device=DEVICE)
-    post = torch.rand((129, 4, 1), device=DEVICE)
-    comb = torch.rand((129, 4, 4), device=DEVICE)
-    fn = torch.randn((24, 16384), device=DEVICE) * 0.01
-    scale = torch.ones(3, device=DEVICE)
-    base = torch.zeros(24, device=DEVICE)
-    norm = torch.ones(4096, dtype=torch.bfloat16, device=DEVICE)
-    reference = None
-    for n in (1, 17, 129):
+    # 69a359f404：从真实 mHC 入口检查不同 batch 大小时的内核分派。
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")  # 开启确定性路径，测试后自动恢复。
+    torch.manual_seed(3)  # 固定完整输入，再切不同前缀。
+    x = torch.randn((129, 4096), dtype=torch.bfloat16, device=DEVICE)  # 当前层输出。
+    residual = torch.randn(
+        (129, 4, 4096), dtype=torch.bfloat16, device=DEVICE
+    )  # 4 残差流。
+    post = torch.rand((129, 4, 1), device=DEVICE)  # 输出写入残差流的混合权重。
+    comb = torch.rand((129, 4, 4), device=DEVICE)  # 残差流间的组合权重。
+    fn = torch.randn((24, 16384), device=DEVICE) * 0.01  # 展平残差流的投影。
+    scale = torch.ones(3, device=DEVICE)  # mHC 三类混合参数的缩放。
+    base = torch.zeros(24, device=DEVICE)  # 混合参数偏置。
+    norm = torch.ones(4096, dtype=torch.bfloat16, device=DEVICE)  # RMSNorm 权重。
+    reference = None  # 保存 batch=1 时的首 token 结果。
+    for n in (1, 17, 129):  # 跨过不同 batch 调度规模。
         outputs = mhc_fused_post_pre_tilelang(
-            x[:n],
-            residual[:n],
-            post[:n],
-            comb[:n],
-            fn,
-            scale,
-            base,
-            1e-6,
-            1e-6,
-            1e-6,
-            2.0,
-            20,
-            norm_weight=norm,
+            x[:n],  # 同一批输入的前 n 行。
+            residual[:n],  # 对应残差流。
+            post[:n],  # 对应 post 混合。
+            comb[:n],  # 对应残差组合。
+            fn,  # 固定投影权重。
+            scale,  # 固定混合缩放。
+            base,  # 固定混合偏置。
+            1e-6,  # RMS 归一化 epsilon。
+            1e-6,  # pre 混合 epsilon。
+            1e-6,  # Sinkhorn 归一化 epsilon。
+            2.0,  # post 混合乘数。
+            20,  # Sinkhorn 迭代次数。
+            norm_weight=norm,  # 固定 RMSNorm 权重。
         )
         if reference is None:
-            reference = outputs
+            reference = outputs  # 首次记录 batch=1 的输出元组。
         else:
-            for output, expected in zip(outputs, reference):
-                assert torch.equal(output[0], expected[0])
+            for output, expected in zip(outputs, reference):  # 检查每一个返回张量。
+                assert torch.equal(output[0], expected[0])  # 首 token 必须完全一致。
 
 
 @pytest.mark.parametrize(

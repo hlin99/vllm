@@ -37,7 +37,7 @@ from vllm.model_executor.layers.indexer_topk import (
     deep_select_topk,
     get_indexer_topk,
     is_deep_select_supported,
-    stable_topk,
+    stable_topk,  # e33d190dd5：接入 5183d7ed85 的同分稳定选择。
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
@@ -586,19 +586,20 @@ def sparse_attn_indexer(
     else:
         assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
 
-    if envs.VLLM_BATCH_INVARIANT:
+    if envs.VLLM_BATCH_INVARIANT:  # e33d190dd5：对未实现的组合显式报错。
         if (
-            use_fp4_cache
-            or use_pcp
-            or dcp_world_size != 1
-            or candidate_blocks is not None
+            use_fp4_cache  # 固定归约 indexer 当前只实现 FP8。
+            or use_pcp  # 不支持 prefill context parallelism。
+            or dcp_world_size != 1  # 不支持 decode context parallelism。
+            or candidate_blocks is not None  # 不支持两级候选块过滤。
         ):
             raise NotImplementedError(
                 "Batch-invariant sparse indexing requires FP8 cache without "
                 "context parallelism or candidate filtering."
+                # 不悄悄退回非确定性实现，以免错误承诺逐位一致。
             )
         from vllm.model_executor.kernels.attention.dsa.batch_invariant import (
-            indexer_logits,
+            indexer_logits,  # 加载 prefill/decode 共用的固定归约打分实现。
         )
 
     # During speculative decoding, k may be padded to the CUDA graph batch
@@ -667,11 +668,13 @@ def sparse_attn_indexer(
         # MXFP4 (head_dim/2 bytes packed + head_dim/MXFP4_BLOCK_SIZE ue8m0
         # scales) based on use_fp4_cache.
         # No chunks exist before the first compressed token.
+        # 8828db9bdb：还没凑够首个压缩组时 chunks 可为空；此前 max 空序列会抛错。
         workspace_manager = current_workspace_manager()
         values_spec, scales_spec = _gather_workspace_shapes(
             max(
                 (c.max_local_total_seq_lens for c in prefill_metadata.chunks),
-                default=0,
+                # 非空时仍取所有 chunk 所需的最大 workspace 长度。
+                default=0,  # 空时分配零长 workspace，后续 chunk 循环自然跳过。
             ),
             head_dim,
             fp8_dtype,
@@ -770,18 +773,18 @@ def sparse_attn_indexer(
                     k_scale_cast = k_scale.view(
                         torch.int32 if mqa_logits_use_mx_scales() else torch.float32
                     ).squeeze(-1)
-                if envs.VLLM_BATCH_INVARIANT:
-                    row_ends = cu_seqlen_ke - cu_seqlen_ks
+                if envs.VLLM_BATCH_INVARIANT:  # e33d190dd5：prefill 固定归约分支。
+                    row_ends = cu_seqlen_ke - cu_seqlen_ks  # 请求内可见 key 数。
                     logits = indexer_logits(
-                        q_slice,
-                        k_quant,
-                        weights[row_start:row_end],
-                        cu_seqlen_ke,
-                        chunk.max_seqlen_k,
-                        scales=k_scale.view(torch.float32).squeeze(-1),
-                        starts=cu_seqlen_ks,
+                        q_slice,  # 当前 chunk 的 FP8 query。
+                        k_quant,  # gather 后连续存放的 FP8 key。
+                        weights[row_start:row_end],  # 当前 query 对应的头权重。
+                        cu_seqlen_ke,  # 拼接缓存中的因果终点。
+                        chunk.max_seqlen_k,  # 以请求最大 key 长度作为输出宽度。
+                        scales=k_scale.view(torch.float32).squeeze(-1),  # 解读 scale。
+                        starts=cu_seqlen_ks,  # 每个 query 所属请求的拼接起点。
                     )
-                elif current_platform.is_xpu():
+                elif current_platform.is_xpu():  # 非确定性模式保留原 XPU 分派。
                     if q_scale_slice is not None:
                         raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
                     logits = torch.ops.vllm.xpu_fp8_mqa_logits(
@@ -842,9 +845,9 @@ def sparse_attn_indexer(
                             chunk_candidates,
                             candidate_block_size,
                         )
-                if envs.VLLM_BATCH_INVARIANT:
-                    stable_topk(logits, topk_indices)
-                elif use_deep_select:
+                if envs.VLLM_BATCH_INVARIANT:  # e33d190dd5：打分后仍需稳定处理同分。
+                    stable_topk(logits, topk_indices)  # 先按分数，再按逻辑位置选 K 项。
+                elif use_deep_select:  # 常规模式保留原高性能选择器。
                     deep_select_topk(
                         logits, topk_tokens, end=row_ends, output_idx=topk_indices
                     )
@@ -951,20 +954,21 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if envs.VLLM_BATCH_INVARIANT:
-            if next_n != 1:
+        if envs.VLLM_BATCH_INVARIANT:  # e33d190dd5：decode 直接读取分页 key。
+            if next_n != 1:  # 当前内核一行仅对应一个解码 query。
                 raise NotImplementedError(
                     "Batch-invariant sparse indexing requires single-token decode."
+                    # 推测解码的多 token 路径尚未实现，不允许隐式降级。
                 )
             logits = indexer_logits(
-                padded_q_quant_cast[:, 0],
-                kv_cache,
-                weights[:num_padded_tokens],
-                seq_lens.reshape(-1),
-                max_model_len,
-                block_table=decode_metadata.block_table,
+                padded_q_quant_cast[:, 0],  # 去掉 next_n=1 的维度。
+                kv_cache,  # 直接使用分页 FP8 indexer 缓存。
+                weights[:num_padded_tokens],  # 包含图捕获 padding 行的头权重。
+                seq_lens.reshape(-1),  # 每行的可见 key 数，展平成连续接口。
+                max_model_len,  # 固定输出宽度，短序列尾部写负无穷。
+                block_table=decode_metadata.block_table,  # 逻辑页到物理页映射。
             )
-        elif current_platform.is_xpu():
+        elif current_platform.is_xpu():  # 常规模式沿用已有平台内核。
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
@@ -1030,16 +1034,18 @@ def sparse_attn_indexer(
 
         # The backend comes from the layer (config is only readable at model
         # construction); dispatchers are cached per backend.
-        if envs.VLLM_BATCH_INVARIANT:
-            stable_topk(logits, topk_indices)
+        if (
+            envs.VLLM_BATCH_INVARIANT
+        ):  # e33d190dd5：decode 与 prefill 使用同一选择规则。
+            stable_topk(logits, topk_indices)  # 同分优先较小位置，无效项填哨兵。
         else:
-            get_indexer_topk(topk_backend)(
-                logits,
-                seq_lens,
-                next_n,
-                topk_indices,
-                topk_tokens,
-                attn_metadata_narrowed.max_seq_len,
+            get_indexer_topk(topk_backend)(  # 原后端仅在未开启批次不变性时调用。
+                logits,  # 候选分数。
+                seq_lens,  # 各请求有效长度。
+                next_n,  # 每个请求的 query 数。
+                topk_indices,  # 写入选中位置。
+                topk_tokens,  # K 值。
+                attn_metadata_narrowed.max_seq_len,  # 当前批次最长序列。
             )
 
         if decode_metadata.global_seq_lens is not None:

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
-import vllm.envs as envs
+import vllm.envs as envs  # e33d190dd5：选择固定归约实现或原 FlashInfer 实现。
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -119,9 +119,11 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
 
     @classmethod
     def supports_batch_invariance(cls) -> bool:
-        from vllm.platforms import current_platform
+        from vllm.platforms import current_platform  # e33d190dd5：查询当前 GPU 架构。
 
-        return current_platform.is_device_capability_family(120)
+        return current_platform.is_device_capability_family(
+            120
+        )  # 仅 SM120 路径已接入。
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
@@ -200,9 +202,11 @@ class DeepseekSparseSWAFlashInferMetadataBuilder(DeepseekSparseSWAMetadataBuilde
 
 
 class DeepseekSparseSWAFlashInferBackend(DeepseekSparseSWABackend):
+    # e33d190dd5：滑窗缓存后端与主稀疏后端使用相同的批次不变性能力条件。
     @classmethod
     def supports_batch_invariance(cls) -> bool:
         return DeepseekV4FlashInferMLASparseBackend.supports_batch_invariance()
+        # 复用主后端判断，避免两个缓存分支宣称不同的支持范围。
 
     @staticmethod
     def get_builder_cls() -> type[DeepseekSparseSWAFlashInferMetadataBuilder]:
@@ -635,14 +639,15 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     use_fp8_ds_mla_layout: ClassVar[bool] = True
 
     def _run_sparse_attention(self, **kwargs) -> None:
+        # e33d190dd5：prefill/decode 通过同一入口选择内核，避免两路数值实现不同。
         if envs.VLLM_BATCH_INVARIANT:
-            from .ops.batch_invariant import sparse_attention
+            from .ops.batch_invariant import sparse_attention  # 固定归约 Triton 实现。
 
-            kwargs.pop("workspace_buffer")
-            kwargs.pop("kv_layout")
-            sparse_attention(**kwargs)
+            kwargs.pop("workspace_buffer")  # Triton 实现不使用 FlashInfer workspace。
+            kwargs.pop("kv_layout")  # Triton 实现固定解释 fp8_ds_mla 布局。
+            sparse_attention(**kwargs)  # 保留相同索引、长度、sink 与输出参数。
         else:
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(**kwargs)
+            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(**kwargs)  # 常规模式不变。
 
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:
@@ -872,7 +877,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
-        self._run_sparse_attention(
+        self._run_sparse_attention(  # e33d190dd5：decode 不再绕过统一的确定性分派。
             query=q,
             swa_kv_cache=swa_cache,
             workspace_buffer=self._get_workspace(q.device),
@@ -991,7 +996,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
-            self._run_sparse_attention(
+            self._run_sparse_attention(  # e33d190dd5：prefill 也使用同一固定归约内核。
                 query=q_chunk,
                 swa_kv_cache=swa_kv_paged,
                 workspace_buffer=self._get_workspace(q.device),

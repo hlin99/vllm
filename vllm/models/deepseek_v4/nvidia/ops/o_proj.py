@@ -5,7 +5,7 @@ from collections.abc import Callable
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
+import vllm.envs as envs  # e33d190dd5：输出投影也必须遵守批次不变性开关。
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
@@ -61,7 +61,7 @@ def deep_gemm_fp8_o_proj(
     """
     use_fp8 = wo_a.weight.dtype == torch.float8_e4m3fn
     if envs.VLLM_BATCH_INVARIANT:
-        tma_aligned_scales = False
+        tma_aligned_scales = False  # e33d190dd5：改用下面 Triton MM 接受的 scale 布局。
     if isinstance(o, QuantizedActivation):
         assert use_fp8
         o_proj_input, o_scale = o.data[:, :n_groups], o.scale[:, :n_groups]
@@ -89,23 +89,29 @@ def deep_gemm_fp8_o_proj(
             if hasattr(wo_a, "weight_scale")
             else wo_a.weight_scale_inv
         )
-        if envs.VLLM_BATCH_INVARIANT:
+        if envs.VLLM_BATCH_INVARIANT:  # e33d190dd5：替换默认的 grouped FP8 einsum。
             from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-                w8a8_triton_block_scaled_mm,
+                w8a8_triton_block_scaled_mm,  # 使用现有 Triton 分块缩放矩阵乘。
             )
 
-            weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
-            scales = weight_scale.view(n_groups, o_lora_rank // 128, -1)
-            for group in range(n_groups):
+            weight = wo_a.weight.view(n_groups, o_lora_rank, -1)  # 还原每组权重矩阵。
+            scales = weight_scale.view(
+                n_groups, o_lora_rank // 128, -1
+            )  # 每 128 行一块。
+            for group in range(
+                n_groups
+            ):  # 各组独立计算，不按 batch 调整 grouped 调度。
                 z[:, group] = w8a8_triton_block_scaled_mm(
-                    o_proj_input[:, group].contiguous(),
-                    weight[group],
-                    o_scale[:, group].contiguous(),
-                    scales[group],
-                    [128, 128],
-                    torch.bfloat16,
+                    o_proj_input[
+                        :, group
+                    ].contiguous(),  # 当前组连续的 FP8 activation。
+                    weight[group],  # 当前组 FP8 权重。
+                    o_scale[:, group].contiguous(),  # activation scale。
+                    scales[group],  # weight scale。
+                    [128, 128],  # 权重的量化块形状。
+                    torch.bfloat16,  # 与原输出缓冲区一致的 BF16 结果。
                 )
-            return wo_b(z.flatten(1))
+            return wo_b(z.flatten(1))  # 拼平组维后做第二级输出投影，跳过原 einsum。
         fp8_einsum(
             "bhr,hdr->bhd",
             (o_proj_input, o_scale),

@@ -26,18 +26,26 @@ DEVICE_TYPE = current_platform.device_type
 
 @skip_unsupported
 def test_matmul_fp32_output_preserves_precision_and_batch_invariance():
-    torch.manual_seed(42)
+    # e33d190dd5：回归 compressor 所需的 FP32 输出，避免中途先舍入到 BF16。
+    torch.manual_seed(42)  # 固定输入矩阵。
     # Dyadic inputs isolate output rounding from FP32 accumulation error.
     a = torch.randint(-4, 5, (17, 4096), device=DEVICE_TYPE).to(torch.bfloat16) / 16
+    # 二进制可精确表示的小分数，让本测试的误差集中在输出 dtype，而非累积误差。
     b = (
         torch.randint(-4, 5, (1024, 4096), device=DEVICE_TYPE).to(torch.bfloat16).t()
-        / 16
+        / 16  # 转置后得到 [4096,1024] 右矩阵，使用相同精确小分数。
     )
-    output = bi.matmul_persistent(a, b, out_dtype=torch.float32)
-    reference = (a.cpu().double() @ b.cpu().double()).float()
-    torch.testing.assert_close(output.cpu(), reference, rtol=0, atol=0)
-    single = bi.matmul_persistent(a[3:4], b, out_dtype=torch.float32)
-    assert torch.equal(output[3:4], single)
+    output = bi.matmul_persistent(a, b, out_dtype=torch.float32)  # 直接写 FP32 结果。
+    reference = (
+        a.cpu().double() @ b.cpu().double()
+    ).float()  # CPU FP64 参考再转 FP32。
+    torch.testing.assert_close(
+        output.cpu(), reference, rtol=0, atol=0
+    )  # 不允许舍入损失。
+    single = bi.matmul_persistent(
+        a[3:4], b, out_dtype=torch.float32
+    )  # 第 4 行单独运行。
+    assert torch.equal(output[3:4], single)  # 同时验证 batch 不变性。
 
 
 @skip_unsupported

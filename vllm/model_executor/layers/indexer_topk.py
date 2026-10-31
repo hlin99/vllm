@@ -48,14 +48,17 @@ def canonicalize_topk_indices(indices: torch.Tensor) -> None:
     indices.copy_(ordered.masked_fill(ordered == sentinel, IDX_OOB_FILL_VALUE))
 
 
+# 5183d7ed85：边界同分也必须选同一组位置；只排序选后索引不足以解决这个问题。
 def stable_topk(logits: torch.Tensor, out: torch.Tensor) -> None:
     """Select by score, breaking cutoff ties by logical position."""
-    count = min(out.shape[1], logits.shape[1])
-    out.fill_(IDX_OOB_FILL_VALUE)
-    if count:
+    count = min(out.shape[1], logits.shape[1])  # 候选不足 K 个时只取实际列数。
+    out.fill_(IDX_OOB_FILL_VALUE)  # 未选满的输出位置预先标记为无效。
+    if count:  # 空候选集不排序。
         indices = torch.argsort(logits, dim=-1, descending=True, stable=True)[:, :count]
-        valid = logits.gather(1, indices) != -float("inf")
+        # 稳定降序排序：同分保留原始列顺序，即逻辑位置较小者优先。
+        valid = logits.gather(1, indices) != -float("inf")  # 负无穷候选不可见。
         out[:, :count].copy_(indices.masked_fill(~valid, IDX_OOB_FILL_VALUE))
+        # 将不可见候选恢复为无效哨兵，避免被当成真实 KV 位置。
 
 
 try:

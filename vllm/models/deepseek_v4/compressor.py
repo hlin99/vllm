@@ -7,7 +7,7 @@ from typing import Any, ClassVar, cast
 import torch
 from torch import nn
 
-import vllm.envs as envs
+import vllm.envs as envs  # e33d190dd5：读取批次不变性开关。
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -80,9 +80,10 @@ class CompressorBackend(AttentionBackend):
 
 
 class BatchInvariantCompressorBackend(CompressorBackend):
+    # e33d190dd5：仅由满足模型和硬件条件的 state cache 选择此能力声明。
     @classmethod
     def supports_batch_invariance(cls) -> bool:
-        return True
+        return True  # 告知 attention 后端检查，此 compressor 路径支持批次不变性。
 
 
 @dataclass
@@ -156,13 +157,14 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         self.dtype = dtype
         self.prefix = prefix
         self.kv_cache = torch.tensor([])
-        config = get_current_vllm_config()
+        config = get_current_vllm_config()  # e33d190dd5：构造时记录分派条件。
         self.batch_invariant = (
-            envs.VLLM_BATCH_INVARIANT
+            envs.VLLM_BATCH_INVARIANT  # 只有显式开启时才改变原来的计算路径。
             and config.model_config.hf_text_config.model_type == "deepseek_v4"
-            and current_platform.is_device_capability_family(120)
+            # 不扩展到共享组件的其他模型。
+            and current_platform.is_device_capability_family(120)  # 限定 SM120 系列。
         )
-        compilation_config = config.compilation_config
+        compilation_config = config.compilation_config  # 仍使用同一配置注册状态缓存。
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
@@ -207,8 +209,8 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        if self.batch_invariant:
-            return BatchInvariantCompressorBackend
+        if self.batch_invariant:  # e33d190dd5：与实际 compressor 内核分派保持一致。
+            return BatchInvariantCompressorBackend  # 仅受支持组合声明此能力。
         return CompressorBackend
 
 
@@ -334,9 +336,9 @@ class DeepseekCompressor(nn.Module):
                 compress_ratio=self.compress_ratio,
             )
             if (
-                current_platform.is_cuda()
-                and self.head_dim == 512
-                and not self.state_cache.batch_invariant
+                current_platform.is_cuda()  # e33d190dd5：保留普通 CUDA 主 KV 路径。
+                and self.head_dim == 512  # indexer 的 128 维路径不走这里。
+                and not self.state_cache.batch_invariant  # 确定性模式不预热 CuTe 内核。
             ):
                 from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (  # noqa: E501
                     _SPARSE_ATTN_COMPRESS_C128_BLOCK8_KERNEL,
@@ -489,14 +491,16 @@ class DeepseekCompressor(nn.Module):
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
         if (
-            current_platform.is_cuda()
-            and self.head_dim == 512
-            and not self.state_cache.batch_invariant
+            current_platform.is_cuda()  # e33d190dd5：与上面的预热条件同步。
+            and self.head_dim == 512  # 仅主 attention KV 的 CuTe 实现。
+            and not self.state_cache.batch_invariant  # 确定性模式继续走后面的 Triton。
         ):
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 _SPARSE_ATTN_COMPRESSOR_CUTEDSL_KERNEL,
             )
 
+            # 中文补充：e33d190dd5 后，下述旧说明不含批次不变性模式；
+            # 该模式跳过此分支，使用后面的单阶段 Triton compressor。
             # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
             # layout and the plain full-cache layout. The full-cache flags
             # are consumed only here.

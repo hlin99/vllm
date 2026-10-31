@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
-import json
+import json  # e33d190dd5：解析环境变量提供的部分 checkpoint 配置覆盖。
 import os
 import random
 
@@ -27,104 +27,161 @@ from vllm.platforms import current_platform
 @skip_unsupported
 def test_raw_logits_bs1_vs_bsN_chunking_and_prefix_cache():
     """Compare every vocabulary logit across batching, cache hits and chunk sizes."""
-    num_fillers = int(os.getenv("VLLM_TEST_NUM_FILLERS", "15"))
-    max_tokens = int(os.getenv("VLLM_TEST_MAX_TOKENS", "512"))
-    assert num_fillers > 0, "VLLM_TEST_NUM_FILLERS must be positive"
-    assert max_tokens > 0, "VLLM_TEST_MAX_TOKENS must be positive"
-    generator = torch.Generator().manual_seed(42)
+    # e33d190dd5：新增真实 LLM 端到端回归，不只比较生成 token，还比较全词表 logits。
+    # 569f3f1de3：把原先固定的 3 个 filler/3 个生成 token 改为可配置轻重负载。
+    num_fillers = int(os.getenv("VLLM_TEST_NUM_FILLERS", "15"))  # 默认 15 个干扰请求。
+    max_tokens = int(
+        os.getenv("VLLM_TEST_MAX_TOKENS", "512")
+    )  # 默认每请求生成 512 步。
+    assert num_fillers > 0, "VLLM_TEST_NUM_FILLERS must be positive"  # 必须实际混批。
+    assert max_tokens > 0, (
+        "VLLM_TEST_MAX_TOKENS must be positive"
+    )  # 至少比较一个生成步。
+    generator = torch.Generator().manual_seed(42)  # 独立 CPU 随机源，固定所有 prompt。
     needle = TokensPrompt(
         prompt_token_ids=torch.randint(10, 20000, (2177,), generator=generator).tolist()
+        # 目标请求长度为 2177，用于覆盖压缩边界与单 token prefill 尾块。
     )
     fillers = [
         TokensPrompt(
             prompt_token_ids=torch.randint(
-                10, 20000, (129 * n,), generator=generator
-            ).tolist()
+                10,
+                20000,
+                (129 * n,),
+                generator=generator,  # 569f3f1de3：长度随 n 增长。
+            ).tolist()  # 转成真实 TokensPrompt 所需的整数列表。
         )
-        for n in range(1, num_fillers + 1)
+        for n in range(1, num_fillers + 1)  # 替代原来的三个固定长度请求。
     ]
     sampling = SamplingParams(
+        temperature=0,  # 贪心生成，排除采样随机性。
+        max_tokens=max_tokens,  # 569f3f1de3：统一使用配置的生成长度。
+        ignore_eos=True,  # 不因 EOS 提前停止，保证每步均可比较。
+        logprobs=-1,  # 请求每一步全词表结果，而不是只保留少量 Top-K。
+        detokenize=False,  # 569f3f1de3：只检查 token/logits，不花时间解码文本。
+    )
+    filler_sampling = SamplingParams(
         temperature=0,
         max_tokens=max_tokens,
         ignore_eos=True,
-        logprobs=-1,
         detokenize=False,
+        # 569f3f1de3：干扰请求不保留全词表 logits，降低测试内存占用。
     )
-    filler_sampling = SamplingParams(
-        temperature=0, max_tokens=max_tokens, ignore_eos=True, detokenize=False
-    )
-    baseline = None
+    baseline = None  # 跨所有引擎配置共用同一份目标请求基线。
     # 2177 = 8 * 272 + 1 forces a single-token prefill tail onto the decode path.
+    # 569f3f1de3：新增预算 272；此前只有 256/257/8192，缺少单 token 尾块覆盖。
     for chunk_size, eager in ((256, True), (257, False), (272, True), (8192, False)):
         print(
+            # 显示配置切换。
             f"\n[E2E] Loading model: chunk={chunk_size}, eager={eager}",
-            flush=True,
+            flush=True,  # 569f3f1de3：立即输出，不让长时间模型加载看起来无进展。
         )
-        with contextlib.ExitStack() as cleanup:
+        with contextlib.ExitStack() as cleanup:  # 即使断言失败也执行引擎清理。
             llm = LLM(
-                TEST_MODEL,
-                tensor_parallel_size=int(os.getenv("VLLM_TEST_TP_SIZE", "1")),
+                TEST_MODEL,  # 通过现有 VLLM_TEST_MODEL 选择真实 checkpoint。
+                tensor_parallel_size=int(
+                    os.getenv("VLLM_TEST_TP_SIZE", "1")
+                ),  # 默认单卡。
                 disable_custom_all_reduce=os.getenv("VLLM_TEST_DISABLE_CUSTOM_AR")
-                == "1",
+                == "1",  # 保留测试环境对 custom all-reduce 的控制。
                 hf_overrides=json.loads(os.getenv("VLLM_TEST_HF_OVERRIDES", "{}")),
-                max_model_len=8192,
-                max_num_batched_tokens=chunk_size,
-                max_num_seqs=num_fillers + 1,
-                enforce_eager=eager,
+                # JSON 覆盖用于把完整架构配置匹配到六层裁剪权重。
+                max_model_len=8192,  # 固定请求总长度上限，排除配置间的其他变化。
+                max_num_batched_tokens=chunk_size,  # 改变调度预算与 prefill 分块形状。
+                max_num_seqs=num_fillers + 1,  # 569f3f1de3：容纳目标与所有干扰请求。
+                enforce_eager=eager,  # 分别覆盖 eager 和 CUDA graph 执行。
                 gpu_memory_utilization=float(
-                    os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.75")
+                    os.getenv(
+                        "VLLM_GPU_MEMORY_UTILIZATION", "0.75"
+                    )  # 默认使用 75% 显存。
                 ),
-                max_logprobs=-1,
-                logprobs_mode="raw_logits",
-                enable_prefix_caching=True,
-                enable_chunked_prefill=True,
+                max_logprobs=-1,  # 允许接口返回全词表，不设较小的 Top-K 上限。
+                logprobs_mode="raw_logits",  # 返回处理前 logits，而非归一化 logprob。
+                enable_prefix_caching=True,  # 必须覆盖前缀缓存命中与冷缓存差异。
+                enable_chunked_prefill=True,  # 让不同预算真正改变 prefill 切块。
             )
-            cleanup.callback(llm.llm_engine.engine_core.shutdown)
+            cleanup.callback(
+                llm.llm_engine.engine_core.shutdown
+            )  # 每个配置结束释放引擎。
             for case, prompts, row, reset in (
-                ("alone", [needle], 0, False),
-                ("prefix-hit", [needle], 0, False),
-                ("batch-first-cold", [needle, *fillers], 0, True),
-                ("batch-last-cold", [*fillers, needle], len(fillers), True),
+                ("alone", [needle], 0, False),  # 目标独立运行，作为首次基线。
+                ("prefix-hit", [needle], 0, False),  # 紧接着重用相同前缀缓存。
+                (
+                    "batch-first-cold",
+                    [needle, *fillers],
+                    0,
+                    True,
+                ),  # 冷缓存，目标在首位。
+                (
+                    "batch-last-cold",
+                    [*fillers, needle],
+                    len(fillers),
+                    True,
+                ),  # 目标在末位。
                 ("mixed-cached", [fillers[0], needle, *fillers[1:]], 1, False),
+                # 569f3f1de3：末位索引不再写死 3，混合缓存场景保留所有 filler。
             ):
-                print(f"[E2E] Running {case}: batch={len(prompts)}", flush=True)
-                if reset:
+                print(
+                    f"[E2E] Running {case}: batch={len(prompts)}", flush=True
+                )  # 场景进度。
+                if reset:  # 冷缓存场景必须清除上一轮留下的前缀。
                     llm.reset_prefix_cache()
                 # Only retain full-vocabulary logits for the target request.
-                params = [filler_sampling] * len(prompts)
-                params[row] = sampling
-                outputs = llm.generate(prompts, params, use_tqdm=False)
+                params = [filler_sampling] * len(
+                    prompts
+                )  # 569f3f1de3：默认不收集 logits。
+                params[row] = sampling  # 仅目标请求使用收集全词表的参数。
+                outputs = llm.generate(
+                    prompts, params, use_tqdm=False
+                )  # 走真实推理入口。
                 assert all(
-                    len(out.outputs[0].token_ids) == max_tokens for out in outputs
+                    len(out.outputs[0].token_ids) == max_tokens
+                    for out in outputs
+                    # 所有请求都必须完成规定步数，不能因提前退出掩盖问题。
                 )
-                result = outputs[row].outputs[0]
-                assert result.logprobs is not None
-                assert len(result.logprobs) == max_tokens
+                result = outputs[row].outputs[0]  # 取目标请求的唯一贪心候选。
+                assert result.logprobs is not None  # 确认确实收集到了 raw logits。
+                assert len(result.logprobs) == max_tokens  # 每个生成步均须有记录。
                 vocab_size = llm.llm_engine.vllm_config.model_config.get_vocab_size()
                 assert all(len(step) == vocab_size for step in result.logprobs)
+                # 上一行防止接口只返回局部 Top-K 而被误认为全词表一致。
                 logits = torch.tensor(
                     [
                         [step[token].logprob for token in range(vocab_size)]
-                        for step in result.logprobs
+                        # raw_logits 模式仍复用名为 logprob 的字段；按 token ID 排序。
+                        for step in result.logprobs  # 按生成步堆叠为 [步数,词表大小]。
                     ]
                 )
-                assert torch.isfinite(logits).all()
-                logit_bits = logits.view(torch.int32)
-                if baseline is None:
-                    baseline = (result.token_ids, logit_bits)
+                assert torch.isfinite(
+                    logits
+                ).all()  # NaN/Inf 直接失败，不当成一致输出。
+                logit_bits = logits.view(
+                    torch.int32
+                )  # 按原始位比较，能区分正零与负零。
+                if baseline is None:  # 仅第一次独立请求建立基线，后面不重置。
+                    baseline = (
+                        result.token_ids,
+                        logit_bits,
+                    )  # 保存 token 与全部 logit 位。
                     print(
+                        # 报告比较规模。
                         f"[E2E] Baseline recorded: {logits.numel()} logits",
-                        flush=True,
+                        flush=True,  # 569f3f1de3：立即显示基线完成。
                     )
                 else:
-                    assert result.token_ids == baseline[0]
+                    assert result.token_ids == baseline[0]  # 生成路径本身必须相同。
                     assert torch.equal(logit_bits, baseline[1]), (
+                        # 定位执行配置。
                         f"case={case}, chunk={chunk_size}, eager={eager}, "
-                        f"batch={len(prompts)}, "
-                        f"row={row}, reset_cache={reset}, "
+                        f"batch={len(prompts)}, "  # 报告混批规模。
+                        f"row={row}, reset_cache={reset}, "  # 报告目标位置与缓存状态。
                         f"different_logits={(logit_bits != baseline[1]).sum().item()}"
+                        # 失败时统计不同位模式的 logit 数量。
                     )
-                    print(f"[E2E] PASS {case}: identical logit bits", flush=True)
+                    print(
+                        f"[E2E] PASS {case}: identical logit bits", flush=True
+                    )  # 逐场景成功。
+                # 释放大对象；baseline 仍持有基线。
                 del outputs, result, logits, logit_bits
 
 

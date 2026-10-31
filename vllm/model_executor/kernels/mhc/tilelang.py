@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-import vllm.envs as envs
+import vllm.envs as envs  # 69a359f404：读取批次不变性开关。
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -15,12 +15,12 @@ def _hc_prenorm_gemm_outputs(
     hc_mult: int,
     use_tilelang_fallback: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if envs.VLLM_BATCH_INVARIANT:
+    if envs.VLLM_BATCH_INVARIANT:  # 69a359f404：在任何自适应 split 计算之前分流。
         from vllm.model_executor.kernels.mhc.triton import (
-            hc_prenorm_gemm_batch_invariant,
+            hc_prenorm_gemm_batch_invariant,  # 延迟加载固定归约的 mHC 投影实现。
         )
 
-        return hc_prenorm_gemm_batch_invariant(x, fn)
+        return hc_prenorm_gemm_batch_invariant(x, fn)  # 不再按 token 数拆分归约。
 
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         compute_num_split,
@@ -891,10 +891,12 @@ def _mhc_fused_post_pre_tilelang_impl(
     post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
+    # 69a359f404：禁止按 batch 选择融合 split 路径，改走后续独立步骤。
     fused_config = (
-        None
-        if envs.VLLM_BATCH_INVARIANT
+        None  # None 使后续跳过 fused_config 对应的融合内核。
+        if envs.VLLM_BATCH_INVARIANT  # 确定性模式必须固定计算路径。
         else mhc_fused_post_pre_split_config(num_tokens, hidden_size, hc_mult)
+        # 非确定性模式保留原来的性能调优配置。
     )
 
     post_mix_cur = torch.empty(
