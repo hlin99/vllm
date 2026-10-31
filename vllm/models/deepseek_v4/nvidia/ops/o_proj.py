@@ -5,6 +5,7 @@ from collections.abc import Callable
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
@@ -59,8 +60,18 @@ def deep_gemm_fp8_o_proj(
     the padding groups are sliced off.
     """
     use_fp8 = wo_a.weight.dtype == torch.float8_e4m3fn
+    if envs.VLLM_BATCH_INVARIANT:
+        # The BI Triton GEMM needs FP32 scales, not DeepGEMM's packed UE8M0 format.
+        tma_aligned_scales = False
     if isinstance(o, QuantizedActivation):
         assert use_fp8
+        # tma_aligned_scales=False produces FP32 scales only when quantizing below;
+        # prequantized inputs must already provide FP32 scales for the BI GEMM.
+        if envs.VLLM_BATCH_INVARIANT and o.scale.dtype != torch.float32:
+            raise NotImplementedError(
+                "Batch-invariant o_proj requires FP32 activation scales, "
+                "not packed RopeQuant scales."
+            )
         o_proj_input, o_scale = o.data[:, :n_groups], o.scale[:, :n_groups]
     else:
         o_proj_input, o_scale = fused_inv_rope_fp8_quant(
@@ -86,6 +97,32 @@ def deep_gemm_fp8_o_proj(
             if hasattr(wo_a, "weight_scale")
             else wo_a.weight_scale_inv
         )
+        if envs.VLLM_BATCH_INVARIANT:
+            if (
+                einsum_recipe[2] != 128
+                or o_lora_rank % 128 != 0
+                or weight_scale.dtype != torch.float32
+            ):
+                raise NotImplementedError(
+                    "Batch-invariant o_proj requires 128x128 FP8 weight blocks "
+                    "with FP32 scales and a rank divisible by 128."
+                )
+            from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                w8a8_triton_block_scaled_mm,
+            )
+
+            weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
+            scales = weight_scale.view(n_groups, o_lora_rank // 128, -1)
+            for group in range(n_groups):
+                z[:, group] = w8a8_triton_block_scaled_mm(
+                    o_proj_input[:, group].contiguous(),
+                    weight[group],
+                    o_scale[:, group].contiguous(),
+                    scales[group],
+                    [128, 128],
+                    torch.bfloat16,
+                )
+            return wo_b(z.flatten(1))
         fp8_einsum(
             "bhr,hdr->bhd",
             (o_proj_input, o_scale),

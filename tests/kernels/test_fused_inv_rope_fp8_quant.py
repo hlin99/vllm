@@ -38,6 +38,81 @@ FP8_DTYPE = torch.float8_e4m3fn
 EPS = 1e-10
 
 
+def test_dsv4_bi_grouped_o_proj_preserves_rows(monkeypatch):
+    """Inverse RoPE, quantization and grouped projection must be batch invariant."""
+    from tests.kernels.quant_utils import native_w8a8_block_matmul
+    from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    torch.manual_seed(13)
+    groups, heads_per_group, rank = 2, 2, 128
+    width = heads_per_group * HEAD_DIM
+    wo_a = torch.nn.Linear(
+        width, groups * rank, bias=False, device="cuda", dtype=torch.bfloat16
+    )
+    wo_a.weight = torch.nn.Parameter(
+        torch.randn((groups * rank, width), device="cuda").to(FP8_DTYPE),
+        requires_grad=False,
+    )
+    scales = torch.rand((groups, 1, width // 128), device="cuda") * 0.1
+    wo_a.register_parameter(
+        "weight_scale_inv", torch.nn.Parameter(scales, requires_grad=False)
+    )
+    wo_b = torch.nn.Identity()
+    x = torch.randn(
+        (65, groups * heads_per_group, HEAD_DIM), device="cuda", dtype=torch.bfloat16
+    )
+    positions = torch.arange(65, device="cuda")
+    rope = make_cos_sin_cache(65)
+
+    def project(x, positions):
+        return deep_gemm_fp8_o_proj(
+            x,
+            positions,
+            rope,
+            wo_a,
+            wo_b,
+            n_groups=groups,
+            heads_per_group=heads_per_group,
+            nope_dim=NOPE_DIM,
+            rope_dim=ROPE_DIM,
+            o_lora_rank=rank,
+            einsum_recipe=(1, 1, 128),
+            tma_aligned_scales=True,
+        )
+
+    reference = project(x, positions)
+    for row in (0, 16, 64):
+        assert torch.equal(
+            project(x[row : row + 1], positions[row : row + 1])[0], reference[row]
+        )
+    quantized, activation_scales = fused_inv_rope_fp8_quant(
+        x,
+        positions,
+        rope,
+        groups,
+        heads_per_group,
+        quant_group_size=128,
+        tma_aligned_scales=False,
+    )
+    weight = wo_a.weight.view(groups, rank, width)
+    expected = torch.cat(
+        [
+            native_w8a8_block_matmul(
+                quantized[:, group].contiguous(),
+                weight[group],
+                activation_scales[:, group].contiguous(),
+                scales[group],
+                [128, 128],
+                torch.bfloat16,
+            )
+            for group in range(groups)
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(reference, expected, atol=0.01, rtol=0.01)
+
+
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(100), reason="Requires SM100/SM103"
 )
