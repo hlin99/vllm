@@ -333,6 +333,12 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
 
 class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
     @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        # Subclasses such as V4.1 must opt in separately; their indexer paths
+        # are not covered by V4's batch-invariance support.
+        return cls is DeepseekV4IndexerBackend and current_platform.is_cuda()
+
+    @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         # ROCm runs adaptive verification through the per-token flattened
         # indexer path, which derives row ownership from device decode lengths.

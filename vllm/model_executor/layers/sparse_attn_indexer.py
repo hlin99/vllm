@@ -37,6 +37,7 @@ from vllm.model_executor.layers.indexer_topk import (
     deep_select_topk,
     get_indexer_topk,
     is_deep_select_supported,
+    stable_topk,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
@@ -469,6 +470,7 @@ def sparse_attn_indexer(
     candidate_block_size: int = 0,
     candidate_write: bool = False,
     topk_backend: str = "auto",
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
@@ -811,7 +813,9 @@ def sparse_attn_indexer(
                             chunk_candidates,
                             candidate_block_size,
                         )
-                if use_deep_select:
+                if batch_invariant:
+                    stable_topk(logits, row_ends, topk_indices)
+                elif use_deep_select:
                     deep_select_topk(
                         logits, topk_tokens, end=row_ends, output_idx=topk_indices
                     )
@@ -949,9 +953,12 @@ def sparse_attn_indexer(
             )
             # Keeping bf16 halves top-k/candidate reads. SM100 decode is varlen:
             # one context length per row.
-            if dcp_world_size != 1 or not get_indexer_topk(
-                topk_backend
-            ).takes_bf16_logits(logits, topk_tokens, logits.shape[0]):
+            if dcp_world_size != 1 or (
+                not batch_invariant
+                and not get_indexer_topk(topk_backend).takes_bf16_logits(
+                    logits, topk_tokens, logits.shape[0]
+                )
+            ):
                 logits = as_fp32_logits(logits, seq_lens.view(-1))
         num_rows = logits.shape[0]
         if candidate_blocks is not None:
@@ -991,14 +998,17 @@ def sparse_attn_indexer(
 
         # The backend comes from the layer (config is only readable at model
         # construction); dispatchers are cached per backend.
-        get_indexer_topk(topk_backend)(
-            logits,
-            seq_lens,
-            next_n,
-            topk_indices,
-            topk_tokens,
-            attn_metadata_narrowed.max_seq_len,
-        )
+        if batch_invariant:
+            stable_topk(logits, seq_lens.reshape(-1), topk_indices)
+        else:
+            get_indexer_topk(topk_backend)(
+                logits,
+                seq_lens,
+                next_n,
+                topk_indices,
+                topk_tokens,
+                attn_metadata_narrowed.max_seq_len,
+            )
 
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
@@ -1055,6 +1065,7 @@ def sparse_attn_indexer_fake(
     candidate_block_size: int = 0,
     candidate_write: bool = False,
     topk_backend: str = "auto",
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -1127,6 +1138,10 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
+        self.batch_invariant = (
+            envs.VLLM_BATCH_INVARIANT
+            and self.k_cache.get_attn_backend().supports_batch_invariance()
+        )
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
@@ -1219,6 +1234,7 @@ class SparseAttnIndexer(CustomOp):
             candidate_block_size=self.candidate_block_size,
             candidate_write=self.candidate_write,
             topk_backend=self.topk_backend,
+            batch_invariant=self.batch_invariant,
         )
 
     def forward_xpu(

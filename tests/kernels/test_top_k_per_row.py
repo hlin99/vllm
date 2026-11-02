@@ -87,6 +87,31 @@ def test_sparse_topk_batch_invariance(
             assert torch.equal(results, expected.expand_as(results))
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_stable_topk_cutoff_ties_and_invalid_columns_across_batches(dtype):
+    from vllm.model_executor.layers.indexer_topk import stable_topk
+
+    device = current_platform.device_type
+    logits = torch.tensor(
+        [[2, 3, 3, 3, 3, 4, float("nan")], [1, 2, 0, 0, 0, 0, 0], [0] * 7],
+        dtype=dtype,
+        device=device,
+    )
+    # Native scoring leaves invalid tails uninitialized, including possible NaNs.
+    logits[1, 2:] = float("nan")
+    logits[2] = float("inf")
+    ends = torch.tensor([6, 2, 0], device=device, dtype=torch.int32)
+    out = torch.empty((3, 3), device=device, dtype=torch.int32)
+    stable_topk(logits, ends, out)
+    expected = torch.tensor(
+        [[5, 1, 2], [1, 0, -1], [-1, -1, -1]], device=device, dtype=torch.int32
+    )
+    assert torch.equal(out, expected)
+    single_out = torch.empty_like(out[:1])
+    stable_topk(logits[:1], ends[:1], single_out)
+    assert torch.equal(single_out, out[:1])
+
+
 def _has_device_capability(major: int) -> bool:
     return current_platform.is_cuda() and current_platform.has_device_capability(major)
 
