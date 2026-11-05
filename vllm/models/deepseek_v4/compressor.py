@@ -208,6 +208,8 @@ class DeepseekCompressor(nn.Module):
     performance.
     """
 
+    state_cache_cls: ClassVar[type[CompressorStateCache]] = CompressorStateCache
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -279,7 +281,7 @@ class DeepseekCompressor(nn.Module):
         )
         self.norm = RMSNorm(self.head_dim, self.rms_norm_eps)
 
-        self.state_cache = CompressorStateCache(
+        self.state_cache = self.state_cache_cls(
             state_dim=2 * self.coff * self.head_dim,  # kv_state + score_state
             dtype=state_dtype,
             compress_ratio=compress_ratio,

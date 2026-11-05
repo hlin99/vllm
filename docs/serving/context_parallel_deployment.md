@@ -16,18 +16,20 @@ Depending on the use case, there are two possible strategies:
 
 Both approaches are under active development.
 
-### DeepSeek V4 on Intel XPU: SWA-only PCP
+### DeepSeek V4 on Intel XPU: PCP
 
 DeepSeek V4's XPU implementation supports a minimal, text-only PCP path with
-`--prefill-context-parallel-size 2`, `--tensor-parallel-size 1`,
+`--prefill-context-parallel-size N` (`N > 1`), `--tensor-parallel-size 1`,
 `--enforce-eager`, and `--no-enable-prefix-caching`. Each rank computes its
-local queries and gathers the rotated KV rows into a replicated cache.
-This does not reduce KV-cache memory usage. Chunked prefill is supported.
+local queries and gathers the rotated SWA KV rows and projected compressor
+inputs into replicated states and caches. This does not reduce KV-cache
+memory usage. Chunked prefill is supported.
 
-All decoder layers must use `sliding_attention` (legacy `compress_ratios`
-values 0 or 1). C4A/C128A compressed layers are not supported, so the full
-DeepSeek V4 checkpoint cannot use this path without changing its architecture.
-Use it for reduced SWA-only dummy models, not as a full-model serving recipe.
+SWA, C4A, and C128A layers are supported, including compression groups split
+across ranks or prefill chunks. PCP sizes 2 and 4 have been validated with reduced
+dummy models. Other sizes are not restricted by this model implementation, but
+still need to satisfy the regular hardware and tensor-shape requirements.
+Full-checkpoint quality and performance need separate validation.
 PP, DP, DCP, expert parallelism, speculative decoding, LoRA, and KV transfer
 are not supported in this initial path.
 

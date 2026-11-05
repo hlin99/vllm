@@ -64,7 +64,6 @@ from vllm.models.deepseek_v4.common.spec_decode import needs_mtp_hidden_buffer
 from vllm.models.deepseek_v4.xpu.xpu_sparse import DeepseekV4XPUAttention
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.deepseek_v4_utils import get_compress_ratios
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -969,8 +968,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         if self.use_pcp:
             if (
-                parallel_config.prefill_context_parallel_size != 2
-                or any(
+                any(
                     size != 1
                     for size in (
                         parallel_config.tensor_parallel_size,
@@ -982,13 +980,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 or parallel_config.enable_expert_parallel
             ):
                 raise NotImplementedError(
-                    "DeepSeek V4 XPU PCP currently requires PCP=2, "
-                    "TP=PP=DP=DCP=1 and expert parallelism disabled."
-                )
-            if any(ratio > 1 for ratio in get_compress_ratios(config)):
-                raise NotImplementedError(
-                    "DeepSeek V4 XPU PCP currently supports SWA-only layers; "
-                    "compressed attention is not supported."
+                    "DeepSeek V4 XPU PCP currently requires TP=PP=DP=DCP=1 "
+                    "and expert parallelism disabled."
                 )
             if (
                 not vllm_config.model_config.enforce_eager

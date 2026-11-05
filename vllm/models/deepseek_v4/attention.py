@@ -145,6 +145,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     backend_cls: ClassVar[type[AttentionBackend]]
     # Backend for the SWA cache layer; None uses the default SWA backend.
     swa_backend_cls: ClassVar[type[AttentionBackend] | None] = None
+    compressor_cls: ClassVar[type[DeepseekCompressor]] = DeepseekCompressor
     # KV-cache per-token block format (both layouts are paged). True (default)
     # = fp8_ds_mla (UE8M0 block-scaled fp8 packed as uint8); False = plain
     # bf16 / per-tensor fp8 KV row. Backends can override the instance hook when
@@ -367,7 +368,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # attention setup above so its KV-cache prefix (self.prefix) is set.
         self.compressor = None
         if self.compress_ratio > 1:
-            self.compressor = DeepseekCompressor(
+            self.compressor = self.compressor_cls(
                 vllm_config=vllm_config,
                 compress_ratio=self.compress_ratio,
                 hidden_size=self.hidden_size,
