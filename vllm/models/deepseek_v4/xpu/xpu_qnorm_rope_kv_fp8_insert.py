@@ -8,6 +8,7 @@ Uses the existing quantize_and_insert_k_cache for the FP8 portion.
 
 import torch
 
+from vllm.distributed import get_pcp_group
 from vllm.triton_utils import tl, triton
 
 HEAD_DIM = 512
@@ -119,6 +120,8 @@ def xpu_qnorm_rope_kv_fp8_insert(
     cos_sin_cache: torch.Tensor,  # [max_pos, ROPE_DIM]
     eps: float,
     block_size: int,
+    *,
+    use_pcp: bool = False,
 ):
     """XPU Triton: qnorm+rope on Q, rope on KV, then FP8 UE8M0 quant+insert."""
     from vllm.models.deepseek_v4.common.ops.cache_utils import (
@@ -149,6 +152,9 @@ def xpu_qnorm_rope_kv_fp8_insert(
         NOPE_DIM=NOPE_DIM,
         HALF_ROPE=HALF_ROPE,
     )
+
+    if use_pcp:
+        kv_roped = get_pcp_group().all_gather(kv_roped, dim=0)
 
     # FP8 UE8M0 quant + paged insert (reuse existing Triton kernel)
     # swa_kv_cache may be [num_blocks, block_size, 584] or [num_blocks, flat]

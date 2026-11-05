@@ -7,10 +7,11 @@ Triton kernels for decode (FP8 dequant + BF16 attention) and prefill
 (BF16 gathered KV + sparse attention).
 """
 
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import torch
 
+from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
@@ -25,11 +26,43 @@ from vllm.models.deepseek_v4.sparse_mla import (
 from vllm.models.deepseek_v4.xpu.xpu_sparse_decode_fp8 import (
     xpu_sparse_decode_fp8,
 )
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla.sparse_swa import (
+    DeepseekSparseSWABackend,
+    DeepseekSparseSWAMetadata,
+    DeepseekSparseSWAMetadataBuilder,
+)
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
 from vllm.v1.worker.workspace import current_workspace_manager
 
-if TYPE_CHECKING:
-    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+class DeepseekV4XPUSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        replay_start: torch.Tensor | None = None,
+    ) -> DeepseekSparseSWAMetadata:
+        pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+        cm = common_attn_metadata
+        if pcp_size > 1:
+            rank = get_pcp_group().rank_in_group
+            cm = cm.replace(slot_mapping=cm.slot_mapping.chunk(pcp_size)[rank])
+        metadata = super().build(common_prefix_len, cm, fast_build, replay_start)
+        if pcp_size > 1:
+            metadata.cache_slot_mapping = common_attn_metadata.slot_mapping
+        return metadata
+
+
+class DeepseekV4XPUSparseSWABackend(DeepseekSparseSWABackend):
+    @staticmethod
+    def get_builder_cls() -> type[DeepseekV4XPUSparseSWAMetadataBuilder]:
+        return DeepseekV4XPUSparseSWAMetadataBuilder
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
 
 
 class DeepseekV4XPUSparseBackend(DeepseekV4SparseMLABackend):
@@ -37,11 +70,16 @@ class DeepseekV4XPUSparseBackend(DeepseekV4SparseMLABackend):
     def get_name() -> str:
         return "XPU_V4_MLA_SPARSE"
 
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
 
 class DeepseekV4XPUAttention(DeepseekV4Attention):
     """XPU sparse MLA attention layer for DeepSeek V4."""
 
     backend_cls = DeepseekV4XPUSparseBackend
+    swa_backend_cls = DeepseekV4XPUSparseSWABackend
     use_flashmla_fp8_layout = True
 
     def __init__(self, *args, **kwargs) -> None:
@@ -67,6 +105,11 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
             attn_metadata.get(self.swa_cache_layer.prefix),
         )
         assert swa_metadata is not None
+        use_pcp = get_pcp_group().world_size > 1
+        slot_mapping = swa_metadata.slot_mapping
+        if use_pcp:
+            assert swa_metadata.cache_slot_mapping is not None
+            slot_mapping = swa_metadata.cache_slot_mapping
 
         from vllm.models.deepseek_v4.xpu.xpu_qnorm_rope_kv_fp8_insert import (
             xpu_qnorm_rope_kv_fp8_insert,
@@ -76,11 +119,12 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
             q,
             kv,
             self.swa_cache_layer.kv_cache,
-            swa_metadata.slot_mapping,
+            slot_mapping,
             positions,
             self.rotary_emb.cos_sin_cache,
             self.eps,
             swa_metadata.block_size,
+            use_pcp=use_pcp,
         )
         return q
 

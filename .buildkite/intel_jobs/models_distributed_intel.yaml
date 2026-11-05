@@ -19,9 +19,16 @@ steps:
   source_file_dependencies:
   - vllm/model_executor/model_loader/sharded_state_loader.py
   - vllm/model_executor/models/
+  - vllm/models/deepseek_v4/
+  - vllm/v1/worker/gpu/pcp_manager.py
+  - vllm/v1/attention/backends/mla/sparse_swa.py
+  - tests/models/test_deepseek_v4_pcp.py
   - tests/model_executor/model_loader/test_sharded_state_loader.py
   commands:
     - >-
       bash .buildkite/scripts/hardware_ci/run-intel-test.sh
       'cd tests &&
-      pytest -v -s model_executor/model_loader/test_sharded_state_loader.py -m "not slow_test"'
+      pytest -v -s
+      model_executor/model_loader/test_sharded_state_loader.py
+      models/test_deepseek_v4_pcp.py
+      -m "not slow_test"'
