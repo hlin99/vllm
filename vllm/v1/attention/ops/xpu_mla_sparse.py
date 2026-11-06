@@ -100,6 +100,9 @@ def _bf16_mla_sparse_kernel(
     SWA_PAGE_STRIDE: tl.constexpr = 0,
     COMPRESSED_SLOTS: tl.constexpr = 0,
     STORE_STATS: tl.constexpr = True,
+    partial_state_ptr=None,
+    LOAD_PARTIAL_STATE: tl.constexpr = False,
+    STORE_PARTIAL_STATE: tl.constexpr = False,
 ):
     cur_q = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -138,6 +141,17 @@ def _bf16_mla_sparse_kernel(
     e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - 1.0e30
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    if LOAD_PARTIAL_STATE or STORE_PARTIAL_STATE:
+        state_base = (cur_q.to(tl.int64) * h_q + cur_head) * 514
+    if LOAD_PARTIAL_STATE:
+        acc = tl.load(
+            partial_state_ptr + state_base[:, None] + offs_dv[None, :],
+            mask=mask_h[:, None] & (offs_dv[None, :] < dim_v),
+            other=0.0,
+        )
+        e_sum = tl.load(partial_state_ptr + state_base + 512, mask=mask_h, other=0.0)
+        e_max = tl.load(partial_state_ptr + state_base + 513, mask=mask_h, other=-1e30)
 
     if PAGED_KV:
         if TOPK_WIDTH > 0:
@@ -258,30 +272,42 @@ def _bf16_mla_sparse_kernel(
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
 
-    # rescaling
-    acc /= e_sum[:, None]
+    if STORE_PARTIAL_STATE:
+        tl.store(
+            partial_state_ptr + state_base[:, None] + offs_dv[None, :],
+            acc,
+            mask=mask_h[:, None] & (offs_dv[None, :] < dim_v),
+        )
+        tl.store(partial_state_ptr + state_base + 512, e_sum, mask=mask_h)
+        tl.store(partial_state_ptr + state_base + 513, e_max, mask=mask_h)
+    else:
+        # rescaling
+        if PAGED_KV:
+            acc /= tl.where(e_sum > 0, e_sum, 1.0)[:, None]
+        else:
+            acc /= e_sum[:, None]
 
-    max_logits = e_max * LOGE2
-    # calculate lse
-    lse = max_logits + tl.log2(e_sum) * LOGE2
+        max_logits = e_max * LOGE2
+        # calculate lse
+        lse = max_logits + tl.log2(e_sum) * LOGE2
 
-    # write output
-    offs_o = (
-        cur_q * stride_out_token
-        + cur_head[:, None] * stride_out_head
-        + offs_dv[None, :]
-    )
-    mask_out_d = offs_dv < dim_v
-    tl.store(
-        out_ptr + offs_o,
-        acc.to(tl.bfloat16),
-        mask=(mask_h[:, None]) & (mask_out_d[None, :]),
-    )
+        # write output
+        offs_o = (
+            cur_q * stride_out_token
+            + cur_head[:, None] * stride_out_head
+            + offs_dv[None, :]
+        )
+        mask_out_d = offs_dv < dim_v
+        tl.store(
+            out_ptr + offs_o,
+            acc.to(tl.bfloat16),
+            mask=(mask_h[:, None]) & (mask_out_d[None, :]),
+        )
 
-    offs_lse = cur_q * stride_lse + cur_head
-    if STORE_STATS:
-        tl.store(softmax_lse_ptr + offs_lse, lse, mask=mask_h)
-        tl.store(max_logits_ptr + offs_lse, max_logits, mask=mask_h)
+        offs_lse = cur_q * stride_lse + cur_head
+        if STORE_STATS:
+            tl.store(softmax_lse_ptr + offs_lse, lse, mask=mask_h)
+            tl.store(max_logits_ptr + offs_lse, max_logits, mask=mask_h)
 
 
 # reference implementation of bf16 sparse prefill kernel
@@ -396,16 +422,31 @@ def triton_paged_mla_sparse_interface(
     swa_indices: torch.Tensor,
     swa_lens: torch.Tensor,
     sm_scale: float,
-    out: torch.Tensor,
+    out: torch.Tensor | None,
+    *,
+    partial_state: torch.Tensor | None = None,
+    initialize: bool = False,
+    finalize: bool = True,
 ) -> None:
     """Attend directly to two paged UE8M0 caches without materializing BF16 KV.
 
     Indices are physical slots, with valid entries in each row's length prefix.
     Cache pages store 576 data bytes per token followed by eight scale bytes;
     page strides may include padding or gaps. K and V share the same latent.
+
+    Partial state stores the FP32 numerator, exponential sum and log2 maximum.
+    Initialize it on the first chunk; finalize=False stores state instead of out.
     """
     assert q.dtype == torch.bfloat16 and q.shape[-1] == 512
-    assert out.shape == q.shape and out.dtype == q.dtype
+    if out is not None:
+        assert out.shape == q.shape and out.dtype == q.dtype
+    assert not finalize or out is not None
+    if partial_state is None:
+        assert not initialize and finalize
+    else:
+        assert partial_state.shape == (*q.shape[:2], 514)
+        assert partial_state.dtype == torch.float32 and partial_state.is_contiguous()
+        assert partial_state.device == q.device
     assert swa_cache.dtype == torch.uint8 and swa_cache.ndim == 3
     has_compressed = kv_cache is not None
     if has_compressed:
@@ -441,8 +482,8 @@ def triton_paged_mla_sparse_interface(
         stride_k_head=0,
         stride_v_token=0,
         stride_v_head=0,
-        stride_out_token=out.stride(0),
-        stride_out_head=out.stride(1),
+        stride_out_token=out.stride(0) if out is not None else 0,
+        stride_out_head=out.stride(1) if out is not None else 0,
         stride_lse=0,
         stride_indices_token=(
             topk_indices.stride(0) if topk_indices is not None else 0
@@ -471,4 +512,7 @@ def triton_paged_mla_sparse_interface(
         SWA_PAGE_STRIDE=swa_cache.stride(0),
         COMPRESSED_SLOTS=cache.shape[0] * cache.shape[1],
         STORE_STATS=False,
+        partial_state_ptr=partial_state,
+        LOAD_PARTIAL_STATE=partial_state is not None and not initialize,
+        STORE_PARTIAL_STATE=partial_state is not None and not finalize,
     )
