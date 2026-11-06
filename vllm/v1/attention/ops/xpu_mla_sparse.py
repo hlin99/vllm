@@ -475,7 +475,8 @@ def triton_paged_mla_sparse_interface(
     topk_width = topk_indices.shape[-1] if topk_indices is not None else 0
     swa_width = swa_indices.shape[-1]
     cache = kv_cache if kv_cache is not None else swa_cache
-    block_h = 16
+    # The four-warp XPU DPAS layout spans 32 heads; reuse KV across the full tile.
+    block_h = 32 if q.shape[1] >= 32 else 16
     _bf16_mla_sparse_kernel[
         (q.shape[0], triton.cdiv(q.shape[1], min(block_h, q.shape[1])))
     ](

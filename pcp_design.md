@@ -493,3 +493,73 @@ TPSP：
 - `csrc/modules/async_tp/MatmulReduceScatterNormAllGather.cpp`：
   chunk-ready 协议、queue 依赖与输出生命周期。
 - `deep_symm/moe_tp/symm_buffer.py`：AG/permute 与 unpermute/RS 接口。
+
+## 10. P3：XPU paged attention 的 head tile 修复
+
+此前 P0/P2 的性能回归不能只归因于通信或 spill。捕获真实 Flash 模型中
+已执行 C4 global top-k 的输入（16 queries、64 heads、512 compressed keys，
+包含流水线累积的 SWA FP32 state），对相同 Q/cache/state 做受控对照：
+
+- 原 paged kernel 固定 `BLOCK_H=16`，但生成的四 warp DPAS layout 沿 head
+  方向覆盖 32 行。H16 和 H32 的 LLVM IR 每个程序均有 64 个矩阵指令调用点；
+  64 heads 从四个程序改为两个，减少重复的 KV 读取、反量化和矩阵工作。
+- H16/H32 的编译器 spill allocation 都是 40,128 bytes，GRF 模式都是 256；
+  H32 的 SLM 从 48 KiB 增至 64 KiB。因此这不是“消除了 spill”的修复。
+  寄存器、cache 和 scratch 访存的各自贡献仍不能仅凭 allocation 推导。
+- 保持 `BLOCK_N=16` 和四 warps，不改变每个 head 的 KV/softmax 累积顺序。
+  该真实输入的 H32 输出与 H16 逐元素一致。H64、更大的 N、八 warps
+  均做过对照，没有选择仅凭 tile 更大就假定更快的配置。
+
+单卡 B70、预编译和预分配、交替顺序的九次 event 计时中位数：
+
+| 真实 C4 compressed final | H16 (ms) | H32 (ms) |
+| --- | --- | --- |
+| warm-cache replay | 3.149 | 2.053 |
+| 每次计时前写 256 MiB 驱逐 buffer | 7.656 | 2.041 |
+
+驱逐 buffer 不计入 kernel 时间；它用于暴露缓存敏感性，不模拟完整模型。
+原来的随机 warm-cache 微测没有复现这种放大，不能再用它代表 serving。
+本次只将 paged/partial 路径在至少 32 heads 时改为 H32，更小 head 数
+保持 H16。原 gather-based kernel、IPC/barrier、分块调度、压缩和 indexer
+均不变；所有实验开关仍默认关闭。
+
+同一 session 重新运行真实 Flash、PCP8/TP1、GPUs 8–15、budget=128、
+max-seqs=16、16 个 8192-token 请求、每请求输出 1 token，每模式三轮，
+第一轮前预热 8 次，后两轮不再预热。所有轮次均完成 16、失败 0，
+测量没有 profiler 或 capture hook：
+
+| 路径 | 三轮耗时 (s) | 中位数 (s) |
+| --- | --- | --- |
+| 未改的原 gather 路径 | 287.596 / 287.574 / 287.463 | 287.574 |
+| H32 P2 pipeline，chunk=8 | 169.461 / 169.461 / 169.438 | 169.461 |
+
+该负载耗时降低 **41.07%**，请求吞吐提高 **69.70%**。不是把旧 P2
+323.864 秒当作原路径基线，也不是由单卡 kernel 时间推算模型收益。
+三轮优化路径先测、三轮原路径后测，并非交替 A/B。5122-token 单请求的
+后续三次稳态测量也从约 11.168 秒降至 6.413 秒；优化路径首次请求发生
+JIT 编译，耗时 31.679 秒，不计入稳态结果，但不隐瞒首次编译成本。
+
+这是该 B70/PCP8/budget=128 配置的实测修复，不保证所有硬件、head 数、
+chunk/batch 形状均加速，也没有证明通信本身带来净收益。
+
+补充的单卡 sweep 覆盖 1/4/16/64/256 queries、64 heads、0/64/512
+compressed keys 与 128 SWA keys，分别计时单次 paged 和三段 SWA 加
+compressed final。15 个形状两种路径的 H16/H32 输出均逐元素一致。
+小形状没有稳定收益，部分 cold-cache 样本慢约 1–3%；64-query 单次
+paged 的 cold-cache 样本慢约 3–7%，但对应 split 路径快约 16–35%。
+这些反例保留在 evidence 中，不能把本次 serving 收益外推为所有算子
+形状都不回退，也不为单个微测形状添加未经模型验证的特殊分支。
+
+最终验证：16 项 kernel 测试与 5 项 public `LLM.generate` 测试通过，
+没有放宽容差。新增 36/64-head kernel 覆盖 H32 尾部 head mask、offset
+view、page stride、空行和 partial-state 复用；paged/pipeline public 测试
+改用 32 heads，避免原来 4-head dummy 模型完全不覆盖本次优化分支。
+所跑 public 用例为 PCP2 paged C4/C128，以及 PCP2/4 pipeline C4/C128
+的 replicated/boundary 两种 compressor 路径。
+
+真实 Flash PCP8、chunk=1 的 20 个完整回复（4 个单请求、16 个并发请求）
+全部自然 stop，人工检查未见乱码、异常重复或明显生成崩坏。监控最大
+running=16，有 21 个采样点 running>8；三份 Python 代码断言与两份
+JSON 提取检查通过。raw completion 的正确答案后有 `</s>`，部分解释
+超过字数要求，如实保留；这是生成质量冒烟，不是正式模型评测或
+bit-exact 生成承诺。正常 pre-commit hooks 通过。

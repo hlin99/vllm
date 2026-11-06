@@ -197,8 +197,11 @@ def _make_paged_sparse_cache(block_size, device):
 
 
 @pytest.mark.parametrize("compressed_block_size", [None, 2, 64])
+@pytest.mark.parametrize("num_heads", [20, 36, 64])
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required")
-def test_paged_sparse_mla_matches_gathered_kv(compressed_block_size, monkeypatch):
+def test_paged_sparse_mla_matches_gathered_kv(
+    compressed_block_size, num_heads, monkeypatch
+):
     """Paged loads preserve attention with gaps, offset views and masked rows."""
     device = torch.device("xpu")
     torch.manual_seed(42)
@@ -209,8 +212,12 @@ def test_paged_sparse_mla_matches_gathered_kv(compressed_block_size, monkeypatch
         if compressed_block_size is not None
         else None
     )
-    q = torch.randn(11, 24, 512, device=device, dtype=torch.bfloat16)[1::2, :20]
-    out = torch.empty(11, 24, 512, device=device, dtype=q.dtype)[1::2, :20]
+    q = torch.randn(11, num_heads + 4, 512, device=device, dtype=torch.bfloat16)[
+        1::2, :num_heads
+    ]
+    out = torch.empty(11, num_heads + 4, 512, device=device, dtype=q.dtype)[
+        1::2, :num_heads
+    ]
     expected = torch.empty_like(q)
     swa_indices = torch.randint(
         0, 4 * 256, (5, 1, 33), dtype=torch.int32, device=device
@@ -260,18 +267,21 @@ def test_paged_sparse_mla_matches_gathered_kv(compressed_block_size, monkeypatch
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("num_heads", [20, 36, 64])
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required")
-def test_paged_sparse_mla_split_kv_preserves_softmax():
+def test_paged_sparse_mla_split_kv_preserves_softmax(num_heads):
     """Block-aligned chunks keep FP32 state, including empty chunks and reuse."""
     device = torch.device("xpu")
     torch.manual_seed(43)
     cache = _make_paged_sparse_cache(256, device)
-    q = torch.randn(5, 24, 512, device=device, dtype=torch.bfloat16)[:, :20]
+    q = torch.randn(5, num_heads + 4, 512, device=device, dtype=torch.bfloat16)[
+        :, :num_heads
+    ]
     indices = torch.randint(0, 1024, (5, 1, 33), device=device, dtype=torch.int32)
     lens = torch.tensor([0, 1, 33, 17, 0], device=device, dtype=torch.int32)
     expected = torch.empty_like(q)
     actual = torch.empty_like(q)
-    state = torch.full((5, 20, 514), float("nan"), device=device)
+    state = torch.full((5, num_heads, 514), float("nan"), device=device)
     empty_indices = indices[..., :0]
     empty_lens = torch.zeros_like(lens)
 

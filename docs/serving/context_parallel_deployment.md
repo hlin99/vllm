@@ -57,6 +57,9 @@ communication modes. It removes the intermediate BF16 KV workspace without
 changing the cache format or adding a KV reorder. The default, `0`, retains
 the gather-based attention path. This switch does not yet overlap KV
 communication with attention, and does not guarantee a speedup.
+With at least 32 query heads, paged attention reuses KV loads and
+dequantization across 32 heads per tile; smaller head counts retain 16-head
+tiles. This also applies to the partial attention kernels used by the pipeline.
 
 Set `VLLM_XPU_PCP_KV_CHUNK_SIZE` to a positive number of rank-local token rows
 to enable experimental SWA KV communication/attention pipelining for SWA,

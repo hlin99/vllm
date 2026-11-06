@@ -186,7 +186,11 @@ def test_xpu_pcp_matches_single_rank(
             gpu_memory_utilization=0.2,
             enable_chunked_prefill=True,
             enable_prefix_caching=False,
-            hf_overrides={"layer_types": layer_types, "index_topk": 16},
+            hf_overrides={
+                "layer_types": layer_types,
+                "index_topk": 16,
+                "num_attention_heads": 32 if paged_attention or kv_chunk_size else 4,
+            },
         ) as runner:
             batch_results = []
             for prompts in batches:
