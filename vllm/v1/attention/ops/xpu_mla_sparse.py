@@ -103,6 +103,8 @@ def _bf16_mla_sparse_kernel(
     partial_state_ptr=None,
     LOAD_PARTIAL_STATE: tl.constexpr = False,
     STORE_PARTIAL_STATE: tl.constexpr = False,
+    swa_offsets_ptr=None,
+    HAS_SWA_OFFSETS: tl.constexpr = False,
 ):
     cur_q = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -161,15 +163,24 @@ def _bf16_mla_sparse_kernel(
         else:
             topk_len = 0
         swa_len = tl.minimum(tl.maximum(tl.load(swa_lens_ptr + cur_q), 0), SWA_WIDTH)
+        swa_start = tl.load(swa_offsets_ptr + cur_q) if HAS_SWA_OFFSETS else 0
 
-    for start_indice in range(0, index_topk, BLOCK_N):
+    if PAGED_KV and (LOAD_PARTIAL_STATE or STORE_PARTIAL_STATE):
+        loop_end = topk_len + swa_len
+    else:
+        loop_end = index_topk
+
+    for start_indice in range(0, loop_end, BLOCK_N):
         offs_indice = start_indice + tl.arange(0, BLOCK_N)
         mask_indice = offs_indice < index_topk
         if PAGED_KV:
             is_swa = offs_indice >= topk_len
             swa_offsets = offs_indice - topk_len
             swa_slots = tl.load(
-                swa_indices_ptr + cur_q * stride_swa_indices_token + swa_offsets,
+                swa_indices_ptr
+                + cur_q * stride_swa_indices_token
+                + swa_start
+                + swa_offsets,
                 mask=is_swa & (swa_offsets < swa_len),
                 other=-1,
             )
@@ -427,6 +438,7 @@ def triton_paged_mla_sparse_interface(
     partial_state: torch.Tensor | None = None,
     initialize: bool = False,
     finalize: bool = True,
+    swa_offsets: torch.Tensor | None = None,
 ) -> None:
     """Attend directly to two paged UE8M0 caches without materializing BF16 KV.
 
@@ -436,6 +448,7 @@ def triton_paged_mla_sparse_interface(
 
     Partial state stores the FP32 numerator, exponential sum and log2 maximum.
     Initialize it on the first chunk; finalize=False stores state instead of out.
+    Optional SWA offsets select a per-query span within the shared index rows.
     """
     assert q.dtype == torch.bfloat16 and q.shape[-1] == 512
     if out is not None:
@@ -447,6 +460,8 @@ def triton_paged_mla_sparse_interface(
         assert partial_state.shape == (*q.shape[:2], 514)
         assert partial_state.dtype == torch.float32 and partial_state.is_contiguous()
         assert partial_state.device == q.device
+    if swa_offsets is not None:
+        assert swa_offsets.shape == q.shape[:1] and swa_offsets.is_contiguous()
     assert swa_cache.dtype == torch.uint8 and swa_cache.ndim == 3
     has_compressed = kv_cache is not None
     if has_compressed:
@@ -515,4 +530,6 @@ def triton_paged_mla_sparse_interface(
         partial_state_ptr=partial_state,
         LOAD_PARTIAL_STATE=partial_state is not None and not initialize,
         STORE_PARTIAL_STATE=partial_state is not None and not finalize,
+        swa_offsets_ptr=swa_offsets,
+        HAS_SWA_OFFSETS=swa_offsets is not None,
     )

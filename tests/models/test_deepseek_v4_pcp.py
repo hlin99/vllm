@@ -18,13 +18,16 @@ from vllm.config import (
 )
 from vllm.distributed import (
     cleanup_dist_env_and_memory,
+    get_pcp_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
+from vllm.models.deepseek_v4.common.ops.cache_utils import quantize_and_insert_k_cache
 from vllm.models.deepseek_v4.compressor import CompressorMetadata, DeepseekCompressor
 from vllm.models.deepseek_v4.xpu.model import DeepseekV4Model
+from vllm.models.deepseek_v4.xpu.pcp_pipeline import get_pcp_swa_pipeline
 from vllm.models.deepseek_v4.xpu.xpu_qnorm_rope_kv_fp8_insert import (
     xpu_qnorm_rope_kv_fp8_insert,
 )
@@ -35,6 +38,7 @@ from vllm.models.deepseek_v4.xpu.xpu_sparse import (
     DeepseekV4XPUSparseMetadataBuilder,
 )
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.ops.xpu_mla_sparse import triton_paged_mla_sparse_interface
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -84,14 +88,47 @@ def swa_model_path(tmp_path):
     ],
 )
 @pytest.mark.parametrize(
-    "layer_types,boundary_exchange,paged_attention",
+    "layer_types,boundary_exchange,paged_attention,kv_chunk_size",
     [
-        (["sliding_attention"] * 2, False, False),
-        (["compressed_sparse_attention", "heavily_compressed_attention"], False, False),
-        (["compressed_sparse_attention", "heavily_compressed_attention"], True, False),
-        (["sliding_attention"] * 2, False, True),
-        (["compressed_sparse_attention", "heavily_compressed_attention"], False, True),
-        (["compressed_sparse_attention", "heavily_compressed_attention"], True, True),
+        (["sliding_attention"] * 2, False, False, 0),
+        (
+            ["compressed_sparse_attention", "heavily_compressed_attention"],
+            False,
+            False,
+            0,
+        ),
+        (
+            ["compressed_sparse_attention", "heavily_compressed_attention"],
+            True,
+            False,
+            0,
+        ),
+        (["sliding_attention"] * 2, False, True, 0),
+        (
+            ["compressed_sparse_attention", "heavily_compressed_attention"],
+            False,
+            True,
+            0,
+        ),
+        (
+            ["compressed_sparse_attention", "heavily_compressed_attention"],
+            True,
+            True,
+            0,
+        ),
+        (["sliding_attention"] * 2, False, False, 16),
+        (
+            ["compressed_sparse_attention", "heavily_compressed_attention"],
+            False,
+            False,
+            16,
+        ),
+        (
+            ["compressed_sparse_attention", "heavily_compressed_attention"],
+            True,
+            False,
+            16,
+        ),
     ],
     ids=[
         "swa",
@@ -100,6 +137,9 @@ def swa_model_path(tmp_path):
         "paged-swa",
         "paged-c4a-c128a",
         "paged-boundary-c4a-c128a",
+        "pipeline-swa",
+        "pipeline-c4a-c128a",
+        "pipeline-boundary-c4a-c128a",
     ],
 )
 def test_xpu_pcp_matches_single_rank(
@@ -108,6 +148,7 @@ def test_xpu_pcp_matches_single_rank(
     layer_types,
     boundary_exchange,
     paged_attention,
+    kv_chunk_size,
     pcp_world_size,
     monkeypatch,
 ):
@@ -123,11 +164,16 @@ def test_xpu_pcp_matches_single_rank(
     results = []
     for pcp_size in (1, pcp_world_size):
         monkeypatch.setenv(
+            "VLLM_XPU_PCP_KV_CHUNK_SIZE",
+            str(kv_chunk_size if pcp_size > 1 else 0),
+        )
+        monkeypatch.setenv(
             "VLLM_XPU_PAGED_SPARSE_ATTN",
             str(int(paged_attention and pcp_size > 1)),
         )
         with vllm_runner(
             swa_model_path,
+            dtype="bfloat16" if kv_chunk_size else "auto",
             load_format="dummy",
             skip_tokenizer_init=True,
             enforce_eager=True,
@@ -172,7 +218,7 @@ def test_xpu_pcp_matches_single_rank(
     )
 
 
-def _check_replicated_swa_cache(rank, init_method):
+def _check_replicated_swa_cache(rank, init_method, pipeline):
     torch.xpu.set_device(rank)
     config = VllmConfig(
         parallel_config=ParallelConfig(
@@ -198,28 +244,69 @@ def _check_replicated_swa_cache(rank, init_method):
         kv = torch.randn(num_tokens, 512, dtype=torch.bfloat16).to(device)
         angles = torch.randn(64, 32).to(device)
         cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1)
-        slots = torch.randperm(512)[:num_tokens].to(device)
+        all_slots = torch.randperm(512).to(device)
+        slots = all_slots[:num_tokens]
+        history_slots = all_slots[num_tokens : num_tokens + 2]
         local_rows = slice(rank * tokens_per_rank, (rank + 1) * tokens_per_rank)
+        transport = (
+            get_pcp_swa_pipeline(get_pcp_group(), tokens_per_rank, 4)
+            if pipeline
+            else None
+        )
         for active_tokens in (17, 1):
             positions = torch.arange(num_tokens, device=device) + 7
             positions[active_tokens:] = 0
             slot_mapping = slots.clone()
             slot_mapping[active_tokens:] = -1
             cache = torch.full((2, 256, 584), 37, dtype=torch.uint8, device=device)
+            if transport is not None:
+                quantize_and_insert_k_cache(
+                    kv[:2], cache.view(2, -1), history_slots, block_size=256
+                )
             expected_cache = cache.clone()
             local_q = q[local_rows].clone()
             expected_q = q.clone()
-            xpu_qnorm_rope_kv_fp8_insert(
-                local_q,
-                kv[local_rows],
-                cache,
-                slot_mapping,
-                positions[local_rows],
-                cos_sin,
-                1e-6,
-                256,
-                use_pcp=True,
-            )
+            if transport is None:
+                xpu_qnorm_rope_kv_fp8_insert(
+                    local_q,
+                    kv[local_rows],
+                    cache,
+                    slot_mapping,
+                    positions[local_rows],
+                    cos_sin,
+                    1e-6,
+                    256,
+                    use_pcp=True,
+                )
+            else:
+                queries = min(
+                    tokens_per_rank, max(0, active_tokens - rank * tokens_per_rank)
+                )
+                indices = (
+                    torch.cat((history_slots, slots[:active_tokens]))
+                    .to(torch.int32)
+                    .view(1, 1, -1)
+                    .expand(queries, 1, -1)
+                    .contiguous()
+                )
+                lengths = torch.full(
+                    (queries,), indices.shape[-1], device=device, dtype=torch.int32
+                )
+                state = transport.prefill(
+                    local_q,
+                    kv[local_rows],
+                    positions[local_rows],
+                    cos_sin,
+                    1e-6,
+                    cache,
+                    slot_mapping,
+                    0,
+                    queries,
+                    indices,
+                    lengths,
+                    512**-0.5,
+                    256,
+                )
             xpu_qnorm_rope_kv_fp8_insert(
                 expected_q,
                 kv,
@@ -232,16 +319,46 @@ def _check_replicated_swa_cache(rank, init_method):
             )
             assert torch.equal(local_q, expected_q[local_rows])
             assert torch.equal(cache, expected_cache)
+            if transport is not None:
+                expected_out = torch.empty_like(local_q[:queries])
+                actual_out = torch.empty_like(expected_out)
+                triton_paged_mla_sparse_interface(
+                    expected_q[local_rows][:queries],
+                    None,
+                    expected_cache,
+                    None,
+                    None,
+                    indices,
+                    lengths,
+                    512**-0.5,
+                    expected_out,
+                )
+                triton_paged_mla_sparse_interface(
+                    local_q[:queries],
+                    None,
+                    cache,
+                    None,
+                    None,
+                    indices[..., :0],
+                    lengths,
+                    512**-0.5,
+                    actual_out,
+                    partial_state=state,
+                )
+                torch.testing.assert_close(
+                    actual_out, expected_out, rtol=1e-2, atol=1e-2
+                )
     finally:
         cleanup_dist_env_and_memory()
 
 
 @pytest.mark.distributed(num_gpus=2)
-def test_xpu_pcp_replicates_cache_with_padding_and_empty_peer(tmp_path):
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_xpu_pcp_replicates_cache_with_padding_and_empty_peer(tmp_path, pipeline):
     """Every cache byte and local Q must match an unsharded cache write."""
     torch.multiprocessing.spawn(
         _check_replicated_swa_cache,
-        args=(f"file://{tmp_path / 'pcp-init'}",),
+        args=(f"file://{tmp_path / 'pcp-init'}", pipeline),
         nprocs=2,
     )
 

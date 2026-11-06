@@ -38,6 +38,10 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4SparseMLAMetadataBuilder,
 )
 from vllm.models.deepseek_v4.xpu.pcp_compressor import publish_compressed_cache
+from vllm.models.deepseek_v4.xpu.pcp_pipeline import (
+    PCPSWAPipeline,
+    get_pcp_swa_pipeline,
+)
 from vllm.models.deepseek_v4.xpu.xpu_sparse_decode_fp8 import (
     xpu_sparse_decode_fp8,
 )
@@ -304,20 +308,35 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
     def _get_indexer_cls(self, vllm_config: VllmConfig) -> type[DeepseekV4Indexer]:
         return DeepseekV4XPUIndexer
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
         # torch.cuda.Event() raises RuntimeError on XPU ("dummy base class").
         # The Base and DeepseekV4Indexer both create cuda Events in __init__, so
         # we temporarily redirect torch.cuda.Event → torch.xpu.Event.
         _orig_event = torch.cuda.Event
         torch.cuda.Event = torch.xpu.Event  # type: ignore[misc]
         try:
-            super().__init__(*args, **kwargs)
+            super().__init__(vllm_config, *args, **kwargs)
         finally:
             torch.cuda.Event = _orig_event  # type: ignore[misc]
+        self._pcp_swa_state: torch.Tensor | None = None
+        self._pcp_swa_pipeline: PCPSWAPipeline | None = None
+        chunk_size = envs.VLLM_XPU_PCP_KV_CHUNK_SIZE
+        if chunk_size < 0:
+            raise ValueError("VLLM_XPU_PCP_KV_CHUNK_SIZE must be nonnegative")
+        group = get_pcp_group()
+        if chunk_size and group.world_size > 1 and self.compress_ratio != 4:
+            if vllm_config.model_config.dtype != torch.bfloat16:
+                raise ValueError("The XPU PCP KV pipeline requires BF16")
+            self._pcp_swa_pipeline = get_pcp_swa_pipeline(
+                group,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                chunk_size,
+            )
 
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
         from typing import cast
 
+        self._pcp_swa_state = None
         if not isinstance(attn_metadata, dict):
             # Profile run: no-op, just return q (no padding needed on XPU).
             return q
@@ -332,6 +351,25 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         if use_pcp:
             assert swa_metadata.cache_slot_mapping is not None
             slot_mapping = swa_metadata.cache_slot_mapping
+
+        pipeline = self._pcp_swa_pipeline
+        if pipeline is not None and q.shape[0] > pipeline.chunk_size:
+            self._pcp_swa_state = pipeline.prefill(
+                q,
+                kv,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.eps,
+                self.swa_cache_layer.kv_cache,
+                slot_mapping,
+                swa_metadata.num_decode_tokens,
+                swa_metadata.num_prefill_tokens,
+                swa_metadata.prefill_swa_indices,
+                swa_metadata.prefill_swa_lens,
+                self.scale,
+                swa_metadata.block_size,
+            )
+            return q
 
         from vllm.models.deepseek_v4.xpu.xpu_qnorm_rope_kv_fp8_insert import (
             xpu_qnorm_rope_kv_fp8_insert,
@@ -405,6 +443,8 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         attn_metadata = forward_context.attn_metadata
 
         if attn_metadata is None:
+            if self._pcp_swa_pipeline is not None:
+                self._pcp_swa_pipeline.reserve_state(q.shape[0], q.shape[1])
             if envs.VLLM_XPU_PAGED_SPARSE_ATTN:
                 output.zero_()
                 return
@@ -538,7 +578,8 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         num_prefill_tokens = swa_metadata.num_prefill_tokens
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
-        if envs.VLLM_XPU_PAGED_SPARSE_ATTN:
+        partial_state = self._pcp_swa_state
+        if envs.VLLM_XPU_PAGED_SPARSE_ATTN or partial_state is not None:
             assert swa_metadata.prefill_swa_indices is not None
             assert swa_metadata.prefill_swa_lens is not None
             global_indices = None
@@ -562,16 +603,21 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
                     attn_metadata.block_size // self.compress_ratio,
                     swa_metadata.is_valid_token[num_decode_tokens:],
                 )
+            swa_indices = swa_metadata.prefill_swa_indices
+            if partial_state is not None:
+                swa_indices = swa_indices[..., :0]
+                self._pcp_swa_state = None
             triton_paged_mla_sparse_interface(
                 q[:num_prefill_tokens],
                 compressed_k_cache,
                 swa_k_cache,
                 global_indices,
                 topk_lens,
-                swa_metadata.prefill_swa_indices,
+                swa_indices,
                 swa_metadata.prefill_swa_lens,
                 self.scale,
                 output[:num_prefill_tokens],
+                partial_state=partial_state,
             )
             return
 

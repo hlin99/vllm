@@ -322,7 +322,46 @@ attention 内重复反量化可能抵消搬运收益。默认路径保持不变�
 P1a 的 kernel 已能跨调用保存 FP32 numerator、指数和与最大值，并在最后一块
 统一归一化，不是相加各块独立 softmax 的输出。新增测试按原有 16-key block
 边界拆分，包含空块、全 mask 行和状态复用，结果与单次调用逐元素完全相同。
-此时模型仍未接入分块传输调度，不能把这个内核能力当作完整 P1。
+仅 P1a 完成时模型尚未接入分块传输调度，不能把这个内核能力当作完整 P1。
+
+P1b 当前原型用 PyTorch XPU symmetric memory 建立共享 IPC arena，Qnorm/RoPE
+直接写本卡发送段；通信 stream 拉取远端 chunk，按 event 就绪后量化入 cache，
+attention 按物理 slot 的 chunk 归属累积 SWA。历史 KV 单独先算，不额外拼接
+或重排 KV。C128 压缩贡献最后合并，C4 尚未启用。
+
+分布式 cache 与 sparse kernel 的 10 项测试通过；原路径、paged 对照及新增
+PCP2/4 pipeline 模式共 8 项 `LLM.generate` 测试通过。真实 V4 Flash、PCP8、
+chunk=8 的三个短任务也与原路径 token 和完整 top-5 logprob 一致。5122-token
+长任务生成的 8 个 token 相同，但首 token logprob 差 0.02452、共同输出前缀的
+最大 logprob 差 0.39433；原路径自身复跑也有变化，不能据此宣称长上下文等价。
+相同 serving 配置的一轮测试完成 16 个请求、失败 0 个，耗时 290.85 秒；
+相对新测原路径三轮中位数 287.95 秒慢约 1.0%，比 P0 paged 的
+340.34 秒短。流水线目前只有一轮，不能称为三轮中位数或证明加速；
+新开关默认关闭。
+
+原型的两卡 B70 算子对照已覆盖每卡 16、128、1024、4096 token，128 heads、
+128-token SWA，BF16；每个形状扫描 2/4/8 个 chunk，交替测量各方案五次，
+每次取最慢 rank，最后取中位数。基线也是 paged attention，不是原 serving 路径。
+计时包含 Qnorm/RoPE、通信、必要量化写 cache、metadata 和 partial attention；
+状态已预留，输入准备和编译不计时。Q 与 cache 逐元素一致，attention 使用
+现有 BF16 的 `rtol=atol=1e-2` 验证。
+
+| 每卡 token | 最佳 chunk | paged 串行基线 (ms) | 流水线 (ms) |
+| --- | --- | --- | --- |
+| 16 | 8 | 2.084 | 2.865 |
+| 128 | 64 | 8.806 | 12.909 |
+| 1024 | 512 | 66.272 | 90.273 |
+| 4096 | 2048 | 264.262 | 350.928 |
+
+4096-token、四 chunk 的生产 wrapper timeline 中，约 132 微秒远端拷贝
+与 attention 重叠约 46–48 微秒，证明调度可以重叠，但收益远小于新增开销。
+扫描后的各形状仍然更慢；不能把它当作 serving 加速结果。下一步需要检查
+partial-state 流量、空 chunk 的处理及量化 launch 数，而不是默认启用。
+
+模型验证还暴露了独立的 XPU FP8 GEMM 单 K-block scale 问题：底层将 compact
+block scales 当成 per-channel scales，读取了本不属于该 scale 的内存，可能
+返回错误值或 NaN。已用有限输入和 CPU 参考复现，单独修复 scale 展开；
+单/多 K-block 四项精确测试通过，没有修改容差或绕开失败。
 
 各阶段需要覆盖：
 
@@ -338,6 +377,12 @@ P1a 的 kernel 已能跨调用保存 FP32 numerator、指数和与最大值，�
 原压缩路径整批耗时中位数 287.40 秒，边界交换路径 291.31 秒。
 这不是通信/attention 流水线的性能结果，也不能外推更大 chunk。
 该配置每卡 token 很少，融合仍必须评估调度开销，不能直接照搬 TPSP 的阈值。
+
+P0 paged attention 用相同配置重新测了三轮，并重新跑原路径作对照：
+原路径中位数 287.95 秒，paged 为 340.34 秒，整批耗时增加 18.2%。
+所以不能因为 decode wrapper 的局部 microbenchmark 更快就打开全模型默认值；
+本次融合确实消除了 BF16 KV workspace，但这个 prefill workload 上没有性能收益。
+默认仍保持原路径。
 
 三组短输入的真实权重检查输出与 top-5 logprob 完全一致；5122-token 长输入
 存在输出/logprob 差异，原路径自己复跑也会变化。后续精度验收需单独厘清这条
