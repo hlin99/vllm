@@ -21,7 +21,7 @@ Both approaches are under active development.
 DeepSeek V4's XPU implementation supports a minimal, text-only PCP path with
 `--prefill-context-parallel-size N` (`N > 1`), `--tensor-parallel-size 1`,
 `--enforce-eager`, and `--no-enable-prefix-caching`. Each rank computes its
-local queries and gathers the rotated SWA KV rows and projected compressor
+local queries and, by default, gathers the rotated SWA KV rows and projected compressor
 inputs into replicated states and caches. This does not reduce KV-cache
 memory usage. Chunked prefill is supported.
 
@@ -32,6 +32,23 @@ still need to satisfy the regular hardware and tensor-shape requirements.
 Full-checkpoint quality and performance need separate validation.
 PP, DP, DCP, expert parallelism, speculative decoding, LoRA, and KV transfer
 are not supported in this initial path.
+
+The full-input replication strategy is not tied to a compression ratio.
+Lower-level multi-XPU tests also cover the real V4.1 C2 compressor, without
+loading a V4.1 model. V4 uses slot-indexed compression states, whereas C2 uses
+request-contiguous inputs and ring states: the C2 tests restore request order and
+remove PCP padding and replicated rows before compression. They do not establish
+V4.1 model support on XPU.
+
+Set `VLLM_XPU_PCP_BOUNDARY_EXCHANGE=1` to exchange compressor segment tails
+instead of all projected compressor inputs. Each rank compresses only its local
+tokens, then publishes the quantized compressed KV and indexer K rows to every
+rank. The exchanged tail covers the compressor's input window: eight tokens for
+overlapping C4 and 128 for C128, per local segment. Live continuation states stay
+consistent; inactive state rows need not be identical. SWA KV replication is
+unchanged. The default, `0`, retains the full-input replication path. Boundary
+exchange adds packing and collective overhead, so it is not necessarily faster
+for short chunks or large numbers of requests.
 
 ## Decode Context Parallel
 

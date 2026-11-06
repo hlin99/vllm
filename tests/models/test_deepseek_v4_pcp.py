@@ -4,12 +4,18 @@
 from dataclasses import replace
 from itertools import accumulate
 
+import numpy as np
 import pytest
 import torch
 from transformers import DeepseekV4Config
 
 from vllm import SamplingParams
-from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode,
+    ParallelConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.distributed import (
     cleanup_dist_env_and_memory,
     init_distributed_environment,
@@ -24,10 +30,14 @@ from vllm.models.deepseek_v4.xpu.xpu_qnorm_rope_kv_fp8_insert import (
 )
 from vllm.models.deepseek_v4.xpu.xpu_sparse import (
     DeepseekV4XPUAttention,
+    DeepseekV4XPUCompressorMetadata,
     DeepseekV4XPUCompressorMetadataBuilder,
     DeepseekV4XPUSparseMetadataBuilder,
 )
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 from .utils import check_logprobs_close
 
@@ -74,17 +84,24 @@ def swa_model_path(tmp_path):
     ],
 )
 @pytest.mark.parametrize(
-    "layer_types",
+    "layer_types,boundary_exchange",
     [
-        ["sliding_attention"] * 2,
-        ["compressed_sparse_attention", "heavily_compressed_attention"],
+        (["sliding_attention"] * 2, False),
+        (["compressed_sparse_attention", "heavily_compressed_attention"], False),
+        (["compressed_sparse_attention", "heavily_compressed_attention"], True),
     ],
-    ids=["swa", "c4a-c128a"],
+    ids=["swa", "c4a-c128a", "boundary-c4a-c128a"],
 )
 def test_xpu_pcp_matches_single_rank(
-    vllm_runner, swa_model_path, layer_types, pcp_world_size
+    vllm_runner,
+    swa_model_path,
+    layer_types,
+    boundary_exchange,
+    pcp_world_size,
+    monkeypatch,
 ):
     """Cover chunking, real C4A indexer scoring, decode, and empty peers."""
+    monkeypatch.setenv("VLLM_XPU_PCP_BOUNDARY_EXCHANGE", str(int(boundary_exchange)))
     batches = [
         [
             {"prompt_token_ids": [3 + i % 200 for i in range(length)]}
@@ -256,12 +273,24 @@ def _check_replicated_compressed_cache(rank, init_method, model_path):
                 for layer in range(2)
             ]
     try:
+        targets = [
+            (attention.compressor, attention, attention.rotary_emb)
+            for attention in attentions
+        ]
         for attention in attentions:
-            compressor = attention.compressor
+            if attention.indexer is not None:
+                targets.append(
+                    (
+                        attention.indexer.compressor,
+                        attention.indexer.k_cache,
+                        attention.indexer_rotary_emb,
+                    )
+                )
+        for compressor, cache_layer, rotary_emb in targets:
             assert compressor is not None
             state = compressor.state_cache
             state_spec = state.get_kv_cache_spec(config)
-            cache_spec = attention.get_kv_cache_spec(config)
+            cache_spec = cache_layer.get_kv_cache_spec(config)
             assert cache_spec is not None
             state_blocks = 512 // state_spec.block_size
             state_table = torch.arange(3 * state_blocks).view(3, state_blocks)
@@ -273,9 +302,14 @@ def _check_replicated_compressed_cache(rank, init_method, model_path):
                     device=device,
                 )
             )
-            attention.bind_kv_cache(
+            cache_layer.bind_kv_cache(
                 torch.full(
-                    (6, 1, cache_spec.num_states, 584),
+                    (
+                        6,
+                        1,
+                        cache_spec.num_states,
+                        cache_spec.page_size_bytes // cache_spec.num_states,
+                    ),
                     37,
                     dtype=torch.uint8,
                     device=device,
@@ -297,7 +331,7 @@ def _check_replicated_compressed_cache(rank, init_method, model_path):
                 state_spec, [state.prefix], config, device
             )
             cache_builder = DeepseekV4XPUSparseMetadataBuilder(
-                cache_spec, [attention.prefix], config, device
+                cache_spec, [cache_layer.prefix], config, device
             )
             starts = [0, 0, 0]
             phases = [(19, 105, 1), (0, 128, 0), (0, 24, 0)] + [(1, 1, 1)] * 4
@@ -375,6 +409,7 @@ def _check_replicated_compressed_cache(rank, init_method, model_path):
                     positions=pos[local],
                 )
                 state_metadata = state_builder.build(0, common)
+                assert isinstance(state_metadata, DeepseekV4XPUCompressorMetadata)
                 cache_metadata = cache_builder.build(
                     0,
                     common.replace(
@@ -397,41 +432,245 @@ def _check_replicated_compressed_cache(rank, init_method, model_path):
                         block_size=state_spec.block_size,
                         token_to_req_indices=req_ids.to(torch.int32),
                     ),
-                    attention.prefix: replace(
+                    cache_layer.prefix: replace(
                         cache_metadata,
                         slot_mapping=compressed_slots,
                     ),
                 }
                 kv_score = scores[req_ids, pos]
                 previous_state = state.kv_cache.clone()
-                previous_cache = attention.kv_cache.clone()
+                previous_cache = cache_layer.kv_cache.clone()
                 with set_forward_context(reference, config):
-                    DeepseekCompressor.forward(
-                        compressor, kv_score, pos, attention.rotary_emb
-                    )
+                    DeepseekCompressor.forward(compressor, kv_score, pos, rotary_emb)
                 expected_state = state.kv_cache.clone()
-                expected_cache = attention.kv_cache.clone()
+                expected_cache = cache_layer.kv_cache.clone()
                 state.kv_cache.copy_(previous_state)
-                attention.kv_cache.copy_(previous_cache)
+                cache_layer.kv_cache.copy_(previous_cache)
                 with set_forward_context(
-                    {state.prefix: state_metadata, attention.prefix: cache_metadata},
+                    {state.prefix: state_metadata, cache_layer.prefix: cache_metadata},
                     config,
                 ):
-                    compressor(kv_score[local], pos[local], attention.rotary_emb)
-                assert torch.equal(state.kv_cache, expected_state)
-                assert torch.equal(attention.kv_cache, expected_cache)
+                    compressor(kv_score[local], pos[local], rotary_emb)
+                if state_metadata.boundary_indices is None:
+                    assert torch.equal(state.kv_cache, expected_state)
+                else:
+                    live_slots = [
+                        int(state_table[req, position // state_spec.block_size])
+                        * state_spec.block_size
+                        + position % state_spec.block_size
+                        for req, (start, length) in enumerate(zip(starts, lengths))
+                        for position in range(
+                            max(0, start + length - state.sliding_window),
+                            start + length,
+                        )
+                    ]
+                    actual_rows = state.kv_cache.flatten(0, 1)
+                    expected_rows = expected_state.flatten(0, 1)
+                    assert torch.equal(
+                        actual_rows[live_slots], expected_rows[live_slots]
+                    )
+                assert torch.equal(cache_layer.kv_cache, expected_cache)
                 starts = [start + length for start, length in zip(starts, lengths)]
     finally:
         cleanup_dist_env_and_memory()
 
 
 @pytest.mark.distributed(num_gpus=2)
-def test_xpu_pcp_replicates_compressed_states_across_chunks(tmp_path, swa_model_path):
-    """C4A/C128A states and cache bytes match unsharded compression exactly."""
+@pytest.mark.parametrize(
+    "boundary_exchange", [False, True], ids=["replicated", "boundary"]
+)
+def test_xpu_pcp_replicates_compressed_states_across_chunks(
+    tmp_path, swa_model_path, boundary_exchange, monkeypatch
+):
+    """C4A/C128A live states and cache bytes match unsharded compression exactly."""
+    monkeypatch.setenv("VLLM_XPU_PCP_BOUNDARY_EXCHANGE", str(int(boundary_exchange)))
     torch.multiprocessing.spawn(
         _check_replicated_compressed_cache,
         args=(f"file://{tmp_path / 'compressed-pcp-init'}", swa_model_path),
         nprocs=2,
+    )
+
+
+def _check_replicated_c2_compression(rank, init_method, model_path, pcp_size):
+    from vllm.models.deepseek_v41.compressor import (
+        CompressorMetadataBuilder as C2MetadataBuilder,
+    )
+    from vllm.models.deepseek_v41.compressor import (
+        DeepseekCompressor as C2Compressor,
+    )
+
+    torch.xpu.set_device(rank)
+    device = torch.device("xpu", rank)
+    # Full-input replication runs the unsharded compressor on every PCP rank.
+    config = EngineArgs(
+        model=model_path,
+        load_format="dummy",
+        skip_tokenizer_init=True,
+        enforce_eager=True,
+        enable_prefix_caching=False,
+        max_model_len=512,
+        max_num_batched_tokens=256,
+        max_num_seqs=3,
+        block_size=256,
+    ).create_engine_config()
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=pcp_size,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=init_method,
+            backend="xccl",
+        )
+        initialize_model_parallel(
+            prefill_context_model_parallel_size=pcp_size, backend="xccl"
+        )
+        with torch.device(device):
+            compressors = [
+                C2Compressor(
+                    config,
+                    compress_ratio=2,
+                    hidden_size=512,
+                    head_dim=512,
+                    prefix=prefix,
+                )
+                for prefix in ("gathered", "reference")
+            ]
+    try:
+        compressor, reference = compressors
+        assert compressor.state_cache is not None
+        spec = compressor.state_cache.get_kv_cache_spec(config)
+        for layer in compressors:
+            assert layer.state_cache is not None
+            layer.state_cache.bind_kv_cache(
+                torch.zeros(
+                    (4, 1, spec.block_size, 1024), device=device, dtype=torch.float32
+                )
+            )
+            with torch.no_grad():
+                layer.norm.weight.fill_(1)
+        builder = C2MetadataBuilder(
+            spec, [compressor.state_cache.prefix], config, device
+        )
+        manager = PCPManager(
+            pcp_size,
+            rank,
+            device,
+            shard_decode_requests=True,
+            max_num_reqs=3,
+            max_num_tokens=256,
+        )
+        buffers = InputBuffers(3, 256, device)
+        scores = torch.randn(
+            (3, 512, 1024), generator=torch.Generator().manual_seed(42)
+        ).to(device)
+        starts = np.zeros(3, dtype=np.int32)
+        prompt_lens = np.array([19, 257, 1], dtype=np.int32)
+        phases = (
+            [(19, 105, 1), (0, 128, 0), (0, 24, 0)]
+            + [(1, 1, 1)] * 4
+            + [(0, 1, 0), (1, 1, 1)]
+        )
+        for phase, lengths in enumerate(phases):
+            order = np.flatnonzero(lengths)
+            if phase % 2:
+                order = order[::-1].copy()
+            lengths_np = np.array(lengths, dtype=np.int32)[order]
+            qsl_np = np.array([0, *accumulate(lengths_np)], dtype=np.int32)
+            positions = torch.cat(
+                [
+                    torch.arange(starts[req], starts[req] + length, device=device)
+                    for req, length in zip(order, lengths_np)
+                ]
+            )
+            num_tokens = len(positions)
+            req_ids = torch.repeat_interleave(
+                torch.tensor(order, device=device),
+                torch.tensor(lengths_np, device=device),
+            )
+            raw = scores[req_ids, positions]
+            input_batch = replace(
+                InputBatch.make_dummy(len(order), num_tokens, buffers),
+                idx_mapping=torch.tensor(order, device=device),
+                idx_mapping_np=order,
+                num_scheduled_tokens=lengths_np,
+                query_start_loc=torch.tensor(qsl_np, device=device),
+                query_start_loc_np=qsl_np,
+                seq_lens=torch.tensor(starts[order] + lengths_np, device=device),
+                seq_lens_cpu_upper_bound=torch.from_numpy(starts[order] + lengths_np),
+                num_computed_tokens_np=starts[order].copy(),
+                prefill_len_np=prompt_lens[order],
+                num_computed_prefill_tokens_np=np.minimum(
+                    starts[order], prompt_lens[order]
+                ),
+                is_prefilling_np=starts[order] < prompt_lens[order],
+                has_prefill=bool((starts[order] < prompt_lens[order]).any()),
+                input_ids=torch.arange(num_tokens, device=device, dtype=torch.int32),
+                positions=positions,
+            )
+            local = manager.partition_batch(
+                input_batch,
+                BatchExecutionDescriptor(CUDAGraphMode.NONE, num_tokens, len(order)),
+            )
+            # C2's ring consumes contiguous request chunks, unlike V4's
+            # slot-indexed states: restore order and discard replicated/padded rows.
+            gathered_raw = manager.restore_hidden_states(raw[local.input_ids.long()])
+            gathered_positions = manager.restore_hidden_states(
+                local.positions[:, None]
+            ).flatten()
+            common = CommonAttentionMetadata(
+                query_start_loc=input_batch.query_start_loc,
+                query_start_loc_cpu=torch.from_numpy(qsl_np),
+                seq_lens=input_batch.seq_lens,
+                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                num_reqs=len(order),
+                num_actual_tokens=num_tokens,
+                max_query_len=int(lengths_np.max()),
+                max_seq_len=int((starts[order] + lengths_np).max()),
+                block_table_tensor=torch.tensor(
+                    order + 1, dtype=torch.int32, device=device
+                )[:, None],
+                slot_mapping=torch.arange(num_tokens, device=device),
+                positions=gathered_positions,
+            )
+            metadata = builder.build(0, common)
+            with set_forward_context({compressor.state_cache.prefix: metadata}, config):
+                actual = compressor(gathered_raw, gathered_positions)
+            assert reference.state_cache is not None
+            reference_metadata = builder.build(0, common.replace(positions=positions))
+            with set_forward_context(
+                {reference.state_cache.prefix: reference_metadata}, config
+            ):
+                expected = reference(raw, positions)
+            assert actual is not None and expected is not None
+            valid = (positions + 1) % 2 == 0
+            assert torch.equal(actual[valid], expected[valid])
+            assert torch.equal(
+                compressor.state_cache.kv_cache, reference.state_cache.kv_cache
+            )
+            starts += lengths
+    finally:
+        cleanup_dist_env_and_memory()
+
+
+@pytest.mark.parametrize(
+    "pcp_size",
+    [
+        pytest.param(2, marks=pytest.mark.distributed(num_gpus=2), id="pcp2"),
+        pytest.param(4, marks=pytest.mark.distributed(num_gpus=4), id="pcp4"),
+    ],
+)
+def test_xpu_pcp_full_input_replication_preserves_c2_compression(
+    tmp_path, swa_model_path, pcp_size
+):
+    """Real C2 latents and ring states match unsharded compression across chunks."""
+    torch.multiprocessing.spawn(
+        _check_replicated_c2_compression,
+        args=(
+            f"file://{tmp_path / 'c2-pcp-init'}",
+            swa_model_path,
+            pcp_size,
+        ),
+        nprocs=pcp_size,
     )
 
 

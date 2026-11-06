@@ -20,6 +20,9 @@ steps:
   - vllm/model_executor/model_loader/sharded_state_loader.py
   - vllm/model_executor/models/
   - vllm/models/deepseek_v4/
+  - vllm/envs.py
+  - vllm/models/deepseek_v41/compressor.py
+  - vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
   - vllm/v1/worker/gpu/pcp_manager.py
   - vllm/v1/attention/backends/mla/sparse_swa.py
   - tests/models/test_deepseek_v4_pcp.py
@@ -49,6 +52,9 @@ steps:
     VLLM_TEST_DEVICE: "xpu"
   source_file_dependencies:
   - vllm/models/deepseek_v4/
+  - vllm/envs.py
+  - vllm/models/deepseek_v41/compressor.py
+  - vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
   - vllm/v1/worker/gpu/pcp_manager.py
   - vllm/v1/attention/backends/mla/
   - tests/models/test_deepseek_v4_pcp.py
