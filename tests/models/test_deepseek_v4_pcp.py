@@ -24,6 +24,7 @@ from vllm.distributed import (
 )
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.models.deepseek_v4.common.ops.cache_utils import quantize_and_insert_k_cache
 from vllm.models.deepseek_v4.compressor import CompressorMetadata, DeepseekCompressor
 from vllm.models.deepseek_v4.xpu.model import DeepseekV4Model
@@ -41,7 +42,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_paged_mla_sparse_interface
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
-from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.pcp_manager import PCPManager, maybe_build_pcp_manager
 
 from .utils import check_logprobs_close
 
@@ -88,46 +89,59 @@ def swa_model_path(tmp_path):
     ],
 )
 @pytest.mark.parametrize(
-    "layer_types,boundary_exchange,paged_attention,kv_chunk_size",
+    "layer_types,boundary_exchange,paged_attention,kv_chunk_size,moe_fusion",
     [
-        (["sliding_attention"] * 2, False, False, 0),
+        (["sliding_attention"] * 2, False, False, 0, False),
         (
             ["compressed_sparse_attention", "heavily_compressed_attention"],
             False,
             False,
             0,
+            False,
         ),
         (
             ["compressed_sparse_attention", "heavily_compressed_attention"],
             True,
             False,
             0,
+            False,
         ),
-        (["sliding_attention"] * 2, False, True, 0),
+        (["sliding_attention"] * 2, False, True, 0, False),
         (
             ["compressed_sparse_attention", "heavily_compressed_attention"],
             False,
             True,
             0,
+            False,
         ),
         (
             ["compressed_sparse_attention", "heavily_compressed_attention"],
             True,
             True,
             0,
+            False,
         ),
-        (["sliding_attention"] * 2, False, False, 16),
+        (["sliding_attention"] * 2, False, False, 16, False),
         (
             ["compressed_sparse_attention", "heavily_compressed_attention"],
             False,
             False,
             16,
+            False,
         ),
         (
             ["compressed_sparse_attention", "heavily_compressed_attention"],
             True,
             False,
             16,
+            False,
+        ),
+        (
+            ["compressed_sparse_attention", "heavily_compressed_attention"],
+            True,
+            False,
+            16,
+            True,
         ),
     ],
     ids=[
@@ -140,6 +154,7 @@ def swa_model_path(tmp_path):
         "pipeline-swa",
         "pipeline-c4a-c128a",
         "pipeline-boundary-c4a-c128a",
+        "deepsymm-pipeline-boundary-c4a-c128a",
     ],
 )
 def test_xpu_pcp_matches_single_rank(
@@ -149,6 +164,7 @@ def test_xpu_pcp_matches_single_rank(
     boundary_exchange,
     paged_attention,
     kv_chunk_size,
+    moe_fusion,
     pcp_world_size,
     monkeypatch,
 ):
@@ -164,6 +180,9 @@ def test_xpu_pcp_matches_single_rank(
     results = []
     for pcp_size in (1, pcp_world_size):
         monkeypatch.setenv(
+            "VLLM_XPU_PCP_MOE_FUSION", str(int(moe_fusion and pcp_size > 1))
+        )
+        monkeypatch.setenv(
             "VLLM_XPU_PCP_KV_CHUNK_SIZE",
             str(kv_chunk_size if pcp_size > 1 else 0),
         )
@@ -173,7 +192,7 @@ def test_xpu_pcp_matches_single_rank(
         )
         with vllm_runner(
             swa_model_path,
-            dtype="bfloat16" if kv_chunk_size else "auto",
+            dtype="bfloat16" if kv_chunk_size or moe_fusion else "auto",
             load_format="dummy",
             skip_tokenizer_init=True,
             enforce_eager=True,
@@ -189,7 +208,11 @@ def test_xpu_pcp_matches_single_rank(
             hf_overrides={
                 "layer_types": layer_types,
                 "index_topk": 16,
+                "topk_method": "noaux_tc",
                 "num_attention_heads": 32 if paged_attention or kv_chunk_size else 4,
+                "mlp_layer_types": ["hash_moe", "moe"]
+                if moe_fusion
+                else ["hash_moe"] * 2,
             },
         ) as runner:
             batch_results = []
@@ -219,6 +242,69 @@ def test_xpu_pcp_matches_single_rank(
         name_0="PCP=1",
         name_1=f"PCP={pcp_world_size}",
         always_check_logprobs=True,
+    )
+
+
+def _check_local_moe_padding(rank, init_method, model_path):
+    torch.xpu.set_device(rank)
+    device = torch.device("xpu", rank)
+    config = EngineArgs(
+        model=model_path,
+        skip_tokenizer_init=True,
+        enforce_eager=True,
+        prefill_context_parallel_size=2,
+        distributed_executor_backend="mp",
+        max_model_len=512,
+        max_num_batched_tokens=128,
+        max_num_seqs=3,
+    ).create_engine_config()
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=2,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=init_method,
+            backend="xccl",
+        )
+        initialize_model_parallel(prefill_context_model_parallel_size=2, backend="xccl")
+        try:
+            manager = maybe_build_pcp_manager(config, device, supports_mm_inputs=False)
+            assert manager is not None
+            batch = InputBatch.make_dummy(
+                num_reqs=3,
+                num_tokens=3,
+                input_buffers=InputBuffers(3, 128, device),
+                max_query_len=1,
+                is_padding=False,
+            )
+            local = manager.partition_batch(
+                batch,
+                BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.NONE, num_tokens=4, num_reqs=None
+                ),
+            )
+            rows = local.num_tokens_after_padding
+            hidden = torch.ones(rows, 4, device=device)
+            logits = torch.arange(8, device=device, dtype=torch.float32)
+            logits = logits.expand(rows, -1).contiguous()
+            with set_forward_context(None, config, is_padding=local.is_padding):
+                _, ids, _ = fused_topk(hidden, logits, 2, False)
+            assert local.num_tokens == (2 if rank == 0 else 1)
+            assert (ids[: local.num_tokens] >= 0).all()
+            assert (ids[local.num_tokens :] == -1).all()
+        finally:
+            cleanup_dist_env_and_memory()
+
+
+@pytest.mark.distributed(num_gpus=2)
+def test_xpu_deepsymm_routes_local_padding(swa_model_path, tmp_path, monkeypatch):
+    """Uneven PCP ranks must not apply rank zero's padding to local routing."""
+    monkeypatch.setenv("VLLM_XPU_PCP_MOE_FUSION", "1")
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
+    torch.multiprocessing.spawn(
+        _check_local_moe_padding,
+        args=(f"file://{tmp_path / 'pcp-init'}", swa_model_path),
+        nprocs=2,
     )
 
 

@@ -20,6 +20,7 @@ steps:
   - vllm/model_executor/model_loader/sharded_state_loader.py
   - vllm/model_executor/models/
   - vllm/models/deepseek_v4/
+  - vllm/model_executor/layers/fused_moe/
   - vllm/envs.py
   - vllm/v1/attention/ops/xpu_mla_sparse.py
   - vllm/models/deepseek_v41/compressor.py
@@ -53,6 +54,7 @@ steps:
     VLLM_TEST_DEVICE: "xpu"
   source_file_dependencies:
   - vllm/models/deepseek_v4/
+  - vllm/model_executor/layers/fused_moe/
   - vllm/envs.py
   - vllm/v1/attention/ops/xpu_mla_sparse.py
   - vllm/models/deepseek_v41/compressor.py

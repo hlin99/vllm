@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     GroupCoordinator,
@@ -197,6 +198,13 @@ def maybe_make_prepare_finalize(
     all2all_manager: Any | None = None,
     input_dtype: torch.dtype | None = None,
 ) -> FusedMoEPrepareAndFinalize | None:
+    if envs.VLLM_XPU_PCP_MOE_FUSION:
+        from .prepare_finalize.xpu_deepsymm import XPUDeepSymmPrepareAndFinalize
+
+        if use_monolithic:
+            raise ValueError("DeepSymm PCP MoE requires a modular XPU expert backend")
+        return XPUDeepSymmPrepareAndFinalize(moe)
+
     if moe.moe_parallel_config.use_passthrough_all2all:
         # The experts dispatch and combine themselves, in every EP topology.
         return PassThroughPrepareAndFinalize()

@@ -79,6 +79,23 @@ Chunk grouping changes BF16 accumulation order, so generated tokens and
 logprobs are not guaranteed to match the original path. Validate model accuracy
 and end-to-end performance before enabling this experimental option.
 
+Set `VLLM_XPU_PCP_MOE_FUSION=1` to use DeepSymm's fused MoE
+all-gather/permute and weighted unpermute/reduce-scatter. The default is `0`.
+Routing, including hash routing, runs on local tokens; expert weights remain
+tensor-sharded across PCP ranks. The combine returns local token rows, so no
+additional PCP reduce-scatter is performed. Shared experts keep their existing
+path. This can be combined with the attention pipeline above.
+
+This experimental single-node path requires an installed, native-compatible
+DeepSymm build and `vllm_xpu_kernels` with `XpuFusedMoe.apply_permuted`.
+It supports BF16 activations, at most 512 experts, PCP greater than one,
+and TP=DP=1, with eager execution. EP, PCP-by-TP topologies, DBO, LoRA,
+and EPLB are not supported. All MoE layers must use the same hidden size,
+top-k, and workspace capacity. Unsupported configurations or missing native
+dependencies raise errors rather than silently using the unfused path.
+Floating-point reduction order can change; validate generation quality and
+serving performance on the intended workload before enabling it.
+
 ## Decode Context Parallel
 
 Due to the auto-regressive nature of decoding, every decoding step needs to compute a small amount of query tokens w.r.t. a large number of key/value tokens stored in the paged KV cache. The core of decode context parallel is how to shard the KV cache across GPUs.

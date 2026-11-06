@@ -344,6 +344,7 @@ if TYPE_CHECKING:
     VLLM_XPU_PCP_BOUNDARY_EXCHANGE: bool = False
     VLLM_XPU_PAGED_SPARSE_ATTN: bool = False
     VLLM_XPU_PCP_KV_CHUNK_SIZE: int = 0
+    VLLM_XPU_PCP_MOE_FUSION: bool = False
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
@@ -2353,6 +2354,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Rank-local KV rows per direct IPC/attention chunk; zero disables pipelining.
     "VLLM_XPU_PCP_KV_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_XPU_PCP_KV_CHUNK_SIZE", "0")
+    ),
+    # Fuse PCP MoE dispatch/combine through DeepSymm on XPU (opt-in).
+    "VLLM_XPU_PCP_MOE_FUSION": lambda: bool(
+        int(os.getenv("VLLM_XPU_PCP_MOE_FUSION", "0"))
     ),
     # Kernel backend for INC weight-only intN (WNA16) linear layers on XPU.
     # "auto" keeps the default preference order (ARK when importable, else the

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
@@ -927,6 +928,8 @@ def maybe_build_pcp_manager(
         dcp_world_size=dcp_size,
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
-        # Without EP all2all kernels, MoERunner all-gathers PCP tokens to route.
-        moe_gathers_tokens=not parallel_config.enable_expert_parallel,
+        moe_gathers_tokens=(
+            not parallel_config.enable_expert_parallel
+            and not envs.VLLM_XPU_PCP_MOE_FUSION
+        ),
     )

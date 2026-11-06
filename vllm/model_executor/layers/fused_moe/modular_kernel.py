@@ -193,6 +193,11 @@ class FusedMoEPrepareAndFinalize(ABC):
     * FusedMoEPrepareAndFinalizeMonolithic - the operates on router_logits
     """
 
+    @property
+    def handles_pcp(self) -> bool:
+        """Whether the kernel owns PCP dispatch and combine."""
+        return False
+
     def post_init_setup(self, fused_experts: "FusedMoEExperts"):
         """Initialize FusedMoEPrepareAndFinalizeModular settings that depend on
         FusedMoEExpertsModular experts object.
