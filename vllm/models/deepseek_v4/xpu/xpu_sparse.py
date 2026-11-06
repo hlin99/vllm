@@ -324,7 +324,7 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         if chunk_size < 0:
             raise ValueError("VLLM_XPU_PCP_KV_CHUNK_SIZE must be nonnegative")
         group = get_pcp_group()
-        if chunk_size and group.world_size > 1 and self.compress_ratio != 4:
+        if chunk_size and group.world_size > 1:
             if vllm_config.model_config.dtype != torch.bfloat16:
                 raise ValueError("The XPU PCP KV pipeline requires BF16")
             self._pcp_swa_pipeline = get_pcp_swa_pipeline(

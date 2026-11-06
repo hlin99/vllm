@@ -295,8 +295,19 @@ AG + expert permute
 unpermute + top-k 加权归并 + RS
 ```
 
-需要匹配 V4 当前量化、路由、shared expert 和 padding 语义，不能直接套用
-一个仅支持普通 BF16 dense GEMM 的接口。
+TPSP 的 dispatch 已支持 FP8 数据和 scale 随 permute 传递，并不只是 BF16
+数据搬运。但接入时仍需要匹配 V4 当前量化、路由、shared expert 和 padding 语义。
+
+P3 尚未实现。当前 `XPUExperts.apply` 调用的 `XpuFusedMoe.apply` 内部完成
+`remap_hidden_states → 两次 grouped GEMM → moe_gather`，没有公开“直接消费
+已 permute 输入”和“返回未 unpermute 专家输出”的接入点。只替换外层 AG/RS
+会重复 permute、归并或加权，不是真融合。需要先拆出这两个 backend 边界，
+shared expert 仍单独处理，不能重复参加 routed output 的 RS。
+
+另外，TPSP 的 Python `SymmBuffer` 可以导入，但实际加载 `deep_symm_cpp`
+时因缺少 SYCL `submit_kernel_direct_with_event_impl` 符号失败；
+这份预编译插件与当前 SYCL 运行库不匹配。需要匹配工具链重新构建或提供兼容
+插件，不能隐藏加载错误或强行替换共享环境的运行库。
 
 ## 7. 实施顺序与验收
 
@@ -327,16 +338,69 @@ P1a 的 kernel 已能跨调用保存 FP32 numerator、指数和与最大值，�
 P1b 当前原型用 PyTorch XPU symmetric memory 建立共享 IPC arena，Qnorm/RoPE
 直接写本卡发送段；通信 stream 拉取远端 chunk，按 event 就绪后量化入 cache，
 attention 按物理 slot 的 chunk 归属累积 SWA。历史 KV 单独先算，不额外拼接
-或重排 KV。C128 压缩贡献最后合并，C4 尚未启用。
+或重排 KV。P1b 只在 SWA/C128 启用，C128 压缩贡献最后合并。
+
+P2 将同一调度接入 C4：先累积 SWA 的 FP32 状态，等现有 indexer 的全局
+top-k 完成后，再读取所选 compressed KV，合并贡献并最终归一化。
+Indexer K 的通信与全局选择逻辑不变，没有宣称流水化 indexer 自身，
+也没有引入 V4.1 indexer K 的通用设计。PCP2/4、两种 compressor 路径的
+4 项 `LLM.generate` 回归通过，覆盖分块 prefill、decode 和空 peer。
+真实 PCP8、chunk=8 的长任务仍得到 56088，但只与原路径共享前 5 个输出
+token，结尾标签不同；首 token logprob 差 0.00405，共同前缀最大差 0.23097。
+尚不能宣称长上下文等价。
+
+补充将 chunk 降为 1，确保三个短任务的 prefill 和 decode 都激活流水线，
+各检查前 32 个生成 token：算术任务的 token 和完整 top-5 logprob 一致；
+KV cache 任务的 32 个 token 一致，但 logprob 最大差 0.22082；
+Python 任务只共享前 26 个 token，之后发生分歧。这里检查的是前缀，
+不是完整回复，不能把先前走回退的精确结果代替这组激活路径的结果。
+
+进一步在真实权重的第一个 128-token prefill 上，对 8 个 rank、43 层逐层
+使用完全相同的 Q 和 cache 比较流水线、原 attention 和 FP32 softmax 参考。
+344 组均满足既有 BF16 的 `rtol=atol=1e-2`；C4 的流水线与原实现最大
+relative RMS 为 0.1285%，C128 为 0.0281%，SWA 完全相同。
+两种实现相对 FP32 参考的最大 relative RMS 都约 0.18%。
+这验证了该输入上的局部数值误差，没有证明完整模型生成等价，也不能把
+所有生成分歧都归因于原路径自身波动。
+
+P2 相同 serving 配置三轮全部完成 16 个请求、失败 0 个：
+
+| 路径 | 三轮整批耗时中位数 (s) | 相对原路径 |
+| --- | --- | --- |
+| 原路径 | 287.950 | 基线 |
+| P0 paged | 340.339 | 慢 18.19% |
+| P2 SWA/C4/C128 流水线，chunk=8 | 323.864 | 慢 12.47% |
+
+P2 三轮分别为 323.878、323.864、323.856 秒，比 P0 paged 的耗时减少
+4.84%，但没有超过原路径。三组均为真实 V4 Flash、8 张 B70、PCP8/TP1、
+16 个 8192-token 输入、各输出 1 token、budget=128，首轮前预热 8 次，
+计时期间没有开启 profiler；原路径和 P0 对照在本 session 较早时测量。
+默认继续关闭。
+
+整机 timeline 还捕获了超过 2048-token 上下文、实际执行 indexer logits 与
+全局 top-k 的一个迭代。8 个 rank、21 个 C4 层均确认同一 SYCL queue 上
+先提交 3 次 SWA partial attention，再执行 indexer logits/top-k，最后提交
+compressed contribution 的 attention。部分 profiler 设备时间戳在同一 queue
+上有约 1 微秒重叠，因此不把时间戳不等式当作独立的同步正确性证明。
+
+该迭代每卡有 172 次 attention 和 688 次 cache quantize launch。
+Attention 的 kernel 时间和约 232–242 毫秒，占该卡所有 kernel 时间和的
+72–75%；KV peer copy 时间和约 1.36 毫秒，profiler 记录与 attention 重叠
+约 55–61 微秒。这里不是整次 serving 的墙钟耗时，也不是可直接相减的
+加速收益。下一步应先优化 attention 本身，而不是假定把通信再重叠一点
+或只减少约 3 毫秒的 quantize kernel 就能解决这组回归。
 
 分布式 cache 与 sparse kernel 的 10 项测试通过；原路径、paged 对照及新增
 PCP2/4 pipeline 模式共 8 项 `LLM.generate` 测试通过。真实 V4 Flash、PCP8、
 chunk=8 的三个短任务也与原路径 token 和完整 top-5 logprob 一致。5122-token
 长任务生成的 8 个 token 相同，但首 token logprob 差 0.02452、共同输出前缀的
 最大 logprob 差 0.39433；原路径自身复跑也有变化，不能据此宣称长上下文等价。
+注意这三个短输入在 PCP8 下每卡仅有 2–6 个 padded query rows，chunk=8 时
+实际走的是原路径回退，只能证明回退行为不变，不能当作流水线激活时的精度证据。
 相同 serving 配置的一轮测试完成 16 个请求、失败 0 个，耗时 290.85 秒；
 相对新测原路径三轮中位数 287.95 秒慢约 1.0%，比 P0 paged 的
-340.34 秒短。流水线目前只有一轮，不能称为三轮中位数或证明加速；
+340.34 秒短。但 P1b 的 C4 仍走原路径，不能把这个差值归因于流水线收益。
+流水线目前只有一轮，不能称为三轮中位数或证明加速；
 新开关默认关闭。
 
 原型的两卡 B70 算子对照已覆盖每卡 16、128、1024、4096 token，128 heads、

@@ -59,17 +59,22 @@ the gather-based attention path. This switch does not yet overlap KV
 communication with attention, and does not guarantee a speedup.
 
 Set `VLLM_XPU_PCP_KV_CHUNK_SIZE` to a positive number of rank-local token rows
-to enable experimental SWA KV communication/attention pipelining for SWA and
-C128A layers. This single-node BF16 path requires PyTorch XPU symmetric memory.
+to enable experimental SWA KV communication/attention pipelining for SWA,
+C4A, and C128A layers. This single-node BF16 path requires PyTorch XPU symmetric memory.
 KV is generated directly in a shared IPC arena; remote chunks are copied into
 their receive segments, quantized into the existing cache, and consumed with
 FP32 partial-softmax state. Historical KV can be consumed before remote chunks
 arrive. There is no additional KV concatenation or local publish copy.
-C4A still uses the original communication schedule. Batches with at most one
-chunk retain the original path unless paged attention is separately enabled.
+C4A consumes SWA chunks before global indexer selection, then merges the
+compressed contribution after global top-k is available. Indexer K communication
+and selection are unchanged. Batches with at most one chunk retain the original
+path unless paged attention is separately enabled.
 The default, `0`, disables the pipeline. Small transfers may not overlap usefully,
 and additional events, partial-state traffic and kernel launches can outweigh
 communication savings.
+Chunk grouping changes BF16 accumulation order, so generated tokens and
+logprobs are not guaranteed to match the original path. Validate model accuracy
+and end-to-end performance before enabling this experimental option.
 
 ## Decode Context Parallel
 
