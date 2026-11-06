@@ -84,19 +84,30 @@ def swa_model_path(tmp_path):
     ],
 )
 @pytest.mark.parametrize(
-    "layer_types,boundary_exchange",
+    "layer_types,boundary_exchange,paged_attention",
     [
-        (["sliding_attention"] * 2, False),
-        (["compressed_sparse_attention", "heavily_compressed_attention"], False),
-        (["compressed_sparse_attention", "heavily_compressed_attention"], True),
+        (["sliding_attention"] * 2, False, False),
+        (["compressed_sparse_attention", "heavily_compressed_attention"], False, False),
+        (["compressed_sparse_attention", "heavily_compressed_attention"], True, False),
+        (["sliding_attention"] * 2, False, True),
+        (["compressed_sparse_attention", "heavily_compressed_attention"], False, True),
+        (["compressed_sparse_attention", "heavily_compressed_attention"], True, True),
     ],
-    ids=["swa", "c4a-c128a", "boundary-c4a-c128a"],
+    ids=[
+        "swa",
+        "c4a-c128a",
+        "boundary-c4a-c128a",
+        "paged-swa",
+        "paged-c4a-c128a",
+        "paged-boundary-c4a-c128a",
+    ],
 )
 def test_xpu_pcp_matches_single_rank(
     vllm_runner,
     swa_model_path,
     layer_types,
     boundary_exchange,
+    paged_attention,
     pcp_world_size,
     monkeypatch,
 ):
@@ -111,6 +122,10 @@ def test_xpu_pcp_matches_single_rank(
     ]
     results = []
     for pcp_size in (1, pcp_world_size):
+        monkeypatch.setenv(
+            "VLLM_XPU_PAGED_SPARSE_ATTN",
+            str(int(paged_attention and pcp_size > 1)),
+        )
         with vllm_runner(
             swa_model_path,
             load_format="dummy",

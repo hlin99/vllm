@@ -9,9 +9,11 @@ This keeps the external KV cache layout identical to CUDA/ROCm.
 
 import torch
 
+from vllm import envs
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.xpu_mla_sparse import (
     triton_bf16_mla_sparse_interface,
+    triton_paged_mla_sparse_interface,
 )
 
 # FP8 DS MLA cache layout constants
@@ -163,6 +165,19 @@ def xpu_sparse_decode_fp8(
     Performance is slower due to on-the-fly dequant, but correctness is
     guaranteed by reusing the validated BF16 attention kernel.
     """
+    if envs.VLLM_XPU_PAGED_SPARSE_ATTN:
+        triton_paged_mla_sparse_interface(
+            q,
+            None if swa_only else kv_cache,
+            swa_kv_cache,
+            None if swa_only else topk_indices,
+            None if swa_only else topk_lens,
+            swa_indices,
+            swa_lens,
+            softmax_scale,
+            out,
+        )
+        return
     num_tokens = q.shape[0]
     device = q.device
 

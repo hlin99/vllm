@@ -50,6 +50,14 @@ unchanged. The default, `0`, retains the full-input replication path. Boundary
 exchange adds packing and collective overhead, so it is not necessarily faster
 for short chunks or large numbers of requests.
 
+Set `VLLM_XPU_PAGED_SPARSE_ATTN=1` to fuse paged KV reads and FP8
+dequantization into DeepSeek V4's XPU sparse attention kernel. This optional
+BF16 path supports prefill and decode, SWA, C4A, and C128A, and both compressor
+communication modes. It removes the intermediate BF16 KV workspace without
+changing the cache format or adding a KV reorder. The default, `0`, retains
+the gather-based attention path. This switch does not yet overlap KV
+communication with attention, and does not guarantee a speedup.
+
 ## Decode Context Parallel
 
 Due to the auto-regressive nature of decoding, every decoding step needs to compute a small amount of query tokens w.r.t. a large number of key/value tokens stored in the paged KV cache. The core of decode context parallel is how to shard the KV cache across GPUs.

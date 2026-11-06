@@ -48,7 +48,10 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
     DeepseekSparseSWAMetadataBuilder,
 )
-from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
+from vllm.v1.attention.ops.xpu_mla_sparse import (
+    triton_bf16_mla_sparse_interface,
+    triton_paged_mla_sparse_interface,
+)
 from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -402,6 +405,9 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         attn_metadata = forward_context.attn_metadata
 
         if attn_metadata is None:
+            if envs.VLLM_XPU_PAGED_SPARSE_ATTN:
+                output.zero_()
+                return
             # Warmup dummy run: reserve workspace, skip actual kernels.
             swa_only = self.compress_ratio <= 1
             N = (
@@ -532,6 +538,42 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         num_prefill_tokens = swa_metadata.num_prefill_tokens
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+        if envs.VLLM_XPU_PAGED_SPARSE_ATTN:
+            assert swa_metadata.prefill_swa_indices is not None
+            assert swa_metadata.prefill_swa_lens is not None
+            global_indices = None
+            topk_lens = None
+            if not swa_only:
+                assert attn_metadata is not None
+                assert swa_metadata.token_to_req_indices is not None
+                assert swa_metadata.is_valid_token is not None
+                if self.compress_ratio == 4:
+                    assert self.topk_indices_buffer is not None
+                    topk_indices = self.topk_indices_buffer[
+                        num_decode_tokens : num_decode_tokens + num_prefill_tokens
+                    ]
+                else:
+                    topk_indices = attn_metadata.c128a_prefill_topk_indices
+                assert topk_indices is not None
+                global_indices, topk_lens = compute_global_topk_indices_and_lens(
+                    topk_indices,
+                    swa_metadata.token_to_req_indices[num_decode_tokens:],
+                    attn_metadata.block_table,
+                    attn_metadata.block_size // self.compress_ratio,
+                    swa_metadata.is_valid_token[num_decode_tokens:],
+                )
+            triton_paged_mla_sparse_interface(
+                q[:num_prefill_tokens],
+                compressed_k_cache,
+                swa_k_cache,
+                global_indices,
+                topk_lens,
+                swa_metadata.prefill_swa_indices,
+                swa_metadata.prefill_swa_lens,
+                self.scale,
+                output[:num_prefill_tokens],
+            )
+            return
 
         # Use pre-computed prefill metadata.
         seq_lens = swa_metadata.prefill_seq_lens

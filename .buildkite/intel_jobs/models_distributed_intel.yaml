@@ -21,6 +21,7 @@ steps:
   - vllm/model_executor/models/
   - vllm/models/deepseek_v4/
   - vllm/envs.py
+  - vllm/v1/attention/ops/xpu_mla_sparse.py
   - vllm/models/deepseek_v41/compressor.py
   - vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
   - vllm/v1/worker/gpu/pcp_manager.py
@@ -53,6 +54,7 @@ steps:
   source_file_dependencies:
   - vllm/models/deepseek_v4/
   - vllm/envs.py
+  - vllm/v1/attention/ops/xpu_mla_sparse.py
   - vllm/models/deepseek_v41/compressor.py
   - vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
   - vllm/v1/worker/gpu/pcp_manager.py

@@ -7,6 +7,52 @@ from vllm.triton_utils import LOG2E, LOGE2, tl, triton
 
 
 @triton.jit
+def _load_paged_latents(
+    compressed_cache,
+    swa_cache,
+    slots,
+    valid,
+    is_swa,
+    COMPRESSED_BLOCK_SIZE: tl.constexpr,
+    COMPRESSED_PAGE_STRIDE: tl.constexpr,
+    SWA_BLOCK_SIZE: tl.constexpr,
+    SWA_PAGE_STRIDE: tl.constexpr,
+):
+    slots = slots.to(tl.int64)
+    compressed_offsets = slots // COMPRESSED_BLOCK_SIZE * COMPRESSED_PAGE_STRIDE
+    swa_offsets = slots // SWA_BLOCK_SIZE * SWA_PAGE_STRIDE
+    page = tl.where(
+        is_swa, swa_cache + swa_offsets, compressed_cache + compressed_offsets
+    )
+    pos = tl.where(is_swa, slots % SWA_BLOCK_SIZE, slots % COMPRESSED_BLOCK_SIZE)
+    block_size = tl.where(is_swa, SWA_BLOCK_SIZE, COMPRESSED_BLOCK_SIZE)
+    dims = tl.arange(0, 512)
+    data = page + pos * 576
+    fp8 = tl.load(
+        data[None, :] + dims[:, None],
+        mask=valid[None, :] & (dims[:, None] < 448),
+        other=0,
+    ).to(tl.float8e4nv, bitcast=True)
+    scales = tl.load(
+        page[None, :]
+        + block_size[None, :] * 576
+        + pos[None, :] * 8
+        + dims[:, None] // 64,
+        mask=valid[None, :] & (dims[:, None] < 448),
+        other=127,
+    )
+    dequant = fp8.to(tl.float32) * tl.exp2(scales.to(tl.float32) - 127.0)
+    rope = tl.load(
+        (data[None, :] + 448 + 2 * (dims[:, None] - 448)).to(
+            tl.pointer_type(tl.bfloat16)
+        ),
+        mask=valid[None, :] & (dims[:, None] >= 448),
+        other=0,
+    )
+    return tl.where(dims[:, None] < 448, dequant, rope).to(tl.bfloat16)
+
+
+@triton.jit
 def _bf16_mla_sparse_kernel(
     q_buffer,
     k_buffer,
@@ -41,6 +87,19 @@ def _bf16_mla_sparse_kernel(
     BLOCK_DMODEL: tl.constexpr,  # block size for dim_nope
     BLOCK_DPE: tl.constexpr,  # block size for positional embedding
     LOGE2: tl.constexpr,
+    swa_indices_ptr=None,
+    swa_lens_ptr=None,
+    topk_lens_ptr=None,
+    stride_swa_indices_token: tl.constexpr = 0,
+    PAGED_KV: tl.constexpr = False,
+    TOPK_WIDTH: tl.constexpr = 0,
+    SWA_WIDTH: tl.constexpr = 0,
+    COMPRESSED_BLOCK_SIZE: tl.constexpr = 1,
+    COMPRESSED_PAGE_STRIDE: tl.constexpr = 0,
+    SWA_BLOCK_SIZE: tl.constexpr = 1,
+    SWA_PAGE_STRIDE: tl.constexpr = 0,
+    COMPRESSED_SLOTS: tl.constexpr = 0,
+    STORE_STATS: tl.constexpr = True,
 ):
     cur_q = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -80,21 +139,49 @@ def _bf16_mla_sparse_kernel(
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
+    if PAGED_KV:
+        if TOPK_WIDTH > 0:
+            topk_len = tl.minimum(
+                tl.maximum(tl.load(topk_lens_ptr + cur_q), 0), TOPK_WIDTH
+            )
+        else:
+            topk_len = 0
+        swa_len = tl.minimum(tl.maximum(tl.load(swa_lens_ptr + cur_q), 0), SWA_WIDTH)
+
     for start_indice in range(0, index_topk, BLOCK_N):
         offs_indice = start_indice + tl.arange(0, BLOCK_N)
         mask_indice = offs_indice < index_topk
-        indices = tl.load(
-            indices_ptr
-            + (
-                cur_q * stride_indices_token
-                + cur_kv_head_id * stride_indices_head
-                + offs_indice
-            ),
-            mask=mask_indice,
-            other=-1,
-        )
-
-        mask_kv = (indices >= 0) & (indices < seq_kv)
+        if PAGED_KV:
+            is_swa = offs_indice >= topk_len
+            swa_offsets = offs_indice - topk_len
+            swa_slots = tl.load(
+                swa_indices_ptr + cur_q * stride_swa_indices_token + swa_offsets,
+                mask=is_swa & (swa_offsets < swa_len),
+                other=-1,
+            )
+            if TOPK_WIDTH > 0:
+                compressed_slots = tl.load(
+                    indices_ptr + cur_q * stride_indices_token + offs_indice,
+                    mask=offs_indice < topk_len,
+                    other=-1,
+                )
+            else:
+                compressed_slots = tl.full((BLOCK_N,), -1, tl.int32)
+            indices = tl.where(is_swa, swa_slots, compressed_slots)
+            capacity = tl.where(is_swa, seq_kv, COMPRESSED_SLOTS)
+            mask_kv = (indices >= 0) & (indices < capacity)
+        else:
+            indices = tl.load(
+                indices_ptr
+                + (
+                    cur_q * stride_indices_token
+                    + cur_kv_head_id * stride_indices_head
+                    + offs_indice
+                ),
+                mask=mask_indice,
+                other=-1,
+            )
+            mask_kv = (indices >= 0) & (indices < seq_kv)
         mask_kv_d = mask_dmodel
         offs_k = (
             indices[None, :] * stride_k_token
@@ -103,9 +190,24 @@ def _bf16_mla_sparse_kernel(
         )
 
         # q_nope @ k_nope
-        k = tl.load(
-            k_buffer + offs_k, mask=(mask_kv[None, :]) & (mask_kv_d[:, None]), other=0.0
-        )
+        if PAGED_KV:
+            k = _load_paged_latents(
+                k_buffer,
+                v_buffer,
+                indices,
+                mask_kv,
+                is_swa,
+                COMPRESSED_BLOCK_SIZE,
+                COMPRESSED_PAGE_STRIDE,
+                SWA_BLOCK_SIZE,
+                SWA_PAGE_STRIDE,
+            )
+        else:
+            k = tl.load(
+                k_buffer + offs_k,
+                mask=(mask_kv[None, :]) & (mask_kv_d[:, None]),
+                other=0.0,
+            )
         qk = tl.dot(q, k.to(q.dtype))
 
         if BLOCK_DPE > 0:
@@ -134,9 +236,14 @@ def _bf16_mla_sparse_kernel(
             + cur_kv_head_id * stride_v_head
             + offs_dv[None, :]
         )
-        v = tl.load(
-            v_buffer + offs_v, mask=(mask_kv[:, None]) & (mask_v_d[None, :]), other=0.0
-        )
+        if PAGED_KV:
+            v = tl.trans(k)
+        else:
+            v = tl.load(
+                v_buffer + offs_v,
+                mask=(mask_kv[:, None]) & (mask_v_d[None, :]),
+                other=0.0,
+            )
 
         # online softmax
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
@@ -172,8 +279,9 @@ def _bf16_mla_sparse_kernel(
     )
 
     offs_lse = cur_q * stride_lse + cur_head
-    tl.store(softmax_lse_ptr + offs_lse, lse, mask=mask_h)
-    tl.store(max_logits_ptr + offs_lse, max_logits, mask=mask_h)
+    if STORE_STATS:
+        tl.store(softmax_lse_ptr + offs_lse, lse, mask=mask_h)
+        tl.store(max_logits_ptr + offs_lse, max_logits, mask=mask_h)
 
 
 # reference implementation of bf16 sparse prefill kernel
@@ -277,3 +385,90 @@ def triton_bf16_mla_sparse_interface(
     )
 
     return out, max_logits, softmax_lse
+
+
+def triton_paged_mla_sparse_interface(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    swa_cache: torch.Tensor,
+    topk_indices: torch.Tensor | None,
+    topk_lens: torch.Tensor | None,
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    sm_scale: float,
+    out: torch.Tensor,
+) -> None:
+    """Attend directly to two paged UE8M0 caches without materializing BF16 KV.
+
+    Indices are physical slots, with valid entries in each row's length prefix.
+    Cache pages store 576 data bytes per token followed by eight scale bytes;
+    page strides may include padding or gaps. K and V share the same latent.
+    """
+    assert q.dtype == torch.bfloat16 and q.shape[-1] == 512
+    assert out.shape == q.shape and out.dtype == q.dtype
+    assert swa_cache.dtype == torch.uint8 and swa_cache.ndim == 3
+    has_compressed = kv_cache is not None
+    if has_compressed:
+        assert kv_cache is not None and kv_cache.dtype == torch.uint8
+        assert kv_cache.ndim == 3
+        assert topk_indices is not None and topk_lens is not None
+    else:
+        assert topk_indices is None and topk_lens is None
+    if q.shape[0] == 0:
+        return
+    topk_width = topk_indices.shape[-1] if topk_indices is not None else 0
+    swa_width = swa_indices.shape[-1]
+    cache = kv_cache if kv_cache is not None else swa_cache
+    block_h = 16
+    _bf16_mla_sparse_kernel[
+        (q.shape[0], triton.cdiv(q.shape[1], min(block_h, q.shape[1])))
+    ](
+        q_buffer=q,
+        k_buffer=cache,
+        v_buffer=swa_cache,
+        indices_ptr=topk_indices,
+        out_ptr=out,
+        softmax_lse_ptr=None,
+        max_logits_ptr=None,
+        seq_q=q.shape[0],
+        seq_kv=swa_cache.shape[0] * swa_cache.shape[1],
+        h_q=q.shape[1],
+        dim_qk=512,
+        dim_v=512,
+        stride_q_token=q.stride(0),
+        stride_q_head=q.stride(1),
+        stride_k_token=0,
+        stride_k_head=0,
+        stride_v_token=0,
+        stride_v_head=0,
+        stride_out_token=out.stride(0),
+        stride_out_head=out.stride(1),
+        stride_lse=0,
+        stride_indices_token=(
+            topk_indices.stride(0) if topk_indices is not None else 0
+        ),
+        stride_indices_head=0,
+        sm_scale=sm_scale * LOG2E,
+        kv_group_num=q.shape[1],
+        index_topk=triton.cdiv(topk_width + swa_width, 16) * 16,
+        BLOCK_H=block_h,
+        BLOCK_M=32,
+        BLOCK_N=16,
+        BLOCK_DV=512,
+        BLOCK_DMODEL=512,
+        BLOCK_DPE=0,
+        LOGE2=LOGE2,
+        swa_indices_ptr=swa_indices,
+        swa_lens_ptr=swa_lens,
+        topk_lens_ptr=topk_lens,
+        stride_swa_indices_token=swa_indices.stride(0),
+        PAGED_KV=True,
+        TOPK_WIDTH=topk_width,
+        SWA_WIDTH=swa_width,
+        COMPRESSED_BLOCK_SIZE=cache.shape[1],
+        COMPRESSED_PAGE_STRIDE=cache.stride(0),
+        SWA_BLOCK_SIZE=swa_cache.shape[1],
+        SWA_PAGE_STRIDE=swa_cache.stride(0),
+        COMPRESSED_SLOTS=cache.shape[0] * cache.shape[1],
+        STORE_STATS=False,
+    )
