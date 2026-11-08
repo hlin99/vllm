@@ -30,8 +30,9 @@ across ranks or prefill chunks. PCP sizes 2 and 4 have been validated with reduc
 dummy models. Other sizes are not restricted by this model implementation, but
 still need to satisfy the regular hardware and tensor-shape requirements.
 Full-checkpoint quality and performance need separate validation.
-PP, DP, DCP, expert parallelism, speculative decoding, LoRA, and KV transfer
-are not supported in this initial path.
+PP, DP, DCP, speculative decoding, LoRA, and KV transfer are not supported.
+Expert parallelism uses all-gather/reduce-scatter by default, with an
+experimental native DeepEP HT option below.
 
 The full-input replication strategy is not tied to a compression ratio.
 Lower-level multi-XPU tests also cover the real V4.1 C2 compressor, without
@@ -79,7 +80,7 @@ Chunk grouping changes BF16 accumulation order, so generated tokens and
 logprobs are not guaranteed to match the original path. Validate model accuracy
 and end-to-end performance before enabling this experimental option.
 
-Set `VLLM_XPU_PCP_MOE_FUSION=1` to use DeepSymm's fused MoE
+Without `--enable-expert-parallel`, set `VLLM_XPU_PCP_MOE_FUSION=1` to use DeepSymm's fused MoE
 all-gather/permute and weighted unpermute/reduce-scatter. The default is `0`.
 Routing, including hash routing, runs on local tokens; expert weights remain
 tensor-sharded across PCP ranks. The combine returns local token rows, so no
@@ -89,12 +90,29 @@ path. This can be combined with the attention pipeline above.
 This experimental single-node path requires an installed, native-compatible
 DeepSymm build and `vllm_xpu_kernels` with `XpuFusedMoe.apply_permuted`.
 It supports BF16 activations, at most 512 experts, PCP greater than one,
-and TP=DP=1, with eager execution. EP, PCP-by-TP topologies, DBO, LoRA,
+and TP=DP=1, with eager execution. PCP-by-TP topologies, DBO, LoRA,
 and EPLB are not supported. All MoE layers must use the same hidden size,
 top-k, and workspace capacity. Unsupported configurations or missing native
 dependencies raise errors rather than silently using the unfused path.
 Floating-point reduction order can change; validate generation quality and
 serving performance on the intended workload before enabling it.
+
+With `--enable-expert-parallel`, `VLLM_XPU_PCP_MOE_FUSION=1` instead selects
+native high-throughput (HT) `deep_ep_xpu.Buffer` dispatch/combine. Each rank holds whole experts,
+and receives only tokens routed to those experts. The existing XPU expert kernel
+applies routing weights once; native combine adds the rank contributions and
+returns local token rows without another PCP reduce-scatter. Shared experts
+remain local. Dispatch is not yet fused with expert permutation.
+
+This EP option requires the native `deep_ep_cpp` extension from DeepSymm,
+BF16 activations, a hidden size divisible by 128, single-node PCP=EP of 2, 4,
+or 8, TP=DP=1, eager execution, and evenly sharded, linearly placed experts.
+DBO, LoRA, EPLB, and deferred cross-rank reduction are unsupported.
+The default `VLLM_XPU_PCP_MOE_FUSION=0` retains the unfused TP path.
+With `--enable-expert-parallel`, it uses the standard
+`--all2all-backend allgather_reducescatter` path instead of DeepSymm.
+Both EP paths route local tokens and retain whole-expert sharding.
+Switches are read at service startup; changing modes requires a restart.
 
 ## Decode Context Parallel
 

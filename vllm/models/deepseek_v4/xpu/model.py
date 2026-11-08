@@ -967,22 +967,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.config = config
         parallel_config = vllm_config.parallel_config
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self.use_ep = parallel_config.enable_expert_parallel
         if self.use_pcp:
-            if (
-                any(
-                    size != 1
-                    for size in (
-                        parallel_config.tensor_parallel_size,
-                        parallel_config.pipeline_parallel_size,
-                        parallel_config.data_parallel_size,
-                        parallel_config.decode_context_parallel_size,
-                    )
+            if any(
+                size != 1
+                for size in (
+                    parallel_config.tensor_parallel_size,
+                    parallel_config.pipeline_parallel_size,
+                    parallel_config.data_parallel_size,
+                    parallel_config.decode_context_parallel_size,
                 )
-                or parallel_config.enable_expert_parallel
             ):
                 raise NotImplementedError(
-                    "DeepSeek V4 XPU PCP currently requires TP=PP=DP=DCP=1 "
-                    "and expert parallelism disabled."
+                    "DeepSeek V4 XPU PCP currently requires TP=PP=DP=DCP=1."
+                )
+            if (
+                self.use_ep
+                and not envs.VLLM_XPU_PCP_MOE_FUSION
+                and parallel_config.all2all_backend != "allgather_reducescatter"
+            ):
+                raise NotImplementedError(
+                    "DeepSeek V4 XPU PCP EP without VLLM_XPU_PCP_MOE_FUSION=1 "
+                    "requires --all2all-backend allgather_reducescatter."
                 )
             if (
                 not vllm_config.model_config.enforce_eager
@@ -1123,7 +1129,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
-        if self.use_pcp and not envs.VLLM_XPU_PCP_MOE_FUSION:
+        if self.use_pcp and not self.use_ep and not envs.VLLM_XPU_PCP_MOE_FUSION:
             input_ids = get_pcp_group().all_gather(input_ids, dim=0)
 
         residual, post_mix, res_mix = None, None, None

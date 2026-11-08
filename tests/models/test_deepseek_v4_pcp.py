@@ -89,14 +89,16 @@ def swa_model_path(tmp_path):
     ],
 )
 @pytest.mark.parametrize(
-    "layer_types,boundary_exchange,paged_attention,kv_chunk_size,moe_fusion",
+    "layer_types,boundary_exchange,paged_attention,kv_chunk_size,moe_fusion,"
+    "expert_parallel",
     [
-        (["sliding_attention"] * 2, False, False, 0, False),
+        (["sliding_attention"] * 2, False, False, 0, False, False),
         (
             ["compressed_sparse_attention", "heavily_compressed_attention"],
             False,
             False,
             0,
+            False,
             False,
         ),
         (
@@ -105,14 +107,16 @@ def swa_model_path(tmp_path):
             False,
             0,
             False,
+            False,
         ),
-        (["sliding_attention"] * 2, False, True, 0, False),
+        (["sliding_attention"] * 2, False, True, 0, False, False),
         (
             ["compressed_sparse_attention", "heavily_compressed_attention"],
             False,
             True,
             0,
             False,
+            False,
         ),
         (
             ["compressed_sparse_attention", "heavily_compressed_attention"],
@@ -120,20 +124,15 @@ def swa_model_path(tmp_path):
             True,
             0,
             False,
+            False,
         ),
-        (["sliding_attention"] * 2, False, False, 16, False),
+        (["sliding_attention"] * 2, False, False, 16, False, False),
         (
             ["compressed_sparse_attention", "heavily_compressed_attention"],
             False,
             False,
             16,
             False,
-        ),
-        (
-            ["compressed_sparse_attention", "heavily_compressed_attention"],
-            True,
-            False,
-            16,
             False,
         ),
         (
@@ -141,6 +140,31 @@ def swa_model_path(tmp_path):
             True,
             False,
             16,
+            False,
+            False,
+        ),
+        (
+            ["compressed_sparse_attention", "heavily_compressed_attention"],
+            True,
+            False,
+            16,
+            True,
+            False,
+        ),
+        (
+            ["compressed_sparse_attention", "heavily_compressed_attention"],
+            True,
+            False,
+            16,
+            False,
+            True,
+        ),
+        (
+            ["compressed_sparse_attention", "heavily_compressed_attention"],
+            True,
+            False,
+            16,
+            True,
             True,
         ),
     ],
@@ -155,6 +179,8 @@ def swa_model_path(tmp_path):
         "pipeline-c4a-c128a",
         "pipeline-boundary-c4a-c128a",
         "deepsymm-pipeline-boundary-c4a-c128a",
+        "allgather-ep-pipeline-boundary-c4a-c128a",
+        "deepep-pipeline-boundary-c4a-c128a",
     ],
 )
 def test_xpu_pcp_matches_single_rank(
@@ -165,6 +191,7 @@ def test_xpu_pcp_matches_single_rank(
     paged_attention,
     kv_chunk_size,
     moe_fusion,
+    expert_parallel,
     pcp_world_size,
     monkeypatch,
 ):
@@ -197,6 +224,7 @@ def test_xpu_pcp_matches_single_rank(
             skip_tokenizer_init=True,
             enforce_eager=True,
             prefill_context_parallel_size=pcp_size,
+            enable_expert_parallel=expert_parallel and pcp_size > 1,
             distributed_executor_backend="mp",
             max_model_len=512,
             max_num_batched_tokens=128,
@@ -211,7 +239,7 @@ def test_xpu_pcp_matches_single_rank(
                 "topk_method": "noaux_tc",
                 "num_attention_heads": 32 if paged_attention or kv_chunk_size else 4,
                 "mlp_layer_types": ["hash_moe", "moe"]
-                if moe_fusion
+                if moe_fusion or expert_parallel
                 else ["hash_moe"] * 2,
             },
         ) as runner:
@@ -909,4 +937,24 @@ def test_xpu_pcp_rejects_prefix_caching(swa_model_path, pcp_size):
         max_model_len=512,
     ).create_engine_config()
     with pytest.raises(NotImplementedError, match="prefix caching disabled"):
+        DeepseekV4Model(vllm_config=config)
+
+
+def test_xpu_pcp_ep_rejects_unsupported_backend(swa_model_path, monkeypatch):
+    """Without native dispatch, PCP EP must use its validated AG/RS backend."""
+    monkeypatch.setenv("VLLM_XPU_PCP_MOE_FUSION", "0")
+    config = EngineArgs(
+        model=swa_model_path,
+        skip_tokenizer_init=True,
+        enforce_eager=True,
+        prefill_context_parallel_size=2,
+        enable_expert_parallel=True,
+        all2all_backend="deepep_low_latency",
+        distributed_executor_backend="mp",
+        enable_prefix_caching=False,
+        max_model_len=512,
+    ).create_engine_config()
+    with pytest.raises(
+        NotImplementedError, match="requires --all2all-backend allgather_reducescatter"
+    ):
         DeepseekV4Model(vllm_config=config)
