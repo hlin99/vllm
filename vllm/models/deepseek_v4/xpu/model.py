@@ -981,9 +981,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 raise NotImplementedError(
                     "DeepSeek V4 XPU PCP currently requires TP=PP=DP=DCP=1."
                 )
-            if self.use_ep:
+            if (
+                self.use_ep
+                and not envs.VLLM_XPU_PCP_MOE_FUSION
+                and parallel_config.all2all_backend != "allgather_reducescatter"
+            ):
                 raise NotImplementedError(
-                    "DeepSeek V4 XPU PCP currently requires MoE tensor parallelism."
+                    "DeepSeek V4 XPU PCP EP without VLLM_XPU_PCP_MOE_FUSION=1 "
+                    "requires --all2all-backend allgather_reducescatter."
                 )
             if (
                 not vllm_config.model_config.enforce_eager
@@ -1124,7 +1129,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
-        if self.use_pcp and not envs.VLLM_XPU_PCP_MOE_FUSION:
+        if self.use_pcp and not self.use_ep and not envs.VLLM_XPU_PCP_MOE_FUSION:
             input_ids = get_pcp_group().all_gather(input_ids, dim=0)
 
         residual, post_mix, res_mix = None, None, None

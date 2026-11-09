@@ -201,6 +201,10 @@ def maybe_make_prepare_finalize(
     if envs.VLLM_XPU_PCP_MOE_FUSION:
         if use_monolithic:
             raise ValueError("DeepSymm PCP MoE requires a modular XPU expert backend")
+        if moe.moe_parallel_config.use_ep:
+            from .prepare_finalize.xpu_deepep import XPUDeepEPPrepareAndFinalize
+
+            return XPUDeepEPPrepareAndFinalize(moe)
         from .prepare_finalize.xpu_deepsymm import XPUDeepSymmPrepareAndFinalize
 
         return XPUDeepSymmPrepareAndFinalize(moe)

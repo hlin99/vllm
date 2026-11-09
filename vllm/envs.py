@@ -2355,7 +2355,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_PCP_KV_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_XPU_PCP_KV_CHUNK_SIZE", "0")
     ),
-    # Opt-in DeepSymm fused PCP dispatch/combine for XPU MoE tensor parallelism.
+    # Opt-in XPU PCP MoE: DeepSymm TP fusion, or native DeepEP with expert parallelism.
     "VLLM_XPU_PCP_MOE_FUSION": lambda: bool(
         int(os.getenv("VLLM_XPU_PCP_MOE_FUSION", "0"))
     ),
