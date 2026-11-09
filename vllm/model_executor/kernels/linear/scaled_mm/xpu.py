@@ -271,14 +271,20 @@ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         As: torch.Tensor,
         Bs: torch.Tensor,
     ) -> torch.Tensor:
+        if Bs.shape[1] == 1:
+            # fp8_gemm dispatches a single K block as per-token/channel scales.
+            weight_scale = Bs.repeat_interleave(
+                B.shape[0] // Bs.shape[0], dim=0
+            ).flatten()
+        else:
+            # Recover the contiguous [k_blocks, n_blocks] scale buffer.
+            weight_scale = Bs.t()
         # B is [N, K]; .t() gives [K, N] view (no copy).
-        # Bs is stored as [n_blocks, k_blocks] view; .t() recovers the
-        # contiguous [k_blocks, n_blocks] buffer that oneDNN expects.
         return torch.ops._xpu_C.fp8_gemm(
             A,
             B.t(),
             self.config.out_dtype,
             As,
-            Bs.t(),
+            weight_scale,
             torch.Tensor(),
         )

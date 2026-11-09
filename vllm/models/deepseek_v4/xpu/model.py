@@ -8,9 +8,11 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -963,6 +965,43 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
+        parallel_config = vllm_config.parallel_config
+        self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self.use_ep = parallel_config.enable_expert_parallel
+        if self.use_pcp:
+            if any(
+                size != 1
+                for size in (
+                    parallel_config.tensor_parallel_size,
+                    parallel_config.pipeline_parallel_size,
+                    parallel_config.data_parallel_size,
+                    parallel_config.decode_context_parallel_size,
+                )
+            ):
+                raise NotImplementedError(
+                    "DeepSeek V4 XPU PCP currently requires TP=PP=DP=DCP=1."
+                )
+            if (
+                self.use_ep
+                and not envs.VLLM_XPU_PCP_MOE_FUSION
+                and parallel_config.all2all_backend != "allgather_reducescatter"
+            ):
+                raise NotImplementedError(
+                    "DeepSeek V4 XPU PCP EP without VLLM_XPU_PCP_MOE_FUSION=1 "
+                    "requires --all2all-backend allgather_reducescatter."
+                )
+            if (
+                not vllm_config.model_config.enforce_eager
+                or vllm_config.cache_config.enable_prefix_caching
+                or vllm_config.speculative_config is not None
+                or vllm_config.lora_config is not None
+                or vllm_config.kv_transfer_config is not None
+            ):
+                raise NotImplementedError(
+                    "DeepSeek V4 XPU PCP currently requires eager mode, "
+                    "prefix caching disabled, and no speculative decoding, "
+                    "LoRA or KV transfer."
+                )
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
@@ -1089,6 +1128,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
+
+        if self.use_pcp and not self.use_ep and not envs.VLLM_XPU_PCP_MOE_FUSION:
+            input_ids = get_pcp_group().all_gather(input_ids, dim=0)
 
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []

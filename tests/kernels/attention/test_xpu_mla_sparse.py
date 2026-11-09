@@ -4,7 +4,12 @@
 import pytest
 import torch
 
-from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
+from vllm.models.deepseek_v4.common.ops.cache_utils import quantize_and_insert_k_cache
+from vllm.models.deepseek_v4.xpu.xpu_sparse_decode_fp8 import xpu_sparse_decode_fp8
+from vllm.v1.attention.ops.xpu_mla_sparse import (
+    triton_bf16_mla_sparse_interface,
+    triton_paged_mla_sparse_interface,
+)
 
 
 # https://github.com/deepseek-ai/FlashMLA/blob/main/tests/ref.py#L7
@@ -168,3 +173,142 @@ def test_bf16_triton_sparse_mla_masked_chunks(device_str, dtype):
     # lse/max_logits are large-negative finite rather than the reference's
     # +inf/-inf placeholders, so only the output is compared here.
     assert torch.allclose(out[2], torch.zeros_like(out[2]))
+
+
+def _make_paged_sparse_cache(block_size, device):
+    page_bytes = ((block_size * 584 + 575) // 576) * 576
+    storage = torch.full(
+        (9, block_size, page_bytes // block_size),
+        37,
+        dtype=torch.uint8,
+        device=device,
+    )
+    cache = storage[1::2]
+    rows = cache.shape[0] * block_size
+    values = torch.randn(rows, 512, dtype=torch.bfloat16, device=device)
+    values *= torch.logspace(-3, 1, 8, device=device).repeat_interleave(64)
+    quantize_and_insert_k_cache(
+        values,
+        cache.view(cache.shape[0], -1),
+        torch.arange(rows, device=device),
+        block_size=block_size,
+    )
+    return cache
+
+
+@pytest.mark.parametrize("compressed_block_size", [None, 2, 64])
+@pytest.mark.parametrize("num_heads", [20, 36, 64])
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required")
+def test_paged_sparse_mla_matches_gathered_kv(
+    compressed_block_size, num_heads, monkeypatch
+):
+    """Paged loads preserve attention with gaps, offset views and masked rows."""
+    device = torch.device("xpu")
+    torch.manual_seed(42)
+    monkeypatch.setenv("VLLM_XPU_PAGED_SPARSE_ATTN", "0")
+    swa_cache = _make_paged_sparse_cache(256, device)
+    cache = (
+        _make_paged_sparse_cache(compressed_block_size, device)
+        if compressed_block_size is not None
+        else None
+    )
+    q = torch.randn(11, num_heads + 4, 512, device=device, dtype=torch.bfloat16)[
+        1::2, :num_heads
+    ]
+    out = torch.empty(11, num_heads + 4, 512, device=device, dtype=q.dtype)[
+        1::2, :num_heads
+    ]
+    expected = torch.empty_like(q)
+    swa_indices = torch.randint(
+        0, 4 * 256, (5, 1, 33), dtype=torch.int32, device=device
+    )
+    swa_lens = torch.tensor([0, 1, 33, 17, 0], dtype=torch.int32, device=device)
+    swa_indices[0] = -1
+    swa_indices[1, 0, 1:] = -1
+    swa_indices[4] = -1
+    topk_indices = None
+    topk_lens = None
+    if cache is not None:
+        topk_indices = torch.randint(
+            0,
+            cache.shape[0] * cache.shape[1],
+            (5, 1, 19),
+            dtype=torch.int32,
+            device=device,
+        )
+        topk_lens = torch.tensor([0, 1, 19, 17, 0], dtype=torch.int32, device=device)
+    xpu_sparse_decode_fp8(
+        q=q,
+        kv_cache=cache,
+        swa_kv_cache=swa_cache,
+        swa_only=cache is None,
+        topk_indices=topk_indices,
+        topk_lens=topk_lens,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        attn_sink=torch.zeros(q.shape[1], device=device),
+        softmax_scale=512**-0.5,
+        head_dim=512,
+        nope_head_dim=448,
+        rope_head_dim=64,
+        out=expected,
+    )
+    triton_paged_mla_sparse_interface(
+        q,
+        cache,
+        swa_cache,
+        topk_indices,
+        topk_lens,
+        swa_indices,
+        swa_lens,
+        512**-0.5,
+        out,
+    )
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_heads", [20, 36, 64])
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required")
+def test_paged_sparse_mla_split_kv_preserves_softmax(num_heads):
+    """Block-aligned chunks keep FP32 state, including empty chunks and reuse."""
+    device = torch.device("xpu")
+    torch.manual_seed(43)
+    cache = _make_paged_sparse_cache(256, device)
+    q = torch.randn(5, num_heads + 4, 512, device=device, dtype=torch.bfloat16)[
+        :, :num_heads
+    ]
+    indices = torch.randint(0, 1024, (5, 1, 33), device=device, dtype=torch.int32)
+    lens = torch.tensor([0, 1, 33, 17, 0], device=device, dtype=torch.int32)
+    expected = torch.empty_like(q)
+    actual = torch.empty_like(q)
+    state = torch.full((5, num_heads, 514), float("nan"), device=device)
+    empty_indices = indices[..., :0]
+    empty_lens = torch.zeros_like(lens)
+
+    def consume(selected, lengths, *, initialize=False, finalize=False):
+        triton_paged_mla_sparse_interface(
+            q,
+            None,
+            cache,
+            None,
+            None,
+            selected,
+            lengths,
+            512**-0.5,
+            actual if finalize else None,
+            partial_state=state,
+            initialize=initialize,
+            finalize=finalize,
+        )
+
+    for _ in range(2):
+        q.neg_()
+        triton_paged_mla_sparse_interface(
+            q, None, cache, None, None, indices, lens, 512**-0.5, expected
+        )
+        consume(empty_indices, empty_lens, initialize=True)
+        for start in range(0, 33, 16):
+            selected = indices[..., start : start + 16]
+            consume(selected, (lens - start).clamp(0, selected.shape[-1]))
+        consume(empty_indices, empty_lens, finalize=True)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

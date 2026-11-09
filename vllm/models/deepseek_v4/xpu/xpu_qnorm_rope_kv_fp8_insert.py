@@ -8,6 +8,7 @@ Uses the existing quantize_and_insert_k_cache for the FP8 portion.
 
 import torch
 
+from vllm.distributed import get_pcp_group
 from vllm.triton_utils import tl, triton
 
 HEAD_DIM = 512
@@ -110,26 +111,22 @@ def _xpu_qnorm_rope_kernel(
         tl.store(kv_out_base + odd_offs, new_odd.to(kv_out_ptr.type.element_ty))
 
 
-def xpu_qnorm_rope_kv_fp8_insert(
-    q: torch.Tensor,  # [num_tokens, num_heads, HEAD_DIM] bf16, in-place
-    kv: torch.Tensor,  # [num_tokens, HEAD_DIM] bf16
-    swa_kv_cache: torch.Tensor,  # [num_blocks, block_size, 584] or flat uint8
-    slot_mapping: torch.Tensor,  # [num_tokens] int64
-    positions: torch.Tensor,  # [num_tokens] int64
-    cos_sin_cache: torch.Tensor,  # [max_pos, ROPE_DIM]
+def xpu_qnorm_rope(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
     eps: float,
-    block_size: int,
-):
-    """XPU Triton: qnorm+rope on Q, rope on KV, then FP8 UE8M0 quant+insert."""
-    from vllm.models.deepseek_v4.common.ops.cache_utils import (
-        quantize_and_insert_k_cache,
-    )
-
+    *,
+    kv_out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Normalize/rotate Q in place and rotate KV into the supplied buffer."""
     num_tokens = q.shape[0]
     num_heads = q.shape[1]
-
-    # Allocate temp buffer for RoPE-applied KV
-    kv_roped = torch.empty_like(kv)
+    if kv_out is None:
+        kv_out = torch.empty_like(kv)
+    assert kv_out.shape == kv.shape and kv_out.dtype == kv.dtype
+    assert kv_out.is_contiguous()
 
     # Grid: one program per (token, head_or_kv)
     # head_idx < num_heads: process Q head
@@ -138,7 +135,7 @@ def xpu_qnorm_rope_kv_fp8_insert(
     _xpu_qnorm_rope_kernel[grid](
         q,
         kv,
-        kv_roped,
+        kv_out,
         positions,
         cos_sin_cache,
         eps,
@@ -149,6 +146,29 @@ def xpu_qnorm_rope_kv_fp8_insert(
         NOPE_DIM=NOPE_DIM,
         HALF_ROPE=HALF_ROPE,
     )
+    return kv_out
+
+
+def xpu_qnorm_rope_kv_fp8_insert(
+    q: torch.Tensor,  # [num_tokens, num_heads, HEAD_DIM] bf16, in-place
+    kv: torch.Tensor,  # [num_tokens, HEAD_DIM] bf16
+    swa_kv_cache: torch.Tensor,  # [num_blocks, block_size, 584] or flat uint8
+    slot_mapping: torch.Tensor,  # [num_tokens] int64
+    positions: torch.Tensor,  # [num_tokens] int64
+    cos_sin_cache: torch.Tensor,  # [max_pos, ROPE_DIM]
+    eps: float,
+    block_size: int,
+    *,
+    use_pcp: bool = False,
+):
+    """XPU Triton: qnorm+rope on Q, rope on KV, then FP8 UE8M0 quant+insert."""
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        quantize_and_insert_k_cache,
+    )
+
+    kv_roped = xpu_qnorm_rope(q, kv, positions, cos_sin_cache, eps)
+    if use_pcp:
+        kv_roped = get_pcp_group().all_gather(kv_roped, dim=0)
 
     # FP8 UE8M0 quant + paged insert (reuse existing Triton kernel)
     # swa_kv_cache may be [num_blocks, block_size, 584] or [num_blocks, flat]
