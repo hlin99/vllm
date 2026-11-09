@@ -7,29 +7,155 @@ Triton kernels for decode (FP8 dequant + BF16 attention) and prefill
 (BF16 gathered KV + sparse attention).
 """
 
-from typing import TYPE_CHECKING, cast
+from dataclasses import dataclass
+from typing import cast
 
 import torch
 
+from vllm.config import VllmConfig
+from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
-from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.attention import DeepseekV4Attention, DeepseekV4Indexer
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
 )
+from vllm.models.deepseek_v4.compressor import (
+    CompressorBackend,
+    CompressorMetadata,
+    CompressorMetadataBuilder,
+    CompressorStateCache,
+    DeepseekCompressor,
+)
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
+    DeepseekV4SparseMLAMetadataBuilder,
 )
 from vllm.models.deepseek_v4.xpu.xpu_sparse_decode_fp8 import (
     xpu_sparse_decode_fp8,
 )
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla.sparse_swa import (
+    DeepseekSparseSWABackend,
+    DeepseekSparseSWAMetadata,
+    DeepseekSparseSWAMetadataBuilder,
+)
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
 from vllm.v1.worker.workspace import current_workspace_manager
 
-if TYPE_CHECKING:
-    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+@dataclass
+class DeepseekV4XPUCompressorMetadata(CompressorMetadata):
+    positions: torch.Tensor | None = None
+
+
+class DeepseekV4XPUCompressorMetadataBuilder(CompressorMetadataBuilder):
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> CompressorMetadata:
+        cm = common_attn_metadata
+        pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+        if pcp_size == 1:
+            return super().build(common_prefix_len, cm, fast_build)
+
+        group = get_pcp_group()
+        local_slots = cm.slot_mapping.chunk(pcp_size)[group.rank_in_group]
+        metadata = super().build(
+            common_prefix_len, cm.replace(slot_mapping=local_slots), fast_build
+        )
+        assert cm.positions is not None
+        assert metadata.token_to_req_indices is not None
+        padded_tokens = local_slots.shape[0]
+        positions = cm.positions.new_zeros(padded_tokens)
+        positions[: cm.num_actual_tokens].copy_(cm.positions[: cm.num_actual_tokens])
+        token_to_req = metadata.token_to_req_indices.new_zeros(padded_tokens)
+        token_to_req[: cm.num_actual_tokens].copy_(metadata.token_to_req_indices)
+
+        # PCP can split a request into two local segments. Match PCPManager's
+        # table capacity so unequal segment counts still gather uniformly.
+        max_reqs = 2 * self.vllm_config.scheduler_config.max_num_seqs
+        block_table = metadata.block_table.new_zeros(
+            (max_reqs, metadata.block_table.shape[1])
+        )
+        block_table[: cm.num_reqs].copy_(metadata.block_table)
+        token_to_req += group.rank_in_group * max_reqs
+        return DeepseekV4XPUCompressorMetadata(
+            block_table=group.all_gather(block_table, dim=0),
+            slot_mapping=cm.slot_mapping,
+            block_size=self.block_size,
+            token_to_req_indices=group.all_gather(token_to_req, dim=0),
+            positions=group.all_gather(positions, dim=0),
+        )
+
+
+class DeepseekV4XPUCompressorBackend(CompressorBackend):
+    @staticmethod
+    def get_builder_cls() -> type[DeepseekV4XPUCompressorMetadataBuilder]:
+        return DeepseekV4XPUCompressorMetadataBuilder
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
+
+class DeepseekV4XPUCompressorStateCache(CompressorStateCache):
+    def get_attn_backend(self) -> type[CompressorBackend]:
+        return DeepseekV4XPUCompressorBackend
+
+
+class DeepseekV4XPUCompressor(DeepseekCompressor):
+    state_cache_cls = DeepseekV4XPUCompressorStateCache
+
+    def forward(
+        self,
+        kv_score: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb,
+    ) -> None:
+        attn_metadata = get_forward_context().attn_metadata
+        if get_pcp_group().world_size > 1 and isinstance(attn_metadata, dict):
+            metadata = cast(
+                DeepseekV4XPUCompressorMetadata,
+                attn_metadata[self.state_cache.prefix],
+            )
+            assert metadata.positions is not None
+            kv_score = get_pcp_group().all_gather(kv_score.contiguous(), dim=0)
+            positions = metadata.positions
+        super().forward(kv_score, positions, rotary_emb)
+
+
+class DeepseekV4XPUSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        replay_start: torch.Tensor | None = None,
+    ) -> DeepseekSparseSWAMetadata:
+        pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+        cm = common_attn_metadata
+        if pcp_size > 1:
+            rank = get_pcp_group().rank_in_group
+            cm = cm.replace(slot_mapping=cm.slot_mapping.chunk(pcp_size)[rank])
+        metadata = super().build(common_prefix_len, cm, fast_build, replay_start)
+        if pcp_size > 1:
+            metadata.cache_slot_mapping = common_attn_metadata.slot_mapping
+        return metadata
+
+
+class DeepseekV4XPUSparseSWABackend(DeepseekSparseSWABackend):
+    @staticmethod
+    def get_builder_cls() -> type[DeepseekV4XPUSparseSWAMetadataBuilder]:
+        return DeepseekV4XPUSparseSWAMetadataBuilder
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
 
 
 class DeepseekV4XPUSparseBackend(DeepseekV4SparseMLABackend):
@@ -37,21 +163,60 @@ class DeepseekV4XPUSparseBackend(DeepseekV4SparseMLABackend):
     def get_name() -> str:
         return "XPU_V4_MLA_SPARSE"
 
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
+    @staticmethod
+    def get_builder_cls() -> type["DeepseekV4XPUSparseMetadataBuilder"]:
+        return DeepseekV4XPUSparseMetadataBuilder
+
+
+class DeepseekV4XPUSparseMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> DeepseekV4FlashMLAMetadata:
+        cm = common_attn_metadata
+        pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+        if pcp_size > 1:
+            group = get_pcp_group()
+            local_slots = cm.slot_mapping.chunk(pcp_size)[group.rank_in_group]
+            cm = cm.replace(slot_mapping=local_slots)
+        metadata = super().build(common_prefix_len, cm, fast_build)
+        if pcp_size > 1 and self.compress_ratio > 1:
+            metadata.slot_mapping = group.all_gather(
+                self.compressed_slot_mapping_buffer[: local_slots.shape[0]], dim=0
+            )
+        return metadata
+
+
+class DeepseekV4XPUIndexer(DeepseekV4Indexer):
+    def _get_compressor_cls(self) -> type[DeepseekCompressor]:
+        return DeepseekV4XPUCompressor
+
 
 class DeepseekV4XPUAttention(DeepseekV4Attention):
     """XPU sparse MLA attention layer for DeepSeek V4."""
 
     backend_cls = DeepseekV4XPUSparseBackend
+    swa_backend_cls = DeepseekV4XPUSparseSWABackend
+    compressor_cls = DeepseekV4XPUCompressor
     use_flashmla_fp8_layout = True
 
-    def __init__(self, *args, **kwargs) -> None:
+    def _get_indexer_cls(self, vllm_config: VllmConfig) -> type[DeepseekV4Indexer]:
+        return DeepseekV4XPUIndexer
+
+    def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
         # torch.cuda.Event() raises RuntimeError on XPU ("dummy base class").
         # The Base and DeepseekV4Indexer both create cuda Events in __init__, so
         # we temporarily redirect torch.cuda.Event → torch.xpu.Event.
         _orig_event = torch.cuda.Event
         torch.cuda.Event = torch.xpu.Event  # type: ignore[misc]
         try:
-            super().__init__(*args, **kwargs)
+            super().__init__(vllm_config, *args, **kwargs)
         finally:
             torch.cuda.Event = _orig_event  # type: ignore[misc]
 
@@ -67,6 +232,11 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
             attn_metadata.get(self.swa_cache_layer.prefix),
         )
         assert swa_metadata is not None
+        use_pcp = get_pcp_group().world_size > 1
+        slot_mapping = swa_metadata.slot_mapping
+        if use_pcp:
+            assert swa_metadata.cache_slot_mapping is not None
+            slot_mapping = swa_metadata.cache_slot_mapping
 
         from vllm.models.deepseek_v4.xpu.xpu_qnorm_rope_kv_fp8_insert import (
             xpu_qnorm_rope_kv_fp8_insert,
@@ -76,11 +246,12 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
             q,
             kv,
             self.swa_cache_layer.kv_cache,
-            swa_metadata.slot_mapping,
+            slot_mapping,
             positions,
             self.rotary_emb.cos_sin_cache,
             self.eps,
             swa_metadata.block_size,
+            use_pcp=use_pcp,
         )
         return q
 
@@ -163,6 +334,10 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
             attn_metadata.get(self.swa_cache_layer.prefix),
         )
         assert swa_metadata is not None
+
+        if swa_metadata.num_decode_tokens + swa_metadata.num_prefill_tokens == 0:
+            output.zero_()
+            return
 
         swa_only = self.compress_ratio <= 1
         self_kv_cache = self.kv_cache if not swa_only else None
