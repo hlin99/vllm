@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -26,6 +28,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Static,
 )
 from vllm.platforms import current_platform
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.xpu_deepsymm import (
+        XPUDeepSymmPrepareAndFinalize,
+    )
 
 if current_platform.is_xpu():
     from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
@@ -65,6 +72,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         )
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
         self.fused_moe_impl: XpuFusedMoe | None = None
+        self.pcp_fusion: XPUDeepSymmPrepareAndFinalize | None = None
         is_xe2_or_xe3 = torch.ops._xpu_C.is_xe2_arch() or torch.ops._xpu_C.is_xe3_arch()
         if not is_xe2_or_xe3:
             raise NotImplementedError(
@@ -175,6 +183,19 @@ class XPUExperts(mk.FusedMoEExpertsModular):
                 gemm1_clamp_limit=self.gemm1_clamp_limit,
             )
         assert self.fused_moe_impl is not None
+        if self.pcp_fusion is not None:
+            if apply_router_weight_on_input:
+                raise NotImplementedError(
+                    "DeepSymm PCP MoE requires output-side router weights"
+                )
+            self.pcp_fusion.apply(
+                self.fused_moe_impl,
+                output,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+            )
+            return
         if self.moe_config.ep_size > 1:
             # Avoid topk_ids = -1, remap them to an
             # expert not owned by this rank so they are skipped.

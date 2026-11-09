@@ -111,6 +111,44 @@ def _xpu_qnorm_rope_kernel(
         tl.store(kv_out_base + odd_offs, new_odd.to(kv_out_ptr.type.element_ty))
 
 
+def xpu_qnorm_rope(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    *,
+    kv_out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Normalize/rotate Q in place and rotate KV into the supplied buffer."""
+    num_tokens = q.shape[0]
+    num_heads = q.shape[1]
+    if kv_out is None:
+        kv_out = torch.empty_like(kv)
+    assert kv_out.shape == kv.shape and kv_out.dtype == kv.dtype
+    assert kv_out.is_contiguous()
+
+    # Grid: one program per (token, head_or_kv)
+    # head_idx < num_heads: process Q head
+    # head_idx == num_heads: process KV
+    grid = (num_tokens, num_heads + 1)
+    _xpu_qnorm_rope_kernel[grid](
+        q,
+        kv,
+        kv_out,
+        positions,
+        cos_sin_cache,
+        eps,
+        num_tokens,
+        num_heads=num_heads,
+        HEAD_DIM=HEAD_DIM,
+        ROPE_DIM=ROPE_DIM,
+        NOPE_DIM=NOPE_DIM,
+        HALF_ROPE=HALF_ROPE,
+    )
+    return kv_out
+
+
 def xpu_qnorm_rope_kv_fp8_insert(
     q: torch.Tensor,  # [num_tokens, num_heads, HEAD_DIM] bf16, in-place
     kv: torch.Tensor,  # [num_tokens, HEAD_DIM] bf16
@@ -128,30 +166,7 @@ def xpu_qnorm_rope_kv_fp8_insert(
         quantize_and_insert_k_cache,
     )
 
-    num_tokens = q.shape[0]
-    num_heads = q.shape[1]
-
-    # Allocate temp buffer for RoPE-applied KV
-    kv_roped = torch.empty_like(kv)
-
-    # Grid: one program per (token, head_or_kv)
-    # head_idx < num_heads: process Q head
-    # head_idx == num_heads: process KV
-    grid = (num_tokens, num_heads + 1)
-    _xpu_qnorm_rope_kernel[grid](
-        q,
-        kv,
-        kv_roped,
-        positions,
-        cos_sin_cache,
-        eps,
-        num_tokens,
-        num_heads=num_heads,
-        HEAD_DIM=HEAD_DIM,
-        ROPE_DIM=ROPE_DIM,
-        NOPE_DIM=NOPE_DIM,
-        HALF_ROPE=HALF_ROPE,
-    )
+    kv_roped = xpu_qnorm_rope(q, kv, positions, cos_sin_cache, eps)
     if use_pcp:
         kv_roped = get_pcp_group().all_gather(kv_roped, dim=0)
 

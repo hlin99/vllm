@@ -341,6 +341,10 @@ if TYPE_CHECKING:
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    VLLM_XPU_PCP_BOUNDARY_EXCHANGE: bool = False
+    VLLM_XPU_PAGED_SPARSE_ATTN: bool = False
+    VLLM_XPU_PCP_KV_CHUNK_SIZE: int = 0
+    VLLM_XPU_PCP_MOE_FUSION: bool = False
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
@@ -2337,6 +2341,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether use xpu specific sample kernel
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
+    ),
+    # Exchange compressor segment tails and compressed cache rows under XPU PCP.
+    # Default to the original full-input replication path.
+    "VLLM_XPU_PCP_BOUNDARY_EXCHANGE": lambda: bool(
+        int(os.getenv("VLLM_XPU_PCP_BOUNDARY_EXCHANGE", "0"))
+    ),
+    # Read DeepSeek V4 paged KV directly in XPU sparse attention.
+    "VLLM_XPU_PAGED_SPARSE_ATTN": lambda: bool(
+        int(os.getenv("VLLM_XPU_PAGED_SPARSE_ATTN", "0"))
+    ),
+    # Rank-local KV rows per direct IPC/attention chunk; zero disables pipelining.
+    "VLLM_XPU_PCP_KV_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_XPU_PCP_KV_CHUNK_SIZE", "0")
+    ),
+    # Opt-in DeepSymm fused PCP dispatch/combine for XPU MoE tensor parallelism.
+    "VLLM_XPU_PCP_MOE_FUSION": lambda: bool(
+        int(os.getenv("VLLM_XPU_PCP_MOE_FUSION", "0"))
     ),
     # Kernel backend for INC weight-only intN (WNA16) linear layers on XPU.
     # "auto" keeps the default preference order (ARK when importable, else the

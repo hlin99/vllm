@@ -802,6 +802,11 @@ class MoERunner(MoERunnerInterface):
         return self._maybe_add_zero_expert_output(result)
 
     @property
+    def _kernel_handles_pcp(self) -> bool:
+        kernel = self._quant_method.moe_kernel
+        return kernel is not None and kernel.prepare_finalize.handles_pcp
+
+    @property
     def do_naive_dispatch_combine(self) -> bool:
         return (
             self.moe_config.dp_size > 1 or self.moe_config.is_sequence_parallel
@@ -828,6 +833,7 @@ class MoERunner(MoERunnerInterface):
         if (
             self.moe_config.pcp_size > 1
             and not self.moe_config.moe_parallel_config.use_all2all_kernels
+            and not self._kernel_handles_pcp
         ):
             hidden_states = get_pcp_group().all_gather(hidden_states, dim=0)
             router_logits = get_pcp_group().all_gather(router_logits, dim=0)
@@ -857,6 +863,7 @@ class MoERunner(MoERunnerInterface):
         if (
             self.moe_config.pcp_size > 1
             and not self.moe_config.moe_parallel_config.use_all2all_kernels
+            and not self._kernel_handles_pcp
         ):
             if isinstance(hidden_states, UnfinalizedMoEOutput):
                 raise RuntimeError(
